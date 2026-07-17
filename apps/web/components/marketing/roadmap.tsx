@@ -13,13 +13,13 @@ const PHASES: { phase: string; title: string; body: string; status: Status }[] =
     phase: "Phase 1",
     title: "Identité & accueil",
     body: "Connexion multi-wallet (Phantom, Solflare...), landing page, gestion de session.",
-    status: "active",
+    status: "done",
   },
   {
     phase: "Phase 2",
     title: "Abonnement Premium",
     body: "Paiement en SOL vérifié on-chain, accès gratuit pour les détenteurs de $PABLO, configuration admin.",
-    status: "upcoming",
+    status: "done",
   },
   {
     phase: "Phase 3",

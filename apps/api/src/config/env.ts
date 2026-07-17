@@ -12,8 +12,22 @@ const envSchema = z.object({
   JWT_ACCESS_TTL: z.string().default("15m"),
   JWT_REFRESH_TTL: z.string().default("30d"),
   RPC_HTTP: z.string().url(),
-  TREASURY_WALLET_ADDRESS: z.string().optional(),
   ENGINE_BRIDGE_INTERNAL_TOKEN: z.string().min(1),
+
+  // Bootstrap defaults only — used to seed the single PlatformConfig row the
+  // first time the app runs against an empty database. After that, the DB
+  // (admin-editable) is the source of truth; these env vars are never read
+  // again. See src/modules/admin/platform-config.service.ts.
+  TREASURY_WALLET_ADDRESS: z.string().optional(),
+  PABLO_MINT_ADDRESS: z.string().optional(),
+  MIN_HOLDER_TOKENS: z.coerce.number().int().positive().default(1_000_000),
+  SUBSCRIPTION_PRICE_USD: z.coerce.number().positive().default(10),
+  SUBSCRIPTION_DURATION_DAYS: z.coerce.number().int().positive().default(30),
+  GRACE_PERIOD_DAYS: z.coerce.number().int().nonnegative().default(3),
+
+  // Comma-separated wallet addresses auto-promoted to ADMIN on login —
+  // bootstraps the first admin without needing direct DB access.
+  ADMIN_WALLET_ADDRESSES: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

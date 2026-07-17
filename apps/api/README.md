@@ -25,6 +25,39 @@ rejection on a spent nonce, bad-signature rejection, JWT-gated `/auth/me`,
 cookie-based refresh rotation, multi-wallet linking, and post-logout refresh
 rejection all pass.
 
+**Phase 2 — subscription.** `src/modules/billing/`, `src/modules/admin/`.
+- `PlatformConfig` (`src/modules/admin/platform-config.service.ts`): the
+  single admin-editable row (price, $PABLO mint, holder threshold,
+  duration, grace period, treasury wallet). Seeded once from env bootstrap
+  defaults, cached in Redis with write-through invalidation.
+  `GET/PUT /admin/config` — PUT requires the `ADMIN` role
+  (`fastify.requireRole`); wallets listed in `ADMIN_WALLET_ADDRESSES` are
+  auto-promoted on login.
+- `subscription.service.ts`: `reconcileSubscriptionState` is a pure state
+  machine (paid period + live $PABLO balance + grace period →
+  ACTIVE/GRACE/EXPIRED) — 11 unit tests in
+  `subscription.service.test.ts` (`pnpm test`), covering lapse-into-grace,
+  grace expiry, `gracePeriodDays = 0`, regaining holder status mid-grace,
+  and that `ADMIN_GRANT` subscriptions are never auto-modified.
+- `holder.service.ts` / `payment.service.ts`: live $PABLO balance via
+  `getParsedTokenAccountsByOwner`, and SOL payments via `@solana/pay`
+  (`encodeURL`/`findReference`/`validateTransfer` against a Solana Pay
+  `reference` keypair — never a plain memo string).
+- `src/jobs/holder-sweep.ts`: periodic reconciliation for every user with a
+  linked wallet, so a balance drop is caught even without the user opening
+  the app (a single-process interval today — see docs/ARCHITECTURE.md §12
+  for the Helius-webhook upgrade path once this needs to scale).
+
+Verified: `GET/PUT /admin/config` (seed, role gate, cache invalidation,
+validation) against a real Postgres/Redis, and the 11 state-machine tests.
+**Not verifiable in this sandbox**: Solana RPC and the CoinGecko price API
+are both blocked by network egress policy here, so the on-chain payment
+confirmation and holder-balance happy paths couldn't be exercised
+end-to-end — confirmed instead that both fail cleanly (sanitized 500, no
+crash, real error still logged server-side) rather than leaking internal
+detail. Test the live paths in an environment with Solana RPC access
+before going to production.
+
 ## Local dev
 
 ```bash

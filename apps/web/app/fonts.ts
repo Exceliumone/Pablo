@@ -1,19 +1,23 @@
-import { Big_Shoulders, JetBrains_Mono } from "next/font/google";
+import localFont from "next/font/local";
 
-// Display: condensed, heavy, stencil-adjacent — carries the same weight as
-// the PABLO wordmark lettering. Body stays a plain system sans (see
-// globals.css --font-sans) so the display face is the one thing that reads
-// as "designed" rather than defaulting to Inter everywhere.
-export const displayFont = Big_Shoulders({
-  subsets: ["latin"],
-  weight: ["700", "800", "900"],
+// Self-hosted, not next/font/google: the Google Fonts CSS API served this
+// specific family/version with the exact same static file for weights
+// 700/800/900 (verified by diffing the resolved URLs), so there was no
+// real weight axis to lean on anyway — one 800-weight cut is what's
+// actually distinct, used at whatever CSS font-weight the component asks
+// for. Self-hosting also means the build never depends on live network
+// access to fonts.gstatic.com, only on these files already being in the
+// repo (see assets/fonts/).
+export const displayFont = localFont({
+  src: "../assets/fonts/big-shoulders-800.woff2",
+  weight: "700 900",
   variable: "--font-display",
+  display: "swap",
 });
 
-// Tabular numerals for a trading terminal aren't optional — prices, PnL,
-// and percentages need a real monospace, not a system fallback.
-export const monoFont = JetBrains_Mono({
-  subsets: ["latin"],
-  weight: ["400", "500", "600"],
+export const monoFont = localFont({
+  src: "../assets/fonts/jetbrains-mono-500.woff2",
+  weight: "400 600",
   variable: "--font-mono",
+  display: "swap",
 });

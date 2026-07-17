@@ -27,7 +27,7 @@ jobs:
 
       - run: pnpm --filter @pablo/api prisma:generate
 
-      - run: pnpm turbo run typecheck lint build
+      - run: pnpm turbo run typecheck lint build test
 
   rust:
     name: Rust (engine / engine-bridge)

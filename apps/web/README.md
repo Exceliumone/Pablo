@@ -8,7 +8,10 @@ Next.js 15 (App Router) frontend — landing page + subscriber dashboard + admin
 ground, violet-neon accent (`pablo-500/600`), glassmorphism surface
 (`.glass`), semantic success/danger colors kept separate from the accent.
 Display face is `Big Shoulders` (condensed, heavy — echoes the wordmark),
-data/prices use `JetBrains Mono` with tabular numerals (`app/fonts.ts`).
+data/prices use `JetBrains Mono` with tabular numerals (`app/fonts.ts`,
+self-hosted via `next/font/local` from `assets/fonts/` — not
+`next/font/google`, so the build never depends on live network access to
+fonts.gstatic.com).
 
 **Phase 1 — identity & landing.**
 - `components/providers/solana-wallet-provider.tsx` +
@@ -25,14 +28,29 @@ data/prices use `JetBrains Mono` with tabular numerals (`app/fonts.ts`).
   Brand imagery lives in `public/brand/` (pre-optimized to WebP — see the
   optimization note in `next.config.ts` re: `sharp`).
 
+**Phase 2 — subscription.**
+- `app/subscribe/page.tsx`: gated (shows a connect prompt if not
+  authenticated), live status via `lib/use-subscription.ts`
+  (`GET /billing/subscription` always reconciles server-side, so re-fetching
+  *is* the refresh — no separate refresh endpoint).
+- `components/subscribe/payment-panel.tsx`: creates a payment intent, shows
+  a Solana Pay QR (`@solana/pay`'s `createQR`) and a "pay with the connected
+  wallet" button (`createTransfer` + wallet-adapter's `sendTransaction`),
+  then polls for confirmation.
+- `components/subscribe/holder-panel.tsx`: $PABLO balance vs. the
+  admin-configured threshold, with a progress bar.
+- "Launch App" everywhere now routes to `/subscribe` instead of anchor-
+  scrolling to the landing page's CTA section.
+
 ## Route map (built incrementally, one phase at a time)
 
 ```
 app/
   page.tsx              Phase 1 — landing page (done)
-  (dashboard)/           Phase 4 — sniper, portfolio, history, wallet,
-                          analytics, settings, support
-  (admin)/                Phase 5 — admin panel
+  subscribe/page.tsx      Phase 2 — subscription status + payment (done)
+  (dashboard)/             Phase 4 — sniper, portfolio, history, wallet,
+                            analytics, settings, support
+  (admin)/                  Phase 5 — admin panel
 ```
 
 ## Local dev

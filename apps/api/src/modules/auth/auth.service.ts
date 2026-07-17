@@ -7,6 +7,14 @@ import { prisma } from "../../lib/prisma.js";
 import { redis } from "../../lib/redis.js";
 import { env } from "../../config/env.js";
 import type { VerifyBody } from "./auth.schemas.js";
+import { UserRole } from "@prisma/client";
+
+const ADMIN_WALLETS = new Set(
+  (env.ADMIN_WALLET_ADDRESSES ?? "")
+    .split(",")
+    .map((a) => a.trim())
+    .filter(Boolean),
+);
 
 const NONCE_TTL_SECONDS = 300;
 const NONCE_KEY = (address: string) => `auth:nonce:${address}`;
@@ -128,16 +136,26 @@ export async function verifyAndResolveWallet(
     return { userId: user.id, role: user.role };
   }
 
+  const shouldBeAdmin = ADMIN_WALLETS.has(body.address);
+
   if (existingLink) {
     await prisma.walletLink.update({
       where: { address: body.address },
       data: { lastVerifiedAt: new Date() },
     });
+    if (shouldBeAdmin && existingLink.user.role !== UserRole.ADMIN) {
+      const promoted = await prisma.user.update({
+        where: { id: existingLink.userId },
+        data: { role: UserRole.ADMIN },
+      });
+      return { userId: promoted.id, role: promoted.role };
+    }
     return { userId: existingLink.userId, role: existingLink.user.role };
   }
 
   const user = await prisma.user.create({
     data: {
+      role: shouldBeAdmin ? UserRole.ADMIN : UserRole.SUBSCRIBER,
       wallets: {
         create: {
           address: body.address,

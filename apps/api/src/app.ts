@@ -1,4 +1,4 @@
-import Fastify from "fastify";
+import Fastify, { type FastifyError } from "fastify";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
@@ -6,6 +6,8 @@ import rateLimit from "@fastify/rate-limit";
 import { env } from "./config/env.js";
 import authPlugin from "./plugins/auth.js";
 import authRoutes from "./modules/auth/auth.routes.js";
+import adminRoutes from "./modules/admin/admin.routes.js";
+import billingRoutes from "./modules/billing/billing.routes.js";
 
 export function buildApp() {
   const app = Fastify({
@@ -21,14 +23,38 @@ export function buildApp() {
   app.register(cookie);
   app.register(authPlugin);
 
+  // Final safety net: module-level handlers (auth.routes.ts, billing.routes.ts)
+  // catch their own typed errors and re-throw everything else, which lands
+  // here. Anything unrecognized becomes a generic message — an upstream RPC
+  // outage or a stray DB error should never leak internal detail (hostnames,
+  // driver messages, stack traces) to the client, only to the server log.
+  app.setErrorHandler((error: FastifyError, request, reply) => {
+    request.log.error({ err: error }, "unhandled error");
+    const statusCode =
+      typeof error.statusCode === "number" && error.statusCode >= 400 && error.statusCode < 500
+        ? error.statusCode
+        : 500;
+    if (statusCode >= 500) {
+      reply.code(statusCode).send({
+        error: "internal_error",
+        message: "Something went wrong on our end. Please try again shortly.",
+      });
+      return;
+    }
+    reply.code(statusCode).send({ error: "bad_request", message: error.message });
+  });
+
   app.get("/health", async () => ({ status: "ok", service: "pablo-api" }));
 
   app.register(authRoutes, { prefix: "/auth" });
+  app.register(adminRoutes, { prefix: "/admin" });
+  app.register(billingRoutes, { prefix: "/billing" });
 
   // Domain modules are registered here as they land, one phase at a time:
-  // Phase 1 → auth (done). Phase 2 → billing. Phase 3 → sniper/settings
-  // (engine-bridge proxy). Phase 4 → portfolio/trades/notifications + WS
-  // gateway. Phase 5 → admin.
+  // Phase 1 → auth (done). Phase 2 → billing + PlatformConfig admin (done).
+  // Phase 3 → sniper/settings (engine-bridge proxy). Phase 4 →
+  // portfolio/trades/notifications + WS gateway. Phase 5 → full admin
+  // console (users, holders, licenses, stats, logs, monitoring).
 
   return app;
 }

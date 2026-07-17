@@ -56,7 +56,19 @@ cargo run --bin engine-bridge   # health/version skeleton today
   against a real Postgres/Redis), wallet-adapter wired into the frontend,
   and the full premium landing page (hero, features, roadmap, FAQ, stats,
   launch CTA) with the PABLO brand assets.
-- **Next: Phase 2 (subscription)** — SOL payment verification, $PABLO
-  holder auto-Premium, admin-editable `PlatformConfig`.
+- **Phase 2 (subscription) — done.** SOL payments via `@solana/pay`
+  (Solana Pay `reference` + `findReference`/`validateTransfer`, not a memo
+  string), $PABLO holder auto-Premium with a periodic sweep so a balance
+  drop is caught without the user opening the app, admin-editable
+  `PlatformConfig` (role-gated, wallets in `ADMIN_WALLET_ADDRESSES`
+  auto-promoted), and an 11-case unit-tested subscription state machine
+  (ACTIVE/GRACE/EXPIRED). Solana RPC and the CoinGecko price API are both
+  blocked by this sandbox's network policy, so the on-chain happy paths
+  (a real confirmed payment, a real detected holder balance) couldn't be
+  exercised end-to-end here — verified instead that they fail cleanly
+  rather than crash or leak internal errors. Test the live paths before
+  production.
+- **Next: Phase 3 (bridge to the engine)** — the shared scanner, one
+  executor per subscriber, settings pushed live to the trading engine.
 
 See §14 of `docs/ARCHITECTURE.md` for the full roadmap.

@@ -41,6 +41,65 @@ export const authVerifyResponse = z.object({
 });
 export type AuthVerifyResponse = z.infer<typeof authVerifyResponse>;
 
+export const platformConfigDto = z.object({
+  subscriptionPriceUsd: z.number().positive(),
+  pabloMintAddress: z.string(),
+  minHolderTokens: z.string(), // serialized bigint (human token count, not raw units)
+  subscriptionDurationDays: z.number().int().positive(),
+  gracePeriodDays: z.number().int().nonnegative(),
+  treasuryWalletAddress: z.string(),
+  updatedAt: z.string().datetime(),
+});
+export type PlatformConfigDto = z.infer<typeof platformConfigDto>;
+
+export const platformConfigPatchSchema = z.object({
+  subscriptionPriceUsd: z.number().positive().optional(),
+  pabloMintAddress: z.string().min(32).max(44).optional(),
+  minHolderTokens: z.coerce.bigint().positive().optional(),
+  subscriptionDurationDays: z.number().int().positive().optional(),
+  gracePeriodDays: z.number().int().nonnegative().optional(),
+  treasuryWalletAddress: z.string().min(32).max(44).optional(),
+});
+export type PlatformConfigPatch = z.infer<typeof platformConfigPatchSchema>;
+
+export const subscriptionViewDto = z.object({
+  tier: z.enum(["FREE", "PREMIUM"]),
+  status: z.enum(["ACTIVE", "GRACE", "EXPIRED"]),
+  source: z.enum(["PAYMENT", "HOLDER", "ADMIN_GRANT"]).nullable(),
+  currentPeriodEnd: z.string().datetime().nullable(),
+  graceUntil: z.string().datetime().nullable(),
+  holder: z.object({
+    balance: z.string(), // raw base units, serialized bigint
+    requiredRaw: z.string(),
+    balanceHuman: z.string(),
+    requiredHuman: z.string(),
+    meetsThreshold: z.boolean(),
+  }),
+});
+export type SubscriptionViewDto = z.infer<typeof subscriptionViewDto>;
+
+export const paymentIntentDto = z.object({
+  id: z.string(),
+  reference: z.string(),
+  recipient: z.string(),
+  amountSol: z.number(),
+  amountLamports: z.string(),
+  solanaPayUrl: z.string(),
+  status: z.enum(["PENDING", "CONFIRMED", "FAILED", "EXPIRED"]),
+  expiresAt: z.string().datetime(),
+});
+export type PaymentIntentDto = z.infer<typeof paymentIntentDto>;
+
+export const paymentStatusDto = z.object({
+  id: z.string(),
+  reference: z.string(),
+  amountLamports: z.string(),
+  status: z.enum(["PENDING", "CONFIRMED", "FAILED", "EXPIRED"]),
+  expiresAt: z.string().datetime(),
+  txSignature: z.string().nullable(),
+});
+export type PaymentStatusDto = z.infer<typeof paymentStatusDto>;
+
 export const botSettingsSchema = z.object({
   isActive: z.boolean(),
   amountPerBuySol: z.number().positive(),

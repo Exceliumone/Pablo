@@ -1,7 +1,10 @@
 "use client";
 
+import Link from "next/link";
+import { ArrowRight } from "lucide-react";
 import { useAuth } from "@/components/providers/auth-provider";
 import { ConnectButton } from "@/components/wallet/connect-button";
+import { Button } from "@/components/ui/button";
 
 export function CtaLaunch() {
   const { status, user } = useAuth();
@@ -16,16 +19,25 @@ export function CtaLaunch() {
         <div className="relative">
           <h2 className="text-balance font-display text-4xl font-extrabold tracking-tight text-foreground md:text-5xl">
             {status === "authenticated" && user
-              ? "Le terminal vous attend."
+              ? "Votre abonnement vous attend."
               : "Connectez un wallet. Signez. C'est tout."}
           </h2>
           <p className="mx-auto mt-4 max-w-md text-muted-foreground">
             {status === "authenticated" && user
-              ? "Le dashboard trading arrive en Phase 4 — votre session est déjà active."
+              ? "Payez en SOL ou activez l'accès gratuit avec $PABLO."
               : "Pas de mot de passe, pas d'inscription. Votre wallet Solana est votre compte."}
           </p>
           <div className="mt-8 flex justify-center">
-            <ConnectButton />
+            {status === "authenticated" && user ? (
+              <Button size="lg" asChild>
+                <Link href="/subscribe" className="group">
+                  Voir mon abonnement
+                  <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+                </Link>
+              </Button>
+            ) : (
+              <ConnectButton />
+            )}
           </div>
         </div>
       </div>
