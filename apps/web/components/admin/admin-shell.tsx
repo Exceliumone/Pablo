@@ -5,34 +5,29 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { motion } from "framer-motion";
 import {
-  BarChart3,
-  History,
+  ArrowLeftRight,
+  FileClock,
+  Gauge,
   LogOut,
-  Radar,
-  Settings,
-  Wallet as WalletIcon,
+  ScrollText,
+  Users,
   Wallet2,
 } from "lucide-react";
 import { useAuth } from "@/components/providers/auth-provider";
 import { cn } from "@/lib/utils";
 
 const TABS = [
-  { href: "/app", label: "Sniper", icon: Radar, exact: true },
-  { href: "/app/portfolio", label: "Portfolio", icon: Wallet2, exact: false },
-  { href: "/app/history", label: "Historique", icon: History, exact: false },
-  { href: "/app/analytics", label: "Analytics", icon: BarChart3, exact: false },
-  { href: "/app/wallet", label: "Wallet", icon: WalletIcon, exact: false },
-  { href: "/app/settings", label: "Réglages", icon: Settings, exact: false },
+  { href: "/admin", label: "Statistiques", icon: Gauge, exact: true },
+  { href: "/admin/users", label: "Utilisateurs", icon: Users, exact: false },
+  { href: "/admin/subscriptions", label: "Abonnements", icon: ArrowLeftRight, exact: false },
+  { href: "/admin/holders", label: "Holders", icon: Wallet2, exact: false },
+  { href: "/admin/executors", label: "Executors", icon: FileClock, exact: false },
+  { href: "/admin/logs", label: "Logs", icon: ScrollText, exact: false },
 ] as const;
 
-function truncateAddress(address: string): string {
-  return `${address.slice(0, 4)}…${address.slice(-4)}`;
-}
-
-export function DashboardShell({ children }: { children: React.ReactNode }) {
+export function AdminShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const { user, signOut } = useAuth();
-  const primaryWallet = user?.wallets.find((w) => w.isPrimary) ?? user?.wallets[0];
+  const { signOut } = useAuth();
 
   return (
     <div className="flex min-h-screen flex-col bg-background">
@@ -50,22 +45,18 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
             <span className="font-display text-xl font-extrabold tracking-wide text-foreground">
               PABLO
             </span>
+            <span className="rounded-full bg-pablo-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-pablo-300">
+              Admin
+            </span>
           </Link>
 
           <div className="flex items-center gap-4">
-            {user?.role === "ADMIN" && (
-              <Link
-                href="/admin"
-                className="text-xs text-pablo-300 transition-colors hover:text-pablo-200"
-              >
-                Admin
-              </Link>
-            )}
-            {primaryWallet && (
-              <span className="text-tabular hidden text-xs text-muted-foreground sm:inline">
-                {truncateAddress(primaryWallet.address)}
-              </span>
-            )}
+            <Link
+              href="/app"
+              className="hidden text-xs text-muted-foreground transition-colors hover:text-foreground sm:inline"
+            >
+              Retour au dashboard
+            </Link>
             <button
               onClick={() => void signOut()}
               className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
@@ -94,7 +85,7 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
               >
                 {active && (
                   <motion.span
-                    layoutId="dashboard-tab-active"
+                    layoutId="admin-tab-active"
                     className="absolute inset-0 rounded-md bg-pablo-500/15"
                     transition={{ type: "spring", stiffness: 500, damping: 35 }}
                   />

@@ -3,8 +3,13 @@ import {
   NOTIFICATION_TYPES,
   POSITION_STATUSES,
   PROTOCOLS,
+  SUBSCRIPTION_SOURCES,
+  SUBSCRIPTION_STATUSES,
+  SUBSCRIPTION_TIERS,
   TRADE_SIDES,
   TRADE_STATUSES,
+  USER_ROLES,
+  USER_STATUSES,
 } from "./enums.js";
 
 // Wire-format DTOs shared between apps/web and apps/api. REST today; the
@@ -22,13 +27,13 @@ export type WalletLinkDto = z.infer<typeof walletLinkDto>;
 
 export const userDto = z.object({
   id: z.string(),
-  role: z.enum(["SUBSCRIBER", "ADMIN", "SUPPORT"]),
-  status: z.enum(["ACTIVE", "BANNED", "SUSPENDED"]),
+  role: z.enum(USER_ROLES),
+  status: z.enum(USER_STATUSES),
   wallets: z.array(walletLinkDto),
   subscription: z
     .object({
-      tier: z.enum(["FREE", "PREMIUM"]),
-      status: z.enum(["ACTIVE", "GRACE", "EXPIRED"]),
+      tier: z.enum(SUBSCRIPTION_TIERS),
+      status: z.enum(SUBSCRIPTION_STATUSES),
     })
     .nullable(),
 });
@@ -69,9 +74,9 @@ export const platformConfigPatchSchema = z.object({
 export type PlatformConfigPatch = z.infer<typeof platformConfigPatchSchema>;
 
 export const subscriptionViewDto = z.object({
-  tier: z.enum(["FREE", "PREMIUM"]),
-  status: z.enum(["ACTIVE", "GRACE", "EXPIRED"]),
-  source: z.enum(["PAYMENT", "HOLDER", "ADMIN_GRANT"]).nullable(),
+  tier: z.enum(SUBSCRIPTION_TIERS),
+  status: z.enum(SUBSCRIPTION_STATUSES),
+  source: z.enum(SUBSCRIPTION_SOURCES).nullable(),
   currentPeriodEnd: z.string().datetime().nullable(),
   graceUntil: z.string().datetime().nullable(),
   holder: z.object({
@@ -285,3 +290,119 @@ export const withdrawResultDto = z.object({
   txSignature: z.string(),
 });
 export type WithdrawResultDto = z.infer<typeof withdrawResultDto>;
+
+// ── Admin console (Phase 6) ────────────────────────────────────────────
+
+export const adminSubscriptionSummaryDto = z.object({
+  tier: z.enum(SUBSCRIPTION_TIERS),
+  status: z.enum(SUBSCRIPTION_STATUSES),
+  source: z.enum(SUBSCRIPTION_SOURCES).nullable(),
+  currentPeriodEnd: z.string().datetime().nullable(),
+  graceUntil: z.string().datetime().nullable(),
+});
+export type AdminSubscriptionSummaryDto = z.infer<typeof adminSubscriptionSummaryDto>;
+
+export const adminUserListItemDto = z.object({
+  id: z.string(),
+  role: z.enum(USER_ROLES),
+  status: z.enum(USER_STATUSES),
+  createdAt: z.string().datetime(),
+  primaryWallet: z.string().nullable(),
+  walletCount: z.number().int().nonnegative(),
+  subscription: adminSubscriptionSummaryDto,
+});
+export type AdminUserListItemDto = z.infer<typeof adminUserListItemDto>;
+
+export const adminUsersPageDto = z.object({
+  users: z.array(adminUserListItemDto),
+  nextCursor: z.string().nullable(),
+  totalCount: z.number().int().nonnegative(),
+});
+export type AdminUsersPageDto = z.infer<typeof adminUsersPageDto>;
+
+export const adminUserDetailDto = z.object({
+  id: z.string(),
+  role: z.enum(USER_ROLES),
+  status: z.enum(USER_STATUSES),
+  createdAt: z.string().datetime(),
+  email: z.string().nullable(),
+  wallets: z.array(walletLinkDto),
+  subscription: adminSubscriptionSummaryDto,
+  tradingWalletPublicKey: z.string().nullable(),
+  botIsActive: z.boolean(),
+  totalTrades: z.number().int().nonnegative(),
+});
+export type AdminUserDetailDto = z.infer<typeof adminUserDetailDto>;
+
+export const adminUserPatchDto = z.object({
+  role: z.enum(USER_ROLES).optional(),
+  status: z.enum(USER_STATUSES).optional(),
+});
+export type AdminUserPatchDto = z.infer<typeof adminUserPatchDto>;
+
+export const adminGrantRequestDto = z.object({
+  days: z.number().int().positive().max(3650).default(30),
+});
+export type AdminGrantRequestDto = z.infer<typeof adminGrantRequestDto>;
+
+export const adminHolderDto = z.object({
+  userId: z.string(),
+  primaryWallet: z.string().nullable(),
+  balanceRaw: z.string().nullable(), // raw base units, serialized bigint; null if never checked
+  balanceHuman: z.string().nullable(), // best-effort — null when the mint-decimals RPC lookup is unavailable
+  meetsThreshold: z.boolean().nullable(), // null when unknown (never checked, or threshold can't be computed)
+  checkedAt: z.string().datetime().nullable(),
+});
+export type AdminHolderDto = z.infer<typeof adminHolderDto>;
+
+export const adminHoldersPageDto = z.object({
+  holders: z.array(adminHolderDto),
+  nextCursor: z.string().nullable(),
+});
+export type AdminHoldersPageDto = z.infer<typeof adminHoldersPageDto>;
+
+export const platformStatsDto = z.object({
+  totalUsers: z.number().int().nonnegative(),
+  newUsersLast7d: z.number().int().nonnegative(),
+  activeSubscriptions: z.number().int().nonnegative(),
+  premiumViaPayment: z.number().int().nonnegative(),
+  premiumViaHolder: z.number().int().nonnegative(),
+  premiumViaAdminGrant: z.number().int().nonnegative(),
+  totalTrades: z.number().int().nonnegative(),
+  totalBuyVolumeSol: z.number(),
+  botsRunning: z.number().int().nonnegative().nullable(), // null when engine-bridge is unreachable
+});
+export type PlatformStatsDto = z.infer<typeof platformStatsDto>;
+
+export const auditLogDto = z.object({
+  id: z.string(),
+  actorType: z.string(),
+  actorUserId: z.string().nullable(),
+  action: z.string(),
+  meta: z.record(z.string(), z.unknown()).nullable(),
+  createdAt: z.string().datetime(),
+});
+export type AuditLogDto = z.infer<typeof auditLogDto>;
+
+export const auditLogsPageDto = z.object({
+  logs: z.array(auditLogDto),
+  nextCursor: z.string().nullable(),
+});
+export type AuditLogsPageDto = z.infer<typeof auditLogsPageDto>;
+
+export const adminExecutorDto = z.object({
+  userId: z.string(),
+  status: z.enum(BOT_STATUSES),
+  pid: z.number().nullable(),
+  startedAt: z.string().datetime().nullable(),
+  lastEventAt: z.string().datetime().nullable(),
+  lastError: z.string().nullable(),
+  restartCount: z.number().int().nonnegative(),
+});
+export type AdminExecutorDto = z.infer<typeof adminExecutorDto>;
+
+export const adminExecutorsDto = z.object({
+  executors: z.array(adminExecutorDto),
+  reachable: z.boolean(), // false when engine-bridge itself couldn't be reached
+});
+export type AdminExecutorsDto = z.infer<typeof adminExecutorsDto>;

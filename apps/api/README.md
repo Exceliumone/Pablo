@@ -134,6 +134,59 @@ directly; the transfer itself was verified to fail cleanly (sanitized
 blocks. **Not verifiable in this sandbox**: live SOL/$PABLO balances and
 an actual on-chain withdrawal — test both on Devnet before Mainnet.
 
+**Phase 6 — admin console.** `src/lib/audit.ts`, six new
+`src/modules/admin/*.service.ts` + `*.routes.ts` pairs, all mounted under
+`GET/PUT /admin/config`'s existing `admin.routes.ts` behind a nested
+`preHandler` so only `/admin/config` stays public and everything else
+requires the `ADMIN` role.
+- `users.service.ts`: `GET /admin/users` (cursor-paginated roster),
+  `GET /admin/users/:id` (detail incl. trading wallet pubkey, bot active
+  flag, trade count), `PATCH /admin/users/:id` (role/status — refuses to
+  let an admin change their own role, a cheap guard against a full
+  self-lockout).
+- `subscriptions.service.ts`: `GET /admin/subscriptions` (filterable by
+  status), `POST /admin/subscriptions/:id/grant` (Premium as
+  `ADMIN_GRANT`, N days), `POST /admin/subscriptions/:id/revoke`. Revoke
+  sets the safe EXPIRED/FREE baseline in the same write that clears the
+  grant, then best-effort reconciles upward (a real payment period or
+  genuine holder balance can still restore ACTIVE) — **not** "clear the
+  grant and hope reconciliation fixes the status," which was the original
+  implementation and a real bug: reconciliation needs a live $PABLO RPC
+  call and can throw outright, so revoke was silently not revoking
+  anything whenever RPC was unavailable. Caught live, fixed, reverified.
+- `holders.service.ts`: `GET /admin/holders` — reads the last-persisted
+  `HolderSnapshot` rows (summed per user across wallets) rather than
+  re-triggering `checkHolderStatus`'s live RPC fan-out on every page load;
+  this is a monitoring view of what's already been observed, not a live
+  probe. `balanceHuman`/`meetsThreshold` degrade to `null` when the
+  mint-decimals RPC lookup is unavailable, same pattern as `wallet.service.ts`.
+- `stats.service.ts`: `GET /admin/stats` — user/subscription/trade
+  aggregates plus a live bots-running count from `engine-bridge`
+  (`null` when the orchestrator is unreachable, never a false zero).
+- `logs.service.ts`: `GET /admin/logs` — reads the `AuditLog` table, which
+  nothing wrote to before this phase. `lib/audit.ts`'s `logAudit()` is now
+  called from every admin mutation (`user.update`, `subscription.grant`,
+  `subscription.revoke`) and retrofitted onto `platform-config.service.ts`'s
+  `updatePlatformConfig` (Phase 2, previously unaudited).
+- `executors.service.ts`: `GET /admin/executors` — proxies
+  `engine-bridge`'s `GET /internal/executors` (already existed, unused by
+  anything until now) via a new `listExecutors()` in
+  `lib/engine-bridge-client.ts`. Reports `{ executors: [], reachable: false }`
+  rather than a 500 when the orchestrator is down.
+
+Verified against a real local Postgres/Redis **and** a real running
+`engine-bridge` orchestrator (`cargo run --bin engine-bridge`): promoted a
+test user to ADMIN, exercised every endpoint above by hand, and — the
+strongest check — started a real executor via `POST /bot/start` and
+watched `GET /admin/executors` correctly report it moving
+STARTING → RUNNING → STOPPED, matching exactly what the orchestrator's own
+Redis-subscription self-healing (Phase 3) reports. Also verified the
+ADMIN-role gate rejects a non-admin JWT with 403, and that role/status
+changes, grants, and revokes all land in `GET /admin/logs`.
+**Not verifiable in this sandbox**: live $PABLO holder balances, since
+Solana RPC is blocked here — the holders view degrades to "never
+checked" instead of guessing.
+
 ## Local dev
 
 ```bash
@@ -147,9 +200,9 @@ pnpm --filter @pablo/api dev
 ```
 
 `engine-bridge` (the Rust orchestrator) needs to be running separately for
-`/bot/*` routes to do anything beyond validation — see the root README's
-"Local dev" section.
+`/bot/*` routes and the admin Executors page to do anything beyond
+validation — see the root README's "Local dev" section.
 
-The `admin` dashboard (Phase 5's console: users, holders, licenses, stats,
-logs) is the one domain module left — see `docs/ARCHITECTURE.md` at the
-repo root.
+Every domain module from the original roadmap is now shipped — the
+remaining work (Phase 7) is load/security/end-to-end hardening, not new
+modules. See `docs/ARCHITECTURE.md` at the repo root.

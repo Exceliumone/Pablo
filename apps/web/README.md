@@ -112,6 +112,40 @@ fonts.gstatic.com).
   Réglages existed past the fold — fixed with a permanent edge-fade
   (`.scroll-fade-x` in `globals.css`, a `mask-image` gradient).
 
+**Phase 6 — admin console.**
+- `app/admin/layout.tsx`: role-gated, not subscription-gated — checks
+  `user.role === "ADMIN"` and matches the backend's `requireRole("ADMIN")`
+  exactly (the schema's `SUPPORT` role isn't let in either, since it has
+  no granted backend capabilities yet — no half-built promise on either
+  side of the stack). `components/admin/admin-shell.tsx` is the six-tab
+  shell (Statistiques, Utilisateurs, Abonnements, Holders, Executors,
+  Logs), same spring-tab-indicator and `scroll-fade-x` treatment as the
+  subscriber dashboard shell. A small "Admin" link appears in
+  `dashboard-shell.tsx`'s header for users whose role is ADMIN.
+- `app/admin/page.tsx`: the Statistiques landing page — user/subscription
+  counts by source, trade volume, and a live bots-running count (`—` when
+  `engine-bridge` is unreachable, never a fabricated zero).
+- `app/admin/users/page.tsx` + `components/admin/users-table.tsx`:
+  inline role/status `<select>`s per row; an admin's own row has its role
+  select disabled (mirrors the backend's self-demotion guard).
+- `app/admin/subscriptions/page.tsx` + `components/admin/subscriptions-table.tsx`:
+  status-filtered list with inline Accorder/Révoquer buttons.
+- `app/admin/holders/page.tsx` + `components/admin/holders-table.tsx`:
+  last-observed $PABLO balance, "Jamais vérifié" for a user with no
+  snapshot yet rather than blocking the page on a live check.
+- `app/admin/executors/page.tsx`: live executor table when
+  `engine-bridge` is reachable, a distinct "orchestrateur injoignable"
+  empty state when it isn't — verified against a real running
+  orchestrator with a real spawned executor, watched the row go
+  STARTING → RUNNING → STOPPED live.
+- `app/admin/logs/page.tsx`: the `AuditLog` trail — every role/status
+  change and subscription grant/revoke, actor + action + JSON meta.
+- `lib/use-admin-*.ts`: one small hook per resource (users, subscriptions,
+  holders, stats, logs, executors), following the same
+  cursor-pagination shape as `lib/use-trades.ts` rather than a generic
+  "useResource" abstraction — consistent with how the rest of `lib/`
+  already does this per-feature.
+
 ## Route map (built incrementally, one phase at a time)
 
 ```
@@ -125,7 +159,13 @@ app/
   app/analytics/page.tsx   Phase 4 — win rate, PnL chart (done)
   app/wallet/page.tsx      Phase 4 — deposit/withdraw (done)
   app/settings/page.tsx    Phase 4 — bot settings form (done)
-  (admin)/                 Phase 6 — admin panel
+  admin/layout.tsx         Phase 6 — role gate + admin shell (done)
+  admin/page.tsx           Phase 6 — platform statistics (done)
+  admin/users/page.tsx     Phase 6 — user roster, role/status (done)
+  admin/subscriptions/     Phase 6 — grant/revoke Premium (done)
+  admin/holders/page.tsx   Phase 6 — $PABLO holder monitoring (done)
+  admin/executors/page.tsx Phase 6 — live executor monitoring (done)
+  admin/logs/page.tsx      Phase 6 — audit trail (done)
 ```
 
 ## Local dev

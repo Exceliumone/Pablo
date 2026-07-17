@@ -131,7 +131,33 @@ cargo run --bin engine-bridge   # orchestrator: HTTP API on :8090
   past the fold, fixed with a permanent edge-fade mask. Both fixed and
   reverified with a clean re-run (fresh login, single navigation, no stale
   session state) rather than assumed fixed.
-- **Next: Phase 6 (admin console)** — users, holders, licenses, stats,
-  logs, executor monitoring.
+- **Phase 6 (admin console) — done.** A role-gated `/admin` console
+  (ADMIN only, checked identically on the frontend gate and every backend
+  route) covering all six areas: Utilisateurs (role/status, with a
+  self-demotion guard), Abonnements (grant/revoke Premium as
+  `ADMIN_GRANT`), Holders (latest observed $PABLO balance per user — reads
+  the persisted `HolderSnapshot` rows rather than re-triggering a live RPC
+  check per user on every page load), Executors (a live proxy of
+  `engine-bridge`'s `GET /internal/executors`, gracefully reporting
+  "unreachable" rather than erroring when the orchestrator is down),
+  Statistiques (user/subscription/trade aggregates, bots-running count),
+  and Logs (a new `AuditLog` write-path — `platform_config.update`,
+  `user.update`, `subscription.grant/revoke` — nothing wrote to that table
+  before this phase). Verified end-to-end against a real local
+  Postgres/Redis **and** a real running `engine-bridge` orchestrator: spun
+  up a genuine executor process, watched it go PENDING → RUNNING →
+  STOPPED through the admin Executors table exactly as the orchestrator
+  self-reported it, confirmed the mobile layout the same programmatic way
+  as Phase 5. Caught and fixed a real correctness bug along the way:
+  revoking a subscription cleared its grant fields but left `status`/`tier`
+  unchanged, so a subsequent reconciliation failure (RPC unavailable, as
+  it is in this sandbox) silently left the subscription looking
+  ACTIVE/PREMIUM after being "revoked" — fixed by setting the safe
+  EXPIRED/FREE baseline directly instead of relying on reconciliation to
+  get there. **Not verifiable in this sandbox**: live $PABLO holder
+  balances (Solana RPC blocked) — the holders view degrades to "never
+  checked" rather than guessing.
+- **Next: Phase 7 (production hardening)** — load testing, security
+  audit, end-to-end tests before opening to the first subscribers.
 
 See §14 of `docs/ARCHITECTURE.md` for the full roadmap.

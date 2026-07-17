@@ -1,6 +1,12 @@
 import type { FastifyInstance } from "fastify";
 import { platformConfigPatchSchema, type PlatformConfigDto } from "@pablo/shared-types";
 import { getPlatformConfig, updatePlatformConfig } from "./platform-config.service.js";
+import adminUsersRoutes from "./users.routes.js";
+import adminSubscriptionsRoutes from "./subscriptions.routes.js";
+import adminHoldersRoutes from "./holders.routes.js";
+import adminStatsRoutes from "./stats.routes.js";
+import adminLogsRoutes from "./logs.routes.js";
+import adminExecutorsRoutes from "./executors.routes.js";
 
 function toDto(config: Awaited<ReturnType<typeof getPlatformConfig>>): PlatformConfigDto {
   return {
@@ -31,4 +37,16 @@ export default async function adminRoutes(fastify: FastifyInstance) {
       return toDto(updated);
     },
   );
+
+  // Everything else under /admin is the console proper — authenticated
+  // AND role-gated, unlike GET/PUT /config above.
+  await fastify.register(async (console) => {
+    console.addHook("preHandler", fastify.requireRole("ADMIN"));
+    await console.register(adminUsersRoutes, { prefix: "/users" });
+    await console.register(adminSubscriptionsRoutes, { prefix: "/subscriptions" });
+    await console.register(adminHoldersRoutes, { prefix: "/holders" });
+    await console.register(adminStatsRoutes, { prefix: "/stats" });
+    await console.register(adminLogsRoutes, { prefix: "/logs" });
+    await console.register(adminExecutorsRoutes, { prefix: "/executors" });
+  });
 }

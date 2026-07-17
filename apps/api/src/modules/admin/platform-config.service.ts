@@ -1,6 +1,7 @@
 import { prisma } from "../../lib/prisma.js";
 import { redis } from "../../lib/redis.js";
 import { env } from "../../config/env.js";
+import { logAudit } from "../../lib/audit.js";
 
 const CACHE_KEY = "platform-config";
 const CACHE_TTL_SECONDS = 30;
@@ -71,5 +72,11 @@ export async function updatePlatformConfig(adminUserId: string, patch: PlatformC
     data: { ...patch, updatedBy: adminUserId },
   });
   await redis.del(CACHE_KEY);
+  await logAudit({
+    actorType: "ADMIN",
+    actorUserId: adminUserId,
+    action: "platform_config.update",
+    meta: { ...patch, minHolderTokens: patch.minHolderTokens?.toString() },
+  });
   return updated;
 }

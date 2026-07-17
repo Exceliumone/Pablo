@@ -27,3 +27,15 @@ export type SubscriptionSource = (typeof SUBSCRIPTION_SOURCES)[number];
 
 export const PROTOCOLS = ["pumpfun", "pumpswap", "raydium", "meteora", "auto"] as const;
 export type Protocol = (typeof PROTOCOLS)[number];
+
+export const USER_ROLES = ["SUBSCRIBER", "ADMIN", "SUPPORT"] as const;
+export type UserRole = (typeof USER_ROLES)[number];
+
+export const USER_STATUSES = ["ACTIVE", "BANNED", "SUSPENDED"] as const;
+export type UserStatus = (typeof USER_STATUSES)[number];
+
+export const SUBSCRIPTION_TIERS = ["FREE", "PREMIUM"] as const;
+export type SubscriptionTier = (typeof SUBSCRIPTION_TIERS)[number];
+
+export const SUBSCRIPTION_STATUSES = ["ACTIVE", "GRACE", "EXPIRED"] as const;
+export type SubscriptionStatus = (typeof SUBSCRIPTION_STATUSES)[number];

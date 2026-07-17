@@ -56,14 +56,17 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-function toBotStatusDto(view: {
+interface RawExecutorView {
+  user_id: string;
   status: string;
   pid: number | null;
   started_at: string | null;
   last_event_at: string | null;
   last_error: string | null;
   restart_count: number;
-}): BotStatusDto {
+}
+
+function toBotStatusDto(view: RawExecutorView): BotStatusDto {
   return {
     status: view.status as BotStatusDto["status"],
     pid: view.pid,
@@ -95,4 +98,11 @@ export async function getExecutorStatus(userId: string): Promise<BotStatusDto> {
     `/internal/executors/${userId}`,
   );
   return toBotStatusDto(view);
+}
+
+/** Admin monitoring only — every executor the orchestrator currently knows
+ * about, across all users. */
+export async function listExecutors(): Promise<(BotStatusDto & { userId: string })[]> {
+  const views = await request<RawExecutorView[]>("/internal/executors");
+  return views.map((view) => ({ userId: view.user_id, ...toBotStatusDto(view) }));
 }

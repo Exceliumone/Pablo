@@ -46,7 +46,7 @@ const PHASES: { phase: string; title: string; body: string; status: Status }[] =
     phase: "Phase 6",
     title: "Console admin",
     body: "Utilisateurs, holders, licences, statistiques, logs, monitoring des executors.",
-    status: "upcoming",
+    status: "done",
   },
   {
     phase: "Phase 7",
