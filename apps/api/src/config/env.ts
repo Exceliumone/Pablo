@@ -5,6 +5,17 @@ const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().int().positive().default(4000),
   APP_ORIGIN: z.string().url().default("http://localhost:3000"),
+  // The refresh cookie is scoped narrowly (not "/") so it only ever rides
+  // along on auth calls — but that scope has to match the path the
+  // *browser* actually sees, not apps/api's own internal route prefix.
+  // Behind a reverse proxy that strips a prefix before forwarding (e.g.
+  // Nginx `location /api/ { proxy_pass http://127.0.0.1:4000/; }`), the
+  // browser's request path is /api/auth/..., not /auth/... — a cookie
+  // scoped to /auth is then never sent back, silently breaking
+  // /auth/refresh (though not /auth/verify itself, which returns its
+  // tokens in the JSON body). Set this to match whatever prefix, if any,
+  // sits in front of /auth on the public-facing domain.
+  AUTH_COOKIE_PATH: z.string().min(1).default("/auth"),
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().min(1),
   JWT_ACCESS_SECRET: z.string().min(16),

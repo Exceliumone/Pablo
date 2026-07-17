@@ -24,7 +24,7 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const { publicKey, signMessage, disconnect, connected } = useWallet();
+  const { wallet, publicKey, signMessage, disconnect, connected } = useWallet();
   const [status, setStatus] = useState<AuthStatus>("restoring");
   const [user, setUser] = useState<UserDto | null>(null);
   const [accessToken, setAccessToken] = useState<string | null>(null);
@@ -73,7 +73,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       const result = await apiFetch<AuthVerifyResponse>("/auth/verify", {
         method: "POST",
-        body: JSON.stringify({ address, signature, provider: "wallet-standard" }),
+        body: JSON.stringify({ address, signature, provider: wallet?.adapter.name ?? "other" }),
       });
 
       setAccessToken(result.accessToken);
@@ -83,7 +83,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setError(err instanceof ApiError ? err.message : "Sign-in failed.");
       setStatus("error");
     }
-  }, [publicKey, signMessage]);
+  }, [publicKey, signMessage, wallet]);
 
   const signOut = useCallback(async () => {
     await apiFetch("/auth/logout", { method: "POST" }).catch(() => undefined);
