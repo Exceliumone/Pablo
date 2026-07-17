@@ -128,9 +128,49 @@ async fn main() -> anyhow::Result<()> {
                  under load. Not intended to run against real capital — see this file's module \
                  doc comment."
             );
-            run_rpc_websocket(env("RPC_HTTP"), env("SOLANA_WS_URL"), redis_conn).await
+            let solana_ws_url = env("SOLANA_WS_URL");
+            log_redacted_ws_url(&solana_ws_url);
+            run_rpc_websocket(env("RPC_HTTP"), solana_ws_url, redis_conn).await
         }
     }
+}
+
+/// Logs the *shape* of SOLANA_WS_URL — scheme, host, and how many path
+/// segments it has — without ever logging the URL itself, so the secret
+/// never ends up in log output. Exists to self-diagnose the most common
+/// cause of Chainstack's WS handshake returning HTTP 401: Chainstack's
+/// documented Solana WSS auth is the API key embedded as the LAST URL PATH
+/// SEGMENT (e.g. `wss://ws-nd-XXX.p2pify.com/<KEY>` or
+/// `wss://<network>.core.chainstack.com/<KEY>`) — it is not a header, not
+/// Bearer, and not HTTP Basic Auth. `PubsubClient::new()` sends the full
+/// URL path verbatim (verified by reading tokio-tungstenite's
+/// `IntoClientRequest` impl), so a URL that already ends in `/<KEY>` works
+/// fine through it; a URL with zero path segments (key left off, or a
+/// plain `wss://ws-nd-XXX.p2pify.com` copied from the dashboard's "host"
+/// field instead of its full endpoint URL) will authenticate as nobody and
+/// is the first thing this rules in or out before assuming Chainstack has
+/// its optional Basic-Auth "password protection" feature turned on instead
+/// (a separate, less common cause `PubsubClient::new()` truly cannot
+/// support — see `watch_program_logs`'s error-logging comment for what to
+/// check if `path_segment_count` here is already correct).
+fn log_redacted_ws_url(url: &str) {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("<no-scheme>", url));
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let has_userinfo = authority.contains('@');
+    let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    tracing::info!(
+        scheme = %scheme,
+        host = %host,
+        has_userinfo,
+        path_segment_count = path_segments.len(),
+        last_path_segment_len = path_segments.last().map(|s| s.len()).unwrap_or(0),
+        "scanner: SOLANA_WS_URL shape (redacted — no secret logged). If path_segment_count is 0, \
+         that is almost certainly why Chainstack returns 401: no API key is present in the URL \
+         at all. Compare against the full WSS endpoint URL shown in your Chainstack dashboard \
+         (not just its hostname)."
+    );
 }
 
 fn watched_programs() -> Vec<String> {
