@@ -396,15 +396,55 @@ async fn watch_program_logs(
     redis_conn: RedisConn,
     lookup_limiter: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
-    let pubsub = PubsubClient::new(solana_ws_url).await?;
-    let (mut stream, _unsubscribe) = pubsub
+    // PubsubClientError's ConnectionError/WsError variants wrap the real
+    // tokio-tungstenite error (DNS, TLS, a non-101 HTTP response i.e.
+    // 401/403, malformed handshake, ...) in a bare tuple field with no
+    // #[source]/#[from] — thiserror only wires those into the error chain
+    // when explicitly annotated, so it's NOT reachable via .source(), and
+    // the Display impl is a fixed string ("unable to connect to server")
+    // that never mentions it either. `?` alone (or even Debug-formatting
+    // an anyhow-wrapped version of it) loses that detail before it's ever
+    // logged. Log the raw error's Debug — which does include it, since
+    // #[derive(Debug)] doesn't care about thiserror's chain wiring — right
+    // here, before it's converted to anyhow for this function's own
+    // control flow.
+    let pubsub = match PubsubClient::new(solana_ws_url).await {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!(
+                url = %solana_ws_url,
+                program = %program,
+                error_display = %e,
+                error_debug = ?e,
+                "scanner: PubsubClient::new failed — error_debug has the real cause \
+                 (DNS/TLS/HTTP status/handshake), error_display is a generic thiserror \
+                 message that won't show it"
+            );
+            anyhow::bail!("PubsubClient::new failed: {e}");
+        }
+    };
+
+    let (mut stream, _unsubscribe) = match pubsub
         .logs_subscribe(
             RpcTransactionLogsFilter::Mentions(vec![program.to_string()]),
             RpcTransactionLogsConfig {
                 commitment: Some(CommitmentConfig::processed()),
             },
         )
-        .await?;
+        .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(
+                url = %solana_ws_url,
+                program = %program,
+                error_display = %e,
+                error_debug = ?e,
+                "scanner: logs_subscribe failed — see error_debug for the real cause"
+            );
+            anyhow::bail!("logs_subscribe failed: {e}");
+        }
+    };
 
     while let Some(update) = stream.next().await {
         if update.value.err.is_some() {
