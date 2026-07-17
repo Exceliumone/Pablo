@@ -39,7 +39,7 @@ export function WithdrawForm({
   }
 
   return (
-    <div className="glass flex flex-col rounded-xl p-7">
+    <div className="glass flex min-w-0 flex-col rounded-xl p-7">
       <div className="inline-flex w-fit items-center gap-2 rounded-lg bg-pablo-500/10 p-2.5 text-pablo-300">
         <Send className="h-5 w-5" />
       </div>

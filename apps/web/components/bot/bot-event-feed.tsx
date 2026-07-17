@@ -14,7 +14,7 @@ function EventRow({ event }: { event: BotEventDto }) {
         <span className={cn("rounded-md p-1.5", isBuy ? "bg-success/10 text-success" : "bg-danger/10 text-danger")}>
           {isBuy ? <ArrowUpRight className="h-3.5 w-3.5" /> : <ArrowDownRight className="h-3.5 w-3.5" />}
         </span>
-        <span className="flex-1 truncate">
+        <span className="min-w-0 flex-1 truncate">
           <span className="font-medium text-foreground">{isBuy ? "Achat" : "Vente"}</span>{" "}
           <span className="text-tabular text-muted-foreground">{event.mint.slice(0, 6)}…</span>
           {event.reason && <span className="text-xs text-muted-foreground"> · {event.reason}</span>}
@@ -30,7 +30,7 @@ function EventRow({ event }: { event: BotEventDto }) {
         <span className="rounded-md bg-pablo-500/10 p-1.5 text-pablo-300">
           <Radar className="h-3.5 w-3.5" />
         </span>
-        <span className="flex-1 truncate text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate text-muted-foreground">
           Nouveau token détecté <span className="text-tabular text-foreground">{event.mint.slice(0, 6)}…</span> sur{" "}
           {event.dex}
         </span>
@@ -45,7 +45,7 @@ function EventRow({ event }: { event: BotEventDto }) {
         <span className="rounded-md bg-danger/10 p-1.5 text-danger">
           <AlertTriangle className="h-3.5 w-3.5" />
         </span>
-        <span className="flex-1 truncate text-danger">{event.message}</span>
+        <span className="min-w-0 flex-1 truncate text-danger">{event.message}</span>
         <span className="text-tabular text-xs text-muted-foreground">{time}</span>
       </div>
     );

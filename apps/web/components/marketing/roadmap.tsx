@@ -1,3 +1,6 @@
+"use client";
+
+import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 
 type Status = "done" | "active" | "upcoming";
@@ -35,12 +38,18 @@ const PHASES: { phase: string; title: string; body: string; status: Status }[] =
   },
   {
     phase: "Phase 5",
+    title: "Landing page premium",
+    body: "Animations au scroll, micro-interactions, optimisation mobile — sur toute la plateforme.",
+    status: "done",
+  },
+  {
+    phase: "Phase 6",
     title: "Console admin",
     body: "Utilisateurs, holders, licences, statistiques, logs, monitoring des executors.",
     status: "upcoming",
   },
   {
-    phase: "Phase 6",
+    phase: "Phase 7",
     title: "Mise en production",
     body: "Charge, audit de sécurité, tests de bout en bout avant l'ouverture aux premiers abonnés.",
     status: "upcoming",
@@ -56,7 +65,13 @@ const STATUS_LABEL: Record<Status, string> = {
 export function Roadmap() {
   return (
     <section id="roadmap" className="container py-24">
-      <div className="mx-auto max-w-2xl text-center">
+      <motion.div
+        initial={{ opacity: 0, y: 12 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-80px" }}
+        transition={{ duration: 0.5 }}
+        className="mx-auto max-w-2xl text-center"
+      >
         <p className="text-xs font-semibold uppercase tracking-[0.25em] text-pablo-400">
           Roadmap
         </p>
@@ -67,14 +82,21 @@ export function Roadmap() {
           Chaque phase est entièrement fonctionnelle avant que la suivante ne
           démarre.
         </p>
-      </div>
+      </motion.div>
 
       <ol className="relative mx-auto mt-16 max-w-2xl border-l border-surface-border/20 pl-8">
-        {PHASES.map((p) => (
-          <li key={p.phase} className="relative mb-10 last:mb-0">
+        {PHASES.map((p, i) => (
+          <motion.li
+            key={p.phase}
+            initial={{ opacity: 0, x: -10 }}
+            whileInView={{ opacity: 1, x: 0 }}
+            viewport={{ once: true, margin: "-60px" }}
+            transition={{ delay: (i % 5) * 0.06, duration: 0.4 }}
+            className="group relative mb-10 last:mb-0"
+          >
             <span
               className={cn(
-                "absolute -left-[calc(2rem+5px)] top-1.5 h-2.5 w-2.5 rounded-full",
+                "absolute -left-[calc(2rem+5px)] top-1.5 h-2.5 w-2.5 rounded-full transition-transform duration-300 group-hover:scale-125",
                 p.status === "done" && "bg-success",
                 p.status === "active" && "animate-pulse-glow bg-pablo-400",
                 p.status === "upcoming" && "bg-muted-foreground/40",
@@ -95,9 +117,11 @@ export function Roadmap() {
                 {STATUS_LABEL[p.status]}
               </span>
             </div>
-            <h3 className="mt-2 font-display text-xl font-bold text-foreground">{p.title}</h3>
+            <h3 className="mt-2 font-display text-xl font-bold text-foreground transition-colors group-hover:text-pablo-200">
+              {p.title}
+            </h3>
             <p className="mt-1.5 text-sm text-muted-foreground">{p.body}</p>
-          </li>
+          </motion.li>
         ))}
       </ol>
     </section>

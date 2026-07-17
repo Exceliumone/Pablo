@@ -83,11 +83,40 @@ fonts.gstatic.com).
   Phase 2 payment panel) and a guarded withdraw form with an explicit
   confirm step before it calls `POST /wallet/withdraw`.
 
+**Phase 5 — landing page premium.**
+- Scroll-reveal (`framer-motion`'s `whileInView`, matching the pattern
+  already established in `hero.tsx`/`features.tsx`) added to every
+  marketing section that didn't have it yet: `presentation.tsx`,
+  `stats.tsx`, `faq.tsx`, `conviction.tsx` (plus an image hover scale),
+  `roadmap.tsx` (staggered per phase), and `cta-launch.tsx` (a slow
+  breathing glow, not just a scroll reveal). `navbar.tsx`'s mobile menu is
+  now an animated height/opacity collapse instead of an instant
+  conditional render. `dashboard-shell.tsx`'s active tab gets a
+  spring-animated sliding highlight (`layoutId`), not a static class swap.
+- The substantive work was a mobile pass, not the animations: a
+  Playwright session authenticated through the real SIWS + cookie flow
+  (not a stub), screenshotted at 375px across the landing page and all
+  six dashboard tabs, and audited programmatically for horizontal
+  overflow (an ancestor-aware `getBoundingClientRect` scan, not eyeballing
+  screenshots). That caught two real bugs: `components/wallet/deposit-panel.tsx`'s
+  address `<span className="truncate">` never actually truncated because
+  neither its flex row nor the `grid gap-6 lg:grid-cols-2` item it sat in
+  had `min-w-0` — flex/grid items default to `min-width: auto`, which
+  refuses to shrink below content size regardless of `truncate` — so a
+  44-character base58 address blew the wallet page out to 462px on a
+  375px viewport. Fixed with `min-w-0` at both the grid-item and flex-row
+  level (and the same latent pattern in `bot-event-feed.tsx`'s three
+  `truncate` spans, pre-emptively, since an error message can be
+  arbitrary length). Separately, `dashboard-shell.tsx`'s tab strip
+  scrolls horizontally on mobile but gave no visual hint that Wallet and
+  Réglages existed past the fold — fixed with a permanent edge-fade
+  (`.scroll-fade-x` in `globals.css`, a `mask-image` gradient).
+
 ## Route map (built incrementally, one phase at a time)
 
 ```
 app/
-  page.tsx                 Phase 1 — landing page (done)
+  page.tsx                 Phase 1 — landing page (done), Phase 5 polish (done)
   subscribe/page.tsx       Phase 2 — subscription status + payment (done)
   app/layout.tsx           Phase 4 — auth/subscription gate + dashboard shell (done)
   app/page.tsx             Phase 3 — sniper tab: start/stop + live feed (done)
@@ -96,7 +125,7 @@ app/
   app/analytics/page.tsx   Phase 4 — win rate, PnL chart (done)
   app/wallet/page.tsx      Phase 4 — deposit/withdraw (done)
   app/settings/page.tsx    Phase 4 — bot settings form (done)
-  (admin)/                 Phase 5 — admin panel
+  (admin)/                 Phase 6 — admin panel
 ```
 
 ## Local dev

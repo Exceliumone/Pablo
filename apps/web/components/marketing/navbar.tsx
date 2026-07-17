@@ -3,6 +3,7 @@
 import Image from "next/image";
 import Link from "next/link";
 import { useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { Menu, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConnectButton } from "@/components/wallet/connect-button";
@@ -56,31 +57,42 @@ export function Navbar() {
           className="text-foreground md:hidden"
           onClick={() => setMobileOpen((v) => !v)}
           aria-label="Toggle menu"
+          aria-expanded={mobileOpen}
         >
           {mobileOpen ? <X className="h-6 w-6" /> : <Menu className="h-6 w-6" />}
         </button>
       </div>
 
-      {mobileOpen && (
-        <div className="glass mx-4 mb-4 flex flex-col gap-4 rounded-lg p-5 md:hidden">
-          {LINKS.map((link) => (
-            <a
-              key={link.href}
-              href={link.href}
-              onClick={() => setMobileOpen(false)}
-              className="text-sm text-muted-foreground hover:text-foreground"
-            >
-              {link.label}
-            </a>
-          ))}
-          <div className="flex flex-col gap-3 pt-2">
-            <ConnectButton />
-            <Button asChild size="default">
-              <Link href="/app">Launch App</Link>
-            </Button>
-          </div>
-        </div>
-      )}
+      <AnimatePresence>
+        {mobileOpen && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.25, ease: "easeOut" }}
+            className="overflow-hidden md:hidden"
+          >
+            <div className="glass mx-4 mb-4 flex flex-col gap-4 rounded-lg p-5">
+              {LINKS.map((link) => (
+                <a
+                  key={link.href}
+                  href={link.href}
+                  onClick={() => setMobileOpen(false)}
+                  className="text-sm text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  {link.label}
+                </a>
+              ))}
+              <div className="flex flex-col gap-3 pt-2">
+                <ConnectButton />
+                <Button asChild size="default">
+                  <Link href="/app">Launch App</Link>
+                </Button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </header>
   );
 }

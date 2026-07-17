@@ -23,7 +23,7 @@ export function DepositPanel({ wallet }: { wallet: WalletDto }) {
   }
 
   return (
-    <div className="glass flex flex-col rounded-xl p-7">
+    <div className="glass flex min-w-0 flex-col rounded-xl p-7">
       <div className="inline-flex w-fit items-center gap-2 rounded-lg bg-pablo-500/10 p-2.5 text-pablo-300">
         <QrCode className="h-5 w-5" />
       </div>
@@ -41,9 +41,9 @@ export function DepositPanel({ wallet }: { wallet: WalletDto }) {
         </div>
         <button
           onClick={() => void copy()}
-          className="text-tabular flex w-full items-center justify-between gap-2 rounded-md border border-surface-border/20 bg-white/[0.03] px-3 py-2 text-xs text-foreground transition-colors hover:border-pablo-500/40"
+          className="text-tabular flex w-full min-w-0 items-center justify-between gap-2 rounded-md border border-surface-border/20 bg-white/[0.03] px-3 py-2 text-xs text-foreground transition-colors hover:border-pablo-500/40"
         >
-          <span className="truncate">{wallet.publicKey}</span>
+          <span className="min-w-0 truncate">{wallet.publicKey}</span>
           {copied ? (
             <Check className="h-3.5 w-3.5 shrink-0 text-success" />
           ) : (

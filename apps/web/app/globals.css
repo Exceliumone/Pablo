@@ -69,3 +69,12 @@ body {
 .text-tabular {
   font-variant-numeric: tabular-nums;
 }
+
+/* Hints that a horizontally-scrollable strip has more content past the
+   right edge (the dashboard tab nav on narrow viewports, where Wallet and
+   Réglages sit past the fold with no other affordance) — fades only the
+   trailing edge, since the strip is always at rest scrolled to the start. */
+.scroll-fade-x {
+  mask-image: linear-gradient(to right, black calc(100% - 24px), transparent);
+  -webkit-mask-image: linear-gradient(to right, black calc(100% - 24px), transparent);
+}

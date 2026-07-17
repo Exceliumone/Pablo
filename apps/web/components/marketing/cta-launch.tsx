@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { motion } from "framer-motion";
 import { ArrowRight } from "lucide-react";
 import { useAuth } from "@/components/providers/auth-provider";
 import { ConnectButton } from "@/components/wallet/connect-button";
@@ -11,9 +12,17 @@ export function CtaLaunch() {
 
   return (
     <section id="launch" className="container py-24">
-      <div className="glass relative overflow-hidden rounded-2xl px-8 py-16 text-center shadow-glow-lg md:px-16">
-        <div
+      <motion.div
+        initial={{ opacity: 0, y: 16 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-100px" }}
+        transition={{ duration: 0.6 }}
+        className="glass relative overflow-hidden rounded-2xl px-8 py-16 text-center shadow-glow-lg md:px-16"
+      >
+        <motion.div
           aria-hidden
+          animate={{ opacity: [0.7, 1, 0.7], scale: [1, 1.06, 1] }}
+          transition={{ duration: 5, repeat: Infinity, ease: "easeInOut" }}
           className="pointer-events-none absolute left-1/2 top-1/2 h-[420px] w-[420px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-pablo-600/25 blur-[130px]"
         />
         <div className="relative">
@@ -40,7 +49,7 @@ export function CtaLaunch() {
             )}
           </div>
         </div>
-      </div>
+      </motion.div>
     </section>
   );
 }

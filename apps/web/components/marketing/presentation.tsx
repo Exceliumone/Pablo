@@ -1,3 +1,7 @@
+"use client";
+
+import { motion } from "framer-motion";
+
 const POINTS = [
   {
     title: "Un vrai moteur, pas un script",
@@ -16,7 +20,13 @@ const POINTS = [
 export function Presentation() {
   return (
     <section className="container py-24">
-      <div className="mx-auto max-w-2xl text-center">
+      <motion.div
+        initial={{ opacity: 0, y: 12 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-80px" }}
+        transition={{ duration: 0.5 }}
+        className="mx-auto max-w-2xl text-center"
+      >
         <p className="text-xs font-semibold uppercase tracking-[0.25em] text-pablo-400">
           Ce que c'est
         </p>
@@ -28,14 +38,23 @@ export function Presentation() {
           chaîne pour vous et exécute selon vos règles — mêmes règles, jour et
           nuit.
         </p>
-      </div>
+      </motion.div>
 
       <div className="mt-16 grid gap-6 md:grid-cols-3">
-        {POINTS.map((point) => (
-          <div key={point.title} className="glass rounded-xl p-7">
-            <h3 className="font-display text-xl font-bold text-foreground">{point.title}</h3>
+        {POINTS.map((point, i) => (
+          <motion.div
+            key={point.title}
+            initial={{ opacity: 0, y: 16 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, margin: "-80px" }}
+            transition={{ delay: i * 0.08, duration: 0.45 }}
+            className="glass group rounded-xl p-7 transition-colors hover:border-pablo-500/30"
+          >
+            <h3 className="font-display text-xl font-bold text-foreground transition-colors group-hover:text-pablo-200">
+              {point.title}
+            </h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">{point.body}</p>
-          </div>
+          </motion.div>
         ))}
       </div>
     </section>

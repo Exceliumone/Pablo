@@ -113,7 +113,25 @@ cargo run --bin engine-bridge   # orchestrator: HTTP API on :8090
   itself, since Solana RPC is blocked by network egress policy here — the
   code fails cleanly (a `null` balance, a sanitized 500) rather than
   crashing; test the live paths on Devnet before Mainnet.
-- **Next: Phase 5 (landing page polish)** — premium design pass,
-  animations, mobile optimization.
+- **Phase 5 (landing page premium) — done.** Scroll-reveal animations
+  (`framer-motion`'s `whileInView`) added to every marketing section that
+  didn't already have one (Presentation, Stats, FAQ, Conviction, Roadmap,
+  the launch CTA), an animated mobile nav collapse, and a spring-animated
+  active-tab indicator in the dashboard shell. The real work was a mobile
+  pass across all seven pages (landing + six dashboard tabs) using a
+  headless-browser session authenticated through the actual SIWS + cookie
+  flow, screenshotted at 375px and audited for horizontal overflow
+  programmatically (not by eyeballing) — that caught two genuine bugs, not
+  hypothetical ones: the wallet address's `truncate` never engaged because
+  neither the flex row nor the CSS Grid item it sat in had `min-w-0` (a
+  classic "flex/grid items don't shrink below content size by default"
+  trap), so a 44-character base58 address was blowing the wallet page out
+  to 462px on a 375px viewport; and the dashboard's tab strip scrolls
+  horizontally but gave no visual hint that Wallet and Réglages existed
+  past the fold, fixed with a permanent edge-fade mask. Both fixed and
+  reverified with a clean re-run (fresh login, single navigation, no stale
+  session state) rather than assumed fixed.
+- **Next: Phase 6 (admin console)** — users, holders, licenses, stats,
+  logs, executor monitoring.
 
 See §14 of `docs/ARCHITECTURE.md` for the full roadmap.

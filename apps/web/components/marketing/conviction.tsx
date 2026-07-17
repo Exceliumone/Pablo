@@ -1,15 +1,24 @@
+"use client";
+
 import Image from "next/image";
+import { motion } from "framer-motion";
 
 export function Conviction() {
   return (
     <section className="container py-24">
-      <div className="glass grid overflow-hidden rounded-2xl lg:grid-cols-2">
-        <div className="relative min-h-[320px]">
+      <motion.div
+        initial={{ opacity: 0, y: 16 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-100px" }}
+        transition={{ duration: 0.6 }}
+        className="glass grid overflow-hidden rounded-2xl lg:grid-cols-2"
+      >
+        <div className="relative min-h-[320px] overflow-hidden">
           <Image
             src="/brand/alley.webp"
             alt="PABLO dans une ruelle, veste à capuche, entouré de tags « PABLO doesn't forgive » et « We don't sell »"
             fill
-            className="object-cover object-top"
+            className="object-cover object-top transition-transform duration-700 ease-out hover:scale-105"
             sizes="(min-width: 1024px) 50vw, 100vw"
           />
           <div className="absolute inset-0 bg-gradient-to-t from-background via-background/10 to-transparent lg:bg-gradient-to-r" />
@@ -31,7 +40,7 @@ export function Conviction() {
             exécute exactement, à chaque fois, sans hésitation.
           </p>
         </div>
-      </div>
+      </motion.div>
     </section>
   );
 }

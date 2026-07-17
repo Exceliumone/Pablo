@@ -1,3 +1,6 @@
+"use client";
+
+import { motion } from "framer-motion";
 import {
   Accordion,
   AccordionContent,
@@ -35,21 +38,35 @@ const FAQS = [
 export function Faq() {
   return (
     <section id="faq" className="container py-24">
-      <div className="mx-auto max-w-2xl text-center">
+      <motion.div
+        initial={{ opacity: 0, y: 12 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-80px" }}
+        transition={{ duration: 0.5 }}
+        className="mx-auto max-w-2xl text-center"
+      >
         <p className="text-xs font-semibold uppercase tracking-[0.25em] text-pablo-400">FAQ</p>
         <h2 className="mt-3 text-balance font-display text-4xl font-extrabold tracking-tight text-foreground md:text-5xl">
           Questions fréquentes
         </h2>
-      </div>
+      </motion.div>
 
-      <Accordion type="single" collapsible className="mx-auto mt-14 max-w-2xl space-y-3">
-        {FAQS.map((item, i) => (
-          <AccordionItem key={item.q} value={`item-${i}`}>
-            <AccordionTrigger>{item.q}</AccordionTrigger>
-            <AccordionContent>{item.a}</AccordionContent>
-          </AccordionItem>
-        ))}
-      </Accordion>
+      <motion.div
+        initial={{ opacity: 0, y: 16 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-80px" }}
+        transition={{ delay: 0.1, duration: 0.5 }}
+        className="mx-auto mt-14 max-w-2xl"
+      >
+        <Accordion type="single" collapsible className="space-y-3">
+          {FAQS.map((item, i) => (
+            <AccordionItem key={item.q} value={`item-${i}`}>
+              <AccordionTrigger>{item.q}</AccordionTrigger>
+              <AccordionContent>{item.a}</AccordionContent>
+            </AccordionItem>
+          ))}
+        </Accordion>
+      </motion.div>
     </section>
   );
 }

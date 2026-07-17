@@ -3,6 +3,7 @@
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { motion } from "framer-motion";
 import {
   BarChart3,
   History,
@@ -68,7 +69,7 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
           </div>
         </div>
 
-        <nav className="container flex gap-1 overflow-x-auto pb-3">
+        <nav className="scroll-fade-x container flex gap-1 overflow-x-auto pb-3 pr-6">
           {TABS.map((tab) => {
             const active = tab.exact ? pathname === tab.href : pathname.startsWith(tab.href);
             const Icon = tab.icon;
@@ -77,14 +78,21 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
                 key={tab.href}
                 href={tab.href}
                 className={cn(
-                  "flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
+                  "relative flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
                   active
-                    ? "bg-pablo-500/15 text-pablo-300"
+                    ? "text-pablo-300"
                     : "text-muted-foreground hover:bg-white/5 hover:text-foreground",
                 )}
               >
-                <Icon className="h-3.5 w-3.5" />
-                {tab.label}
+                {active && (
+                  <motion.span
+                    layoutId="dashboard-tab-active"
+                    className="absolute inset-0 rounded-md bg-pablo-500/15"
+                    transition={{ type: "spring", stiffness: 500, damping: 35 }}
+                  />
+                )}
+                <Icon className="relative h-3.5 w-3.5" />
+                <span className="relative">{tab.label}</span>
               </Link>
             );
           })}
