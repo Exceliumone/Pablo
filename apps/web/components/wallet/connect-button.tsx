@@ -89,7 +89,8 @@ export function ConnectButton() {
         <div className="glass absolute right-0 z-50 mt-2 w-60 rounded-md p-1 text-sm shadow-glow">
           {available.length === 0 && (
             <p className="px-3 py-3 text-xs text-muted-foreground">
-              No Solana wallet detected. Install Phantom or Solflare to continue.
+              No Solana wallet extension detected. Install Phantom, Solflare, Trust, or
+              Bitget, or connect a mobile wallet via WalletConnect.
             </p>
           )}
           {available.map((w) => (
