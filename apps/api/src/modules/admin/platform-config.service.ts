@@ -7,7 +7,12 @@ import { logAudit } from "../../lib/audit.js";
 const CACHE_KEY = "platform-config";
 const CACHE_TTL_SECONDS = 30;
 
-export class PlatformConfigError extends Error {}
+export class PlatformConfigError extends Error {
+  // 503, not 500: "the platform hasn't been configured yet" is an
+  // operator-fixable readiness state, not a server bug — see
+  // admin.routes.ts's dedicated handler for this class.
+  readonly statusCode = 503;
+}
 
 /**
  * Row `id: 1` is the entire table — there is exactly one PlatformConfig.
@@ -82,10 +87,32 @@ export interface PlatformConfigPatch {
 }
 
 export async function updatePlatformConfig(adminUserId: string, patch: PlatformConfigPatch) {
-  await getOrSeed(); // ensure the row exists before updating it
-  const updated = await prisma.platformConfig.update({
+  // Deliberately NOT getOrSeed() here: that throws when the env bootstrap
+  // vars (TREASURY_WALLET_ADDRESS / PABLO_MINT_ADDRESS) aren't set yet —
+  // exactly the situation before $PABLO exists — which used to make this
+  // the one endpoint whose entire purpose is setting those values unable
+  // to ever run for the first time. Upsert directly instead: an admin
+  // supplying real values here IS the seed, env vars are only a
+  // convenience default for whatever the patch doesn't cover, falling
+  // back to an empty string (not null — the columns are non-nullable) for
+  // the two identity fields when neither the patch nor the env has them
+  // yet. Downstream Solana calls already degrade gracefully on an empty
+  // mint (see wallet.service.ts's getWalletView) or fail with a clear
+  // error rather than crash (billing/holder.service.ts) — either way,
+  // "not fully configured yet" stays recoverable instead of a dead end.
+  const updated = await prisma.platformConfig.upsert({
     where: { id: 1 },
-    data: { ...patch, updatedBy: adminUserId },
+    create: {
+      id: 1,
+      subscriptionPriceUsd: patch.subscriptionPriceUsd ?? env.SUBSCRIPTION_PRICE_USD,
+      pabloMintAddress: patch.pabloMintAddress ?? env.PABLO_MINT_ADDRESS ?? "",
+      minHolderTokens: patch.minHolderTokens ?? BigInt(env.MIN_HOLDER_TOKENS),
+      subscriptionDurationDays: patch.subscriptionDurationDays ?? env.SUBSCRIPTION_DURATION_DAYS,
+      gracePeriodDays: patch.gracePeriodDays ?? env.GRACE_PERIOD_DAYS,
+      treasuryWalletAddress: patch.treasuryWalletAddress ?? env.TREASURY_WALLET_ADDRESS ?? "",
+      updatedBy: adminUserId,
+    },
+    update: { ...patch, updatedBy: adminUserId },
   });
   await redis.del(CACHE_KEY);
   await logAudit({

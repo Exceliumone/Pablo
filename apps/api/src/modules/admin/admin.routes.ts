@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { platformConfigPatchSchema, type PlatformConfigDto } from "@pablo/shared-types";
-import { getPlatformConfig, updatePlatformConfig } from "./platform-config.service.js";
+import { getPlatformConfig, updatePlatformConfig, PlatformConfigError } from "./platform-config.service.js";
 import adminUsersRoutes from "./users.routes.js";
 import adminSubscriptionsRoutes from "./subscriptions.routes.js";
 import adminHoldersRoutes from "./holders.routes.js";
@@ -21,6 +21,15 @@ function toDto(config: Awaited<ReturnType<typeof getPlatformConfig>>): PlatformC
 }
 
 export default async function adminRoutes(fastify: FastifyInstance) {
+  fastify.setErrorHandler((error, request, reply) => {
+    if (error instanceof PlatformConfigError) {
+      request.log.warn({ url: request.url, message: error.message }, "platform_config_error");
+      reply.code(error.statusCode).send({ error: "platform_config_error", message: error.message });
+      return;
+    }
+    throw error;
+  });
+
   // Public: the frontend needs the price/mint/treasury to build the
   // subscription UI before the user is even authenticated.
   fastify.get("/config", async () => toDto(await getPlatformConfig()));

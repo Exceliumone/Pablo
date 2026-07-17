@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type { PaymentIntentDto, PaymentStatusDto, SubscriptionViewDto } from "@pablo/shared-types";
 import { reconcileSubscription, toSubscriptionViewDto } from "./subscription.service.js";
 import { createPaymentIntent, checkPaymentIntent, PaymentError } from "./payment.service.js";
+import { PlatformConfigError } from "../admin/platform-config.service.js";
 
 function toPaymentIntentDto(
   payment: { id: string; referenceId: string; amountLamports: bigint | null; status: string; expiresAt: Date },
@@ -22,9 +23,14 @@ function toPaymentIntentDto(
 }
 
 export default async function billingRoutes(fastify: FastifyInstance) {
-  fastify.setErrorHandler((error, _request, reply) => {
+  fastify.setErrorHandler((error, request, reply) => {
     if (error instanceof PaymentError) {
       reply.code(error.statusCode).send({ error: "payment_error", message: error.message });
+      return;
+    }
+    if (error instanceof PlatformConfigError) {
+      request.log.warn({ url: request.url, message: error.message }, "platform_config_error");
+      reply.code(error.statusCode).send({ error: "platform_config_error", message: error.message });
       return;
     }
     throw error;
