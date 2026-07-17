@@ -1,0 +1,38 @@
+# Node
+node_modules/
+.pnpm-store/
+dist/
+.next/
+.turbo/
+*.tsbuildinfo
+npm-debug.log*
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Rust
+target/
+**/*.rs.bk
+# Cargo.lock is committed at the workspace root (binaries, not a library) —
+# reproducible builds matter for code that signs transactions.
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Prisma
+apps/api/prisma/migrations/dev.db
+
+# Engine runtime artifacts (unchanged from upstream .gitignore)
+engine/buy-grpc
+engine/blacklist.txt
+engine/record/

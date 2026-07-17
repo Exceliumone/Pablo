@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * PABLO tokens. HSL triplets (no `hsl()` wrapper) so Tailwind's
+ * `hsl(var(--x) / <alpha>)` opacity syntax works everywhere.
+ * Single dark theme — see tailwind.config.ts header comment.
+ */
+:root {
+  --background: 260 35% 4%;
+  --foreground: 260 20% 96%;
+
+  --surface: 260 30% 8%;
+  --surface-raised: 260 28% 11%;
+  --surface-border: 262 60% 60%;
+
+  --pablo-glow: 262 83% 66%;
+
+  --success: 142 71% 45%;
+  --danger: 0 84% 63%;
+  --warning: 38 92% 55%;
+
+  --muted: 260 20% 14%;
+  --muted-foreground: 260 12% 65%;
+
+  --radius: 14px;
+
+  --font-display: ui-sans-serif, "Segoe UI", system-ui, sans-serif;
+  --font-sans: ui-sans-serif, "Inter", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+* {
+  border-color: hsl(var(--surface-border) / 0.15);
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: var(--font-sans);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Glassmorphism surface — the one recurring card treatment across the
+   product (sniper feed cards, portfolio tiles, settings panels). */
+.glass {
+  background: linear-gradient(
+    180deg,
+    hsl(var(--surface-raised) / 0.6),
+    hsl(var(--surface) / 0.4)
+  );
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid hsl(var(--surface-border) / 0.14);
+}
+
+.text-tabular {
+  font-variant-numeric: tabular-nums;
+}

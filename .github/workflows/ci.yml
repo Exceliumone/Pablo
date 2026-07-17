@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  node:
+    name: Node (web / api / shared-types)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm --filter @pablo/shared-types typecheck
+
+      - run: pnpm --filter @pablo/api prisma:generate
+
+      - run: pnpm turbo run typecheck lint build
+
+  rust:
+    name: Rust (engine / engine-bridge)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo check --workspace --all-targets
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+        continue-on-error: true # engine ships pre-existing warnings; tightened once triaged

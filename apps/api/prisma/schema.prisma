@@ -1,0 +1,323 @@
+// PABLO platform — primary datastore.
+// See docs/ARCHITECTURE.md for the full rationale behind this schema.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Identity & auth
+// ─────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  SUBSCRIBER
+  ADMIN
+  SUPPORT
+}
+
+enum UserStatus {
+  ACTIVE
+  BANNED
+  SUSPENDED
+}
+
+model User {
+  id        String     @id @default(cuid())
+  createdAt DateTime   @default(now())
+  role      UserRole   @default(SUBSCRIBER)
+  status    UserStatus @default(ACTIVE)
+  email     String?    @unique // optional, for notifications only — never used for login
+
+  wallets         WalletLink[]
+  tradingWallet   TradingWallet?
+  subscription    Subscription?
+  payments        Payment[]
+  holderSnapshots HolderSnapshot[]
+  botSettings     BotSettings?
+  trades          Trade[]
+  positions       Position[]
+  notifications   Notification[]
+  sessions        Session[]
+  auditLogs       AuditLog[]
+}
+
+/// Identity wallet(s) — Phantom / Solflare / Backpack / OKX etc. Non-custodial:
+/// the platform never holds a private key for these. Used for login (Sign-In
+/// With Solana), for sending the SOL subscription payment, and for proving
+/// $PABLO holdings for the free-Premium path.
+model WalletLink {
+  id             String    @id @default(cuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id])
+  address        String    @unique
+  provider       String // phantom | solflare | backpack | okx | ...
+  isPrimary      Boolean   @default(true)
+  linkedAt       DateTime  @default(now())
+  lastVerifiedAt DateTime?
+
+  @@index([userId])
+}
+
+enum TradingWalletCustody {
+  GENERATED // platform-generated keypair (default, recommended)
+  IMPORTED // user supplied an existing private key instead of generating one
+}
+
+/// The wallet the executor actually trades with. Always held server-side,
+/// encrypted at rest — the bot needs to sign in milliseconds, so this cannot
+/// be a "confirm every trade in Phantom" flow. `custody` only records *how*
+/// the key was obtained; the storage and signing path is identical either way.
+model TradingWallet {
+  id                  String               @id @default(cuid())
+  userId              String               @unique
+  user                User                 @relation(fields: [userId], references: [id])
+  publicKey           String               @unique
+  encryptedPrivateKey String               @db.Text // envelope-encrypted (KMS/Vault), never stored in plaintext
+  kmsKeyId            String
+  custody             TradingWalletCustody @default(GENERATED)
+  createdAt           DateTime             @default(now())
+  importedAt          DateTime?
+}
+
+model Session {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id])
+  refreshToken String    @unique
+  userAgent    String?
+  ip           String?
+  expiresAt    DateTime
+  createdAt    DateTime  @default(now())
+  revokedAt    DateTime?
+
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Subscription & payment
+// ─────────────────────────────────────────────────────────────────
+
+enum SubTier {
+  FREE
+  PREMIUM
+}
+
+enum SubSource {
+  PAYMENT
+  HOLDER
+  ADMIN_GRANT
+}
+
+enum SubStatus {
+  ACTIVE
+  GRACE
+  EXPIRED
+}
+
+/// Both PAYMENT and HOLDER sources resolve to the same SubTier.PREMIUM —
+/// nothing downstream ever branches on `source`, only on `status`.
+model Subscription {
+  id               String     @id @default(cuid())
+  userId           String     @unique
+  user             User       @relation(fields: [userId], references: [id])
+  tier             SubTier    @default(FREE)
+  source           SubSource?
+  status           SubStatus  @default(EXPIRED)
+  startedAt        DateTime?
+  currentPeriodEnd DateTime?
+  graceUntil       DateTime?
+  cancelledAt      DateTime?
+  updatedAt        DateTime   @updatedAt
+}
+
+enum PaymentStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+  EXPIRED
+}
+
+/// One row per payment intent. `referenceId` is embedded as a memo in the
+/// on-chain transfer (Solana Pay style) so the confirmation job can match an
+/// incoming treasury transaction back to the user who sent it.
+model Payment {
+  id              String        @id @default(cuid())
+  userId          String
+  user            User          @relation(fields: [userId], references: [id])
+  referenceId     String        @unique
+  txSignature     String?       @unique
+  fromAddress     String?
+  amountLamports  BigInt?
+  solUsdPriceAtTx Float?
+  status          PaymentStatus @default(PENDING)
+  confirmedAt     DateTime?
+  expiresAt       DateTime
+  createdAt       DateTime      @default(now())
+
+  @@index([userId, createdAt])
+}
+
+/// Periodic snapshot of $PABLO balance per linked wallet, used to drive the
+/// free-Premium-for-holders path and its grace period.
+model HolderSnapshot {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id])
+  walletAddress  String
+  balance        BigInt
+  meetsThreshold Boolean
+  checkedAt      DateTime @default(now())
+
+  @@index([userId, checkedAt])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Admin-editable platform configuration — replaces all product-facing .env
+// ─────────────────────────────────────────────────────────────────
+
+model PlatformConfig {
+  id                       Int      @id @default(1)
+  subscriptionPriceUsd     Float    @default(10)
+  pabloMintAddress         String
+  minHolderTokens          BigInt
+  subscriptionDurationDays Int      @default(30)
+  gracePeriodDays          Int      @default(3)
+  treasuryWalletAddress    String
+  updatedAt                DateTime @updatedAt
+  updatedBy                String?
+}
+
+model WhitelistEntry {
+  id        String   @id @default(cuid())
+  address   String   @unique
+  reason    String?
+  createdBy String
+  createdAt DateTime @default(now())
+}
+
+model BlacklistEntry {
+  id        String   @id @default(cuid())
+  address   String   @unique
+  reason    String?
+  createdBy String
+  createdAt DateTime @default(now())
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Per-user bot settings — pushed to that user's executor via engine-bridge
+// ─────────────────────────────────────────────────────────────────
+
+model BotSettings {
+  id                  String   @id @default(cuid())
+  userId              String   @unique
+  user                User     @relation(fields: [userId], references: [id])
+  isActive            Boolean  @default(false)
+  amountPerBuySol     Float    @default(0.05)
+  takeProfitPct       Float    @default(50)
+  stopLossPct         Float    @default(-20)
+  trailingStopPct     Float?
+  priorityFeeLamports BigInt   @default(2000000)
+  slippageBps         Int      @default(1000)
+  autoSell            Boolean  @default(true)
+  copyTradingEnabled  Boolean  @default(false)
+  copyTradingTargets  String[]
+  protocolPreference  String   @default("auto") // pumpfun | pumpswap | raydium | auto
+  updatedAt           DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Trading & portfolio
+// ─────────────────────────────────────────────────────────────────
+
+enum TradeSide {
+  BUY
+  SELL
+}
+
+enum TradeStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+}
+
+model Trade {
+  id          String      @id @default(cuid())
+  userId      String
+  user        User        @relation(fields: [userId], references: [id])
+  tokenMint   String
+  tokenSymbol String?
+  side        TradeSide
+  protocol    String // pumpfun | pumpswap | raydium | meteora
+  priceSol    Float
+  amountToken Float
+  amountSol   Float
+  txSignature String      @unique
+  status      TradeStatus
+  reason      String? // TAKE_PROFIT | STOP_LOSS | TRAILING_STOP | MANUAL | TIME_EXIT
+  createdAt   DateTime    @default(now())
+
+  @@index([userId, createdAt])
+  @@index([tokenMint])
+}
+
+enum PositionStatus {
+  OPEN
+  CLOSED
+}
+
+model Position {
+  id             String         @id @default(cuid())
+  userId         String
+  user           User           @relation(fields: [userId], references: [id])
+  tokenMint      String
+  tokenSymbol    String?
+  status         PositionStatus @default(OPEN)
+  entryPriceSol  Float
+  currentAmount  Float
+  costBasisSol   Float
+  realizedPnlSol Float          @default(0)
+  openedAt       DateTime       @default(now())
+  closedAt       DateTime?
+
+  @@index([userId, status])
+}
+
+enum NotifType {
+  OPPORTUNITY
+  TRADE_EXECUTED
+  ERROR
+  TAKE_PROFIT
+  STOP_LOSS
+  CONNECTION_LOST
+  BOT_STOPPED
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  type      NotifType
+  title     String
+  body      String
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  actorType String // USER | ADMIN | SYSTEM
+  action    String
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}

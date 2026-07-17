@@ -1,0 +1,37 @@
+# Local dev baseline. Application services (web, api, scanner, executor-*)
+# get their own Dockerfiles + compose entries as each lands — see
+# docs/ARCHITECTURE.md §13. For now this brings up just the stateful deps
+# apps/api needs to boot against a real database.
+name: pablo-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pablo
+      POSTGRES_PASSWORD: pablo
+      POSTGRES_DB: pablo
+    ports:
+      - "5432:5432"
+    volumes:
+      - pablo_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pablo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pablo_postgres_data:

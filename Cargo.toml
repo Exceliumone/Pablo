@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "engine",
+    "apps/engine-bridge",
+]
+
+# Keep engine/Cargo.lock semantics workspace-wide so scanner/executor
+# link against the exact same dependency graph as the untouched engine crate.
+[profile.release]
+opt-level = 3
+lto = true
