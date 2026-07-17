@@ -157,7 +157,75 @@ cargo run --bin engine-bridge   # orchestrator: HTTP API on :8090
   get there. **Not verifiable in this sandbox**: live $PABLO holder
   balances (Solana RPC blocked) — the holders view degrades to "never
   checked" rather than guessing.
-- **Next: Phase 7 (production hardening)** — load testing, security
-  audit, end-to-end tests before opening to the first subscribers.
+- **Phase 7 (production hardening) — done.** A full security audit, a
+  committed integration test suite, CI wiring, and a local load/smoke test
+  — the last phase before opening to the first subscribers.
+  - **Security audit.** `pnpm audit --prod` found 10 vulnerabilities (3
+    critical/2 high/5 moderate), most seriously three critical + one high
+    + two moderate CVEs in `fast-jwt` (transitive via `@fastify/jwt`),
+    including a JWT auth-bypass via empty HMAC secret — fixed by bumping
+    `@fastify/jwt` to `^10.2.0`. The remaining moderate `postcss`/`uuid`
+    CVEs were buried behind third-party packages with no direct upgrade
+    path, fixed via root-level `pnpm.overrides`. `cargo audit` against the
+    Rust workspace found 5 more (`curve25519-dalek`, `ed25519-dalek`,
+    `rustls-webpki` ×3) — all pinned deep inside `solana-sdk`'s own
+    transitive tree, pulled in by the untouched `engine/` crate itself;
+    patching them would mean forcing a Cargo `[patch]` override on
+    dependency versions `solana-sdk` explicitly chose, which risks
+    silently breaking signature/RPC compatibility in a system that moves
+    real funds — left as a documented, accepted risk, same treatment as
+    `bigint-buffer` (high severity, no patched version exists upstream at
+    all). The most significant finding was a genuine, previously-unnoticed
+    authorization gap: `User.status` (ACTIVE/BANNED/SUSPENDED, in the
+    schema since Phase 0) was never checked anywhere — Phase 6's admin
+    "ban/suspend" control was entirely decorative, since a banned user
+    could still log in, refresh sessions indefinitely, and use every
+    protected route. Fixed by enforcing status at both login and refresh,
+    plus immediate session revocation the moment an admin sets a
+    non-ACTIVE status, so a ban takes effect right away instead of "on
+    next refresh." While fixing that, hardened refresh-token-reuse
+    handling too: presenting an already-rotated token now revokes the
+    user's entire session family, not just that one token, since reuse is
+    a strong theft signal under a rotate-on-every-refresh design. Also:
+    rate limits added to the three admin mutation routes that had none
+    beyond the global default, and a hardcoded-but-real-looking
+    `WALLET_ENCRYPTION_KEY` value replaced with an explicit placeholder in
+    `.env.example` (and de-duplicated out of `ci.yml`, which needed its
+    own distinct dummy key since that field must decode to exactly 32
+    bytes).
+  - **Integration test suite.** 46 committed Vitest tests across 7 files
+    in `apps/api/src/test/`, run with `fileParallelism: false` against a
+    real local Postgres + Redis — no mocks, reset to a clean slate before
+    every test. Covers the full SIWS session lifecycle (including the new
+    status enforcement and refresh-reuse cascade), admin RBAC and CRUD
+    with audit-log and rate-limit regressions, bot settings/start/stop
+    gating, wallet provisioning and withdrawal guards, portfolio/trades/
+    analytics including cross-tenant isolation, and a real regression test
+    for the Phase 4 event-persister race (publishes a BUY immediately
+    followed by a SELL over real Redis pub/sub and asserts the position
+    actually closes).
+  - **CI wiring.** `.github/workflows/ci.yml`'s Node job now runs Postgres
+    16 and Redis 7 as real service containers with health checks, applies
+    Prisma migrations, then runs the full integration suite on every push.
+  - **Load/smoke test.** `autocannon` against a real locally-running
+    instance found two genuine bugs neither the audit nor the test suite
+    had caught: `GET /admin/config`'s Redis cache round-tripped its
+    `updatedAt` field through `JSON.stringify`/`parse`, silently turning
+    the `Date` into a string — so every cache-hit request (i.e. most real
+    traffic, since the cache exists precisely to serve the common case)
+    500'd on `.toISOString()`; and a rarer concurrent-first-read race
+    where two callers could both see no `PlatformConfig` row yet and both
+    try to seed it, the loser hitting a unique-constraint error instead of
+    just reading back the winner's row. Both fixed, the first with a
+    permanent regression test. The global rate limiter (100 req/min per
+    IP) makes raw-throughput tooling against any single route
+    fundamentally unrepresentative from one IP — confirmed it engages
+    correctly under burst load, which is the limiter working as intended,
+    not a defect; genuine capacity testing needs multiple simulated
+    client IPs, out of scope here. **Not verifiable in this sandbox**:
+    everything already flagged in every phase above — Solana RPC/
+    Yellowstone gRPC connectivity, live balances, real trade execution,
+    real payment confirmation. Nothing in Phase 7 changes that; test all
+    of it on Devnet, then Mainnet, before opening to real subscribers.
 
 See §14 of `docs/ARCHITECTURE.md` for the full roadmap.

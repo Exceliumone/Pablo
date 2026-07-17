@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { redis } from "../../lib/redis.js";
 import { env } from "../../config/env.js";
@@ -26,24 +27,39 @@ async function getOrSeed() {
     );
   }
 
-  return prisma.platformConfig.create({
-    data: {
-      id: 1,
-      subscriptionPriceUsd: env.SUBSCRIPTION_PRICE_USD,
-      pabloMintAddress: env.PABLO_MINT_ADDRESS,
-      minHolderTokens: BigInt(env.MIN_HOLDER_TOKENS),
-      subscriptionDurationDays: env.SUBSCRIPTION_DURATION_DAYS,
-      gracePeriodDays: env.GRACE_PERIOD_DAYS,
-      treasuryWalletAddress: env.TREASURY_WALLET_ADDRESS,
-    },
-  });
+  try {
+    return await prisma.platformConfig.create({
+      data: {
+        id: 1,
+        subscriptionPriceUsd: env.SUBSCRIPTION_PRICE_USD,
+        pabloMintAddress: env.PABLO_MINT_ADDRESS,
+        minHolderTokens: BigInt(env.MIN_HOLDER_TOKENS),
+        subscriptionDurationDays: env.SUBSCRIPTION_DURATION_DAYS,
+        gracePeriodDays: env.GRACE_PERIOD_DAYS,
+        treasuryWalletAddress: env.TREASURY_WALLET_ADDRESS,
+      },
+    });
+  } catch (err) {
+    // Two concurrent first-ever reads can both see no row and both race to
+    // seed it — the loser's insert hits the id:1 unique constraint. That's
+    // not a real failure, just a lost race: the row it wanted to create
+    // already exists, so read it back instead of surfacing an error for
+    // what the caller only ever wanted as a read.
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      return prisma.platformConfig.findUniqueOrThrow({ where: { id: 1 } });
+    }
+    throw err;
+  }
 }
 
 export async function getPlatformConfig() {
   const cached = await redis.get(CACHE_KEY);
   if (cached) {
     const parsed = JSON.parse(cached);
-    return { ...parsed, minHolderTokens: BigInt(parsed.minHolderTokens) };
+    // JSON round-tripped both of these back into plain strings — Date and
+    // BigInt need to be reconstructed so a cache hit returns the exact same
+    // shape as a cache miss (a fresh Prisma read).
+    return { ...parsed, minHolderTokens: BigInt(parsed.minHolderTokens), updatedAt: new Date(parsed.updatedAt) };
   }
 
   const config = await getOrSeed();

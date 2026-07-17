@@ -21,7 +21,9 @@ export function buildApp() {
     logger:
       env.NODE_ENV === "development"
         ? { transport: { target: "pino-pretty" } }
-        : true,
+        : env.NODE_ENV === "test"
+          ? false
+          : true,
   });
 
   app.register(helmet);

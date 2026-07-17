@@ -9,11 +9,39 @@ jobs:
   node:
     name: Node (web / api / shared-types)
     runs-on: ubuntu-latest
+    services:
+      # apps/api's integration suite (src/test/*.integration.test.ts) runs
+      # against these for real — no mocks — the same way local dev does
+      # (see infra/docker-compose.yml). Health checks gate the "wait for
+      # postgres/redis" step below so migrations never race container boot.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pablo
+          POSTGRES_PASSWORD: pablo
+          POSTGRES_DB: pablo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pablo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       # Dummy-but-valid values so apps/api's module-level env validation
-      # (src/config/env.ts) doesn't fail typecheck/build/test — none of
-      # these need to be real for CI, no network calls happen during
-      # `vitest run`'s pure state-machine tests.
+      # (src/config/env.ts) doesn't fail typecheck/build — DATABASE_URL and
+      # REDIS_URL are real, pointing at this job's service containers above,
+      # since the integration suite needs a genuine Postgres/Redis to run
+      # against.
       NODE_ENV: test
       DATABASE_URL: postgresql://pablo:pablo@localhost:5432/pablo?schema=public
       REDIS_URL: redis://localhost:6379
@@ -21,7 +49,11 @@ jobs:
       JWT_REFRESH_SECRET: ci-only-refresh-secret-not-real
       RPC_HTTP: https://api.mainnet-beta.solana.com
       ENGINE_BRIDGE_INTERNAL_TOKEN: ci-only-token
-      WALLET_ENCRYPTION_KEY: qYBzNoVAAP0znC5S1zPvPwZB4ztFWkaY+8Z8RQilDWY=
+      # Must decode to exactly 32 bytes (wallet-crypto.ts), so it can't be a
+      # readable "not-real" string like the secrets above — this key never
+      # encrypts anything but ephemeral CI test fixtures, torn down with the
+      # runner. Distinct from any key used in .env.example or a real deploy.
+      WALLET_ENCRYPTION_KEY: fNmIlwc3OtFsbSLjkpD+gWtKeu5ojjyHB+A9QHvVKf4=
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +71,9 @@ jobs:
       - run: pnpm --filter @pablo/shared-types typecheck
 
       - run: pnpm --filter @pablo/api prisma:generate
+
+      - name: Apply Prisma migrations to the CI Postgres service
+        run: pnpm --filter @pablo/api prisma:deploy
 
       - run: pnpm turbo run typecheck lint build test
 

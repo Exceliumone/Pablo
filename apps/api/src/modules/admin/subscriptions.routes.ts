@@ -31,19 +31,27 @@ export default async function adminSubscriptionsRoutes(fastify: FastifyInstance)
     return listSubscriptions(parsed.data);
   });
 
-  fastify.post("/:id/grant", async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const parsed = adminGrantRequestDto.safeParse(request.body ?? {});
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "invalid_request", issues: parsed.error.flatten() });
-    }
-    await grantPremium(request.user.sub, id, parsed.data.days);
-    return { ok: true };
-  });
+  fastify.post(
+    "/:id/grant",
+    { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const parsed = adminGrantRequestDto.safeParse(request.body ?? {});
+      if (!parsed.success) {
+        return reply.code(400).send({ error: "invalid_request", issues: parsed.error.flatten() });
+      }
+      await grantPremium(request.user.sub, id, parsed.data.days);
+      return { ok: true };
+    },
+  );
 
-  fastify.post("/:id/revoke", async (request) => {
-    const { id } = request.params as { id: string };
-    await revokePremium(request.user.sub, id);
-    return { ok: true };
-  });
+  fastify.post(
+    "/:id/revoke",
+    { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request) => {
+      const { id } = request.params as { id: string };
+      await revokePremium(request.user.sub, id);
+      return { ok: true };
+    },
+  );
 }

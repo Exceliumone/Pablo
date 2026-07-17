@@ -30,13 +30,17 @@ export default async function adminUsersRoutes(fastify: FastifyInstance) {
     return getUserDetail(id);
   });
 
-  fastify.patch("/:id", async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const parsed = adminUserPatchDto.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "invalid_request", issues: parsed.error.flatten() });
-    }
-    await updateUser(request.user.sub, id, parsed.data);
-    return getUserDetail(id);
-  });
+  fastify.patch(
+    "/:id",
+    { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const parsed = adminUserPatchDto.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: "invalid_request", issues: parsed.error.flatten() });
+      }
+      await updateUser(request.user.sub, id, parsed.data);
+      return getUserDetail(id);
+    },
+  );
 }

@@ -128,6 +128,19 @@ export async function updateUser(adminUserId: string, targetUserId: string, patc
     },
   });
 
+  // Setting BANNED/SUSPENDED is meant to take effect immediately, not "on
+  // next refresh" — revoke every session so POST /auth/refresh (which does
+  // check status, see auth.service.ts) can never mint the user a new
+  // access token again. Their current access token, if any, still works
+  // until it naturally expires (≤15m by default) — the same bounded
+  // exposure every role change already accepts.
+  if (patch.status !== undefined && patch.status !== "ACTIVE") {
+    await prisma.session.updateMany({
+      where: { userId: targetUserId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+
   await logAudit({
     actorType: "ADMIN",
     actorUserId: adminUserId,

@@ -51,8 +51,8 @@ const PHASES: { phase: string; title: string; body: string; status: Status }[] =
   {
     phase: "Phase 7",
     title: "Mise en production",
-    body: "Charge, audit de sécurité, tests de bout en bout avant l'ouverture aux premiers abonnés.",
-    status: "upcoming",
+    body: "Audit de sécurité, suite de tests d'intégration, CI Postgres/Redis, tests de charge locaux.",
+    status: "done",
   },
 ];
 

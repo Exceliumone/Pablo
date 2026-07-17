@@ -582,7 +582,7 @@ Observabilité : logs structurés (déjà présent dans le moteur via `Logger`, 
 | **4 — Dashboard trading** | Sniper feed temps réel, Portfolio, Historique, Analytics, Notifications WS |
 | **5 — Landing page premium** | Animations au scroll, micro-interactions, optimisation mobile — sur toute la plateforme |
 | **6 — Admin** | Panneau complet (users, holders, licences, stats, logs, monitoring) |
-| **7 — Durcissement** | Charge, sécurité, audit, tests de bout en bout avant ouverture aux premiers abonnés |
+| **7 — Durcissement** | Audit de sécurité, suite de tests d'intégration, CI Postgres/Redis, tests de charge locaux — ✅ terminée |
 
 ---
 
@@ -595,9 +595,9 @@ Observabilité : logs structurés (déjà présent dans le moteur via `Logger`, 
 | Abonnement unique 10$/mois, SOL uniquement, holders $PABLO gratuits, seuil admin-configurable | ✅ Validée |
 | API REST aujourd'hui + WS temps réel dès le départ, gRPC interne réservé au canal scanner→executor | ✅ Validée |
 | Design : noir profond / violet néon / blanc, glassmorphism, au-dessus de BullX/Photon | ✅ Validée |
-| Roadmap en 8 phases (0 à 7), chaque phase fonctionnelle avant la suivante | ✅ Validée — en cours |
-| Fournisseur RPC/Yellowstone gRPC (Shyft, Helius, Triton...) + budget | ⏳ En attente — dimensionne le `scanner`, nécessaire avant Phase 3 |
-| Cible d'hébergement définitive (VPS unique vs cloud managé) | ⏳ En attente — la Phase 0 reste agnostique (Docker Compose), à trancher avant Phase 7 |
+| Roadmap en 8 phases (0 à 7), chaque phase fonctionnelle avant la suivante | ✅ Validée — les 8 phases sont terminées |
+| Fournisseur RPC/Yellowstone gRPC (Shyft, Helius, Triton...) + budget | ⏳ En attente — dimensionne le `scanner`, nécessaire avant tout test Devnet/Mainnet réel |
+| Cible d'hébergement définitive (VPS unique vs cloud managé) | ⏳ En attente — la Phase 0 reste agnostique (Docker Compose), à trancher avant l'ouverture aux premiers abonnés |
 
 Avancement par phase : voir les README de `apps/*` et `engine/UPSTREAM.md` pour
 ce qui est réellement livré à date, ce document reste la référence de

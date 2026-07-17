@@ -7,7 +7,7 @@ import { prisma } from "../../lib/prisma.js";
 import { redis } from "../../lib/redis.js";
 import { env } from "../../config/env.js";
 import type { VerifyBody } from "./auth.schemas.js";
-import { UserRole } from "@prisma/client";
+import { UserRole, UserStatus } from "@prisma/client";
 
 const ADMIN_WALLETS = new Set(
   (env.ADMIN_WALLET_ADDRESSES ?? "")
@@ -139,6 +139,9 @@ export async function verifyAndResolveWallet(
   const shouldBeAdmin = ADMIN_WALLETS.has(body.address);
 
   if (existingLink) {
+    if (existingLink.user.status !== UserStatus.ACTIVE) {
+      throw new AuthError("This account is no longer active.", 403);
+    }
     await prisma.walletLink.update({
       where: { address: body.address },
       data: { lastVerifiedAt: new Date() },
@@ -203,7 +206,21 @@ export async function rotateSession(
   const hashed = hashRefreshToken(presentedToken);
   const session = await prisma.session.findUnique({ where: { refreshToken: hashed } });
 
-  if (!session || session.revokedAt || session.expiresAt < new Date()) {
+  if (!session || session.expiresAt < new Date()) {
+    throw new AuthError("Session expired — please sign in again.", 401);
+  }
+
+  // Refresh tokens are one-time-use (rotated below). Seeing an
+  // already-revoked one presented again means either a client double-fired
+  // the request, or someone else got hold of a token that's already been
+  // rotated past — a strong theft signal either way. Burn every session
+  // for this user rather than just this one, so a stolen-but-already-used
+  // token can't be leveraged to keep a stolen session family alive.
+  if (session.revokedAt) {
+    await prisma.session.updateMany({
+      where: { userId: session.userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
     throw new AuthError("Session expired — please sign in again.", 401);
   }
 
@@ -213,6 +230,16 @@ export async function rotateSession(
   });
 
   const user = await prisma.user.findUniqueOrThrow({ where: { id: session.userId } });
+  // A banned/suspended user's access tokens still work until they expire
+  // (short-lived, ≤15m by default — the same "role change takes effect on
+  // next refresh" trust model documented on requireRole), but they can
+  // never mint a new one. Combined with revoking every session at the
+  // moment an admin sets the status (users.service.ts), this caps a
+  // banned user's actual access to whatever access token they already
+  // held, not indefinitely.
+  if (user.status !== UserStatus.ACTIVE) {
+    throw new AuthError("This account is no longer active.", 403);
+  }
   const next = await createSession(user.id, meta);
   return { user, ...next };
 }
