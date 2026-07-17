@@ -48,7 +48,7 @@ export function Navbar() {
         <div className="hidden items-center gap-3 md:flex">
           <ConnectButton />
           <Button asChild size="default">
-            <Link href="/subscribe">Launch App</Link>
+            <Link href="/app">Launch App</Link>
           </Button>
         </div>
 
@@ -76,7 +76,7 @@ export function Navbar() {
           <div className="flex flex-col gap-3 pt-2">
             <ConnectButton />
             <Button asChild size="default">
-              <Link href="/subscribe">Launch App</Link>
+              <Link href="/app">Launch App</Link>
             </Button>
           </div>
         </div>

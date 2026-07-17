@@ -19,19 +19,19 @@ export function CtaLaunch() {
         <div className="relative">
           <h2 className="text-balance font-display text-4xl font-extrabold tracking-tight text-foreground md:text-5xl">
             {status === "authenticated" && user
-              ? "Votre abonnement vous attend."
+              ? "Le terminal vous attend."
               : "Connectez un wallet. Signez. C'est tout."}
           </h2>
           <p className="mx-auto mt-4 max-w-md text-muted-foreground">
             {status === "authenticated" && user
-              ? "Payez en SOL ou activez l'accès gratuit avec $PABLO."
+              ? "Réglez votre bot, démarrez-le, suivez son activité en direct."
               : "Pas de mot de passe, pas d'inscription. Votre wallet Solana est votre compte."}
           </p>
           <div className="mt-8 flex justify-center">
             {status === "authenticated" && user ? (
               <Button size="lg" asChild>
-                <Link href="/subscribe" className="group">
-                  Voir mon abonnement
+                <Link href="/app" className="group">
+                  Ouvrir le terminal
                   <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
                 </Link>
               </Button>

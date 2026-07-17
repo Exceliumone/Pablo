@@ -42,12 +42,27 @@ fonts.gstatic.com).
 - "Launch App" everywhere now routes to `/subscribe` instead of anchor-
   scrolling to the landing page's CTA section.
 
+**Phase 3 — bot terminal.**
+- `app/app/page.tsx`: auth-gated, then subscription-gated (redirects to
+  `/subscribe` if not ACTIVE), then renders the control terminal.
+- `lib/use-bot.ts`: settings/status CRUD against `/bot/*`.
+- `lib/use-bot-events.ts`: opens `GET /ws?token=`, exponential-backoff
+  reconnect (capped at 15s) on drop.
+- `components/bot/`: `bot-control-panel.tsx` (start/stop, pid, WS
+  connection indicator, restart count, last error),
+  `bot-settings-form.tsx` (amount/TP/SL/trailing/slippage/priority-fee/
+  copy-trading targets), `bot-event-feed.tsx` (live color-coded
+  trade/opportunity/error/status rows).
+- "Launch App" / the landing CTA now route to `/app` once authenticated
+  (still `/subscribe` mid-way through the connect flow).
+
 ## Route map (built incrementally, one phase at a time)
 
 ```
 app/
   page.tsx              Phase 1 — landing page (done)
   subscribe/page.tsx      Phase 2 — subscription status + payment (done)
+  app/page.tsx             Phase 3 — bot control terminal (done)
   (dashboard)/             Phase 4 — sniper, portfolio, history, wallet,
                             analytics, settings, support
   (admin)/                  Phase 5 — admin panel

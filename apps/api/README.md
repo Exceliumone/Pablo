@@ -58,6 +58,39 @@ crash, real error still logged server-side) rather than leaking internal
 detail. Test the live paths in an environment with Solana RPC access
 before going to production.
 
+**Phase 3 — bridge to the engine.** `src/modules/wallet/`,
+`src/modules/bot/`, `src/ws/`.
+- `wallet.service.ts`: custodial trading wallet per user
+  (`getOrCreateTradingWallet` generates a `Keypair` on first use),
+  secret key encrypted at rest with AES-256-GCM
+  (`src/lib/wallet-crypto.ts`, key from `WALLET_ENCRYPTION_KEY` — an
+  explicit placeholder for real KMS/Vault, documented as such in the
+  source).
+- `lib/engine-bridge-client.ts`: the only place in `apps/api` that talks
+  to `engine-bridge` — a thin HTTP client (`start`/`stop`/`status`)
+  against its internal, bearer-token-gated API.
+- `bot.service.ts` / `bot.routes.ts`: `GET/PUT /bot/settings`,
+  `POST /bot/start` (requires an ACTIVE subscription — 402 otherwise;
+  provisions the trading wallet, decrypts its key in-process only, hands
+  it plus RPC/Yellowstone/Redis config to the orchestrator),
+  `POST /bot/stop`, `GET /bot/status`. Changing settings while the bot is
+  running restarts the executor, since the engine only reads its config
+  at boot (no hot-reload).
+- `src/ws/gateway.ts`: `GET /ws?token=<jwt>` — relays each user's
+  `executor:events:<userId>` Redis pub/sub channel straight to their
+  browser socket. Query-param auth because the native WebSocket API
+  can't set custom headers; invalid/missing tokens close with 4401.
+
+Verified against a real local Postgres/Redis: settings CRUD (including a
+`priorityFeeLamports` BigInt-serialization bug found and fixed via live
+testing), subscription gating on `/bot/start`, the orchestrator spawning
+a real executor process against the real `engine` crate (a genuine
+`execute_buy` call observed), the Redis Stream → pub/sub → WebSocket
+relay carrying real events end-to-end, and JWT rejection on the socket.
+**Not verifiable in this sandbox**: actual Yellowstone gRPC connectivity
+and actual on-chain execution — Solana RPC/gRPC is blocked by network
+egress policy here. Test both on Devnet before Mainnet.
+
 ## Local dev
 
 ```bash
@@ -70,6 +103,10 @@ pnpm --filter @pablo/api prisma:migrate   # first run only
 pnpm --filter @pablo/api dev
 ```
 
-Domain modules still to come (`billing`, `orchestrator`, `sniper`,
-`portfolio`, `trades`, `notifications`, `admin`) land one roadmap phase at a
-time — see `docs/ARCHITECTURE.md` at the repo root.
+`engine-bridge` (the Rust orchestrator) needs to be running separately for
+`/bot/*` routes to do anything beyond validation — see the root README's
+"Local dev" section.
+
+Domain modules still to come (`portfolio`, `trades`, `notifications`,
+`admin` dashboards) land one roadmap phase at a time — see
+`docs/ARCHITECTURE.md` at the repo root.

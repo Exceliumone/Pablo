@@ -3,11 +3,14 @@ import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
+import websocket from "@fastify/websocket";
 import { env } from "./config/env.js";
 import authPlugin from "./plugins/auth.js";
 import authRoutes from "./modules/auth/auth.routes.js";
 import adminRoutes from "./modules/admin/admin.routes.js";
 import billingRoutes from "./modules/billing/billing.routes.js";
+import botRoutes from "./modules/bot/bot.routes.js";
+import wsGateway from "./ws/gateway.js";
 
 export function buildApp() {
   const app = Fastify({
@@ -22,6 +25,7 @@ export function buildApp() {
   app.register(rateLimit, { max: 100, timeWindow: "1 minute" });
   app.register(cookie);
   app.register(authPlugin);
+  app.register(websocket);
 
   // Final safety net: module-level handlers (auth.routes.ts, billing.routes.ts)
   // catch their own typed errors and re-throw everything else, which lands
@@ -49,12 +53,14 @@ export function buildApp() {
   app.register(authRoutes, { prefix: "/auth" });
   app.register(adminRoutes, { prefix: "/admin" });
   app.register(billingRoutes, { prefix: "/billing" });
+  app.register(botRoutes, { prefix: "/bot" });
+  app.register(wsGateway);
 
   // Domain modules are registered here as they land, one phase at a time:
   // Phase 1 → auth (done). Phase 2 → billing + PlatformConfig admin (done).
-  // Phase 3 → sniper/settings (engine-bridge proxy). Phase 4 →
-  // portfolio/trades/notifications + WS gateway. Phase 5 → full admin
-  // console (users, holders, licenses, stats, logs, monitoring).
+  // Phase 3 → bot control + engine-bridge orchestration + WS gateway
+  // (done). Phase 4 → portfolio/trades/notifications history. Phase 5 →
+  // full admin console (users, holders, licenses, stats, logs, monitoring).
 
   return app;
 }

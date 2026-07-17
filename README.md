@@ -15,8 +15,9 @@ pablo/
 ├── engine/              The existing Rust sniper/copy-trading engine.
 │                         Untouched — see engine/UPSTREAM.md.
 ├── apps/
-│   ├── engine-bridge/    Rust/Axum control surface around the engine
-│                         (scanner + per-user executor, Phase 3).
+│   ├── engine-bridge/    Rust control surface around the engine:
+│                         orchestrator + shared scanner + per-user
+│                         executor binaries (Phase 3, done).
 │   ├── api/              Fastify backend — auth, billing, orchestration,
 │                         Prisma schema.
 │   └── web/               Next.js 15 frontend — landing, dashboard, admin.
@@ -43,7 +44,8 @@ Rust side:
 
 ```bash
 cargo check --workspace
-cargo run --bin engine-bridge   # health/version skeleton today
+cargo run --bin engine-bridge   # orchestrator: HTTP API on :8090
+# scanner and executor are spawned by the orchestrator, not run by hand
 ```
 
 ## Status
@@ -68,7 +70,28 @@ cargo run --bin engine-bridge   # health/version skeleton today
   exercised end-to-end here — verified instead that they fail cleanly
   rather than crash or leak internal errors. Test the live paths before
   production.
-- **Next: Phase 3 (bridge to the engine)** — the shared scanner, one
-  executor per subscriber, settings pushed live to the trading engine.
+- **Phase 3 (bridge to the engine) — done.** `engine-bridge` restructured
+  into a library plus three binaries (`engine-bridge` orchestrator,
+  `scanner`, `executor`), all built against the unmodified `engine` crate
+  as a dependency — no file under `engine/` was touched. One shared
+  scanner (single Yellowstone gRPC subscription, reuses the engine's own
+  parsing functions) publishes detections onto a Redis Stream; one
+  independent OS process per subscriber consumes it and calls the
+  engine's real `execute_buy`/`SellingEngine` functions directly. The
+  orchestrator spawns/kills/monitors those processes and self-heals its
+  status view via a Redis pub/sub subscription to what each executor
+  self-reports. `apps/api`'s new `bot` module and `/ws` gateway are the
+  *only* thing that ever talks to the engine — through
+  `packages/shared-types` DTOs mirrored by hand in `contract.rs` — so a
+  future engine rewrite can swap underneath without touching the frontend
+  or the API. Verified end-to-end against a real local Postgres/Redis:
+  process spawn/stop/status, the Redis Stream fan-out, the pub/sub relay,
+  and a real WebSocket client receiving live events with JWT auth
+  enforced. **Not verifiable in this sandbox**: actual Yellowstone gRPC
+  connectivity and actual on-chain trade execution, since Solana RPC/gRPC
+  is blocked by network egress policy here — test both on Devnet before
+  Mainnet.
+- **Next: Phase 4 (trading dashboard)** — live sniper feed, portfolio,
+  history, analytics.
 
 See §14 of `docs/ARCHITECTURE.md` for the full roadmap.

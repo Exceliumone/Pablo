@@ -28,6 +28,20 @@ const envSchema = z.object({
   // Comma-separated wallet addresses auto-promoted to ADMIN on login —
   // bootstraps the first admin without needing direct DB access.
   ADMIN_WALLET_ADDRESSES: z.string().optional(),
+
+  // Envelope key for trading-wallet secret keys (AES-256-GCM, base64,
+  // 32 bytes). This is the placeholder-for-KMS referenced throughout —
+  // swap for real KMS/Vault before production, see wallet.service.ts.
+  WALLET_ENCRYPTION_KEY: z.string().min(1),
+
+  // engine-bridge (the orchestrator) and the platform-wide chain
+  // infrastructure it needs to hand each executor at spawn time. Not
+  // admin-editable like PlatformConfig — these are ops/infra credentials,
+  // not product settings.
+  ENGINE_BRIDGE_URL: z.string().url().default("http://localhost:8090"),
+  YELLOWSTONE_GRPC_HTTP: z.string().default("https://not-configured.invalid"),
+  YELLOWSTONE_GRPC_TOKEN: z.string().default("not-configured"),
+  ZERO_SLOT_URL: z.string().default("https://not-configured.invalid"),
 });
 
 export type Env = z.infer<typeof envSchema>;

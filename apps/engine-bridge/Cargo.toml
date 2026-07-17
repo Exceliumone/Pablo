@@ -4,9 +4,32 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[lib]
+name = "engine_bridge"
+path = "src/lib.rs"
+
+# main.rs: the orchestrator / control-plane HTTP server (spawns and
+# supervises per-user `executor` child processes). This is the only binary
+# apps/api talks to.
 [[bin]]
 name = "engine-bridge"
 path = "src/main.rs"
+
+# The shared, singleton detection process. The orchestrator (or an ops
+# runbook) must never run more than one of these — see docs/ARCHITECTURE.md.
+[[bin]]
+name = "scanner"
+path = "src/bin/scanner.rs"
+
+# One OS process per subscriber, spawned by the orchestrator. Isolation is
+# not a nicety here — the engine's own position-tracking globals
+# (BOUGHT_TOKEN_LIST etc. in sniper_bot.rs) are keyed by mint only, with no
+# user dimension, so two users' state would corrupt each other inside a
+# shared process. A separate OS process is what makes the untouched engine
+# code safe to reuse per-tenant.
+[[bin]]
+name = "executor"
+path = "src/bin/executor.rs"
 
 [dependencies]
 # The trading core, used as a library. Nothing in it is modified here.
@@ -20,3 +43,16 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
+
+# Matched to engine/Cargo.toml so Cargo resolves one shared version across
+# the workspace lockfile.
+anchor-client = { version = "0.31.0", features = ["async"] }
+yellowstone-grpc-client = "4.1.0"
+yellowstone-grpc-proto = "4.1.1"
+futures-util = "0.3.30"
+maplit = "1.0.2"
+dashmap = "5.5.3"
+bs58 = "0.4"
+chrono = "0.4.26"
+
+redis = { version = "0.27", features = ["tokio-comp", "streams"] }

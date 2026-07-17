@@ -25,7 +25,7 @@ const PHASES: { phase: string; title: string; body: string; status: Status }[] =
     phase: "Phase 3",
     title: "Pont vers le moteur",
     body: "Scanner partagé, executor dédié par abonné, réglages appliqués en direct au moteur.",
-    status: "upcoming",
+    status: "done",
   },
   {
     phase: "Phase 4",

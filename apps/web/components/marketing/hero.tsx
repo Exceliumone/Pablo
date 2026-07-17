@@ -77,7 +77,7 @@ export function Hero() {
             className="mt-9 flex flex-wrap items-center gap-4"
           >
             <Button size="lg" asChild>
-              <Link href="/subscribe" className="group">
+              <Link href="/app" className="group">
                 Launch App
                 <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
               </Link>

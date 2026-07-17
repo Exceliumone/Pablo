@@ -106,7 +106,11 @@ export const botSettingsSchema = z.object({
   takeProfitPct: z.number(),
   stopLossPct: z.number(),
   trailingStopPct: z.number().nullable(),
-  priorityFeeLamports: z.coerce.bigint(),
+  // A number, not a serialized bigint like minHolderTokens/amountLamports
+  // elsewhere — priority fees are always small (well under
+  // Number.MAX_SAFE_INTEGER even at many SOL), so there's no precision
+  // reason to pay the bigint-as-string tax here.
+  priorityFeeLamports: z.number().int().nonnegative(),
   slippageBps: z.number().int().min(0).max(10000),
   autoSell: z.boolean(),
   copyTradingEnabled: z.boolean(),
@@ -114,6 +118,65 @@ export const botSettingsSchema = z.object({
   protocolPreference: z.enum(PROTOCOLS),
 });
 export type BotSettingsDto = z.infer<typeof botSettingsSchema>;
+
+// ─────────────────────────────────────────────────────────────────
+// Bot control plane — the contract between apps/api and the engine
+// control layer (apps/engine-bridge). Any engine implementation that
+// speaks this contract (HTTP for control, these payloads over the
+// executor:events:<userId> Redis channel for live events) is a valid
+// drop-in replacement — apps/api and apps/web never assume anything
+// about the engine beyond this shape. See docs/ARCHITECTURE.md §"Engine
+// contract".
+// ─────────────────────────────────────────────────────────────────
+
+export const BOT_STATUSES = ["STOPPED", "STARTING", "RUNNING", "STOPPING", "ERROR"] as const;
+export type BotStatus = (typeof BOT_STATUSES)[number];
+
+export const botStatusDto = z.object({
+  status: z.enum(BOT_STATUSES),
+  pid: z.number().nullable(),
+  startedAt: z.string().datetime().nullable(),
+  lastEventAt: z.string().datetime().nullable(),
+  lastError: z.string().nullable(),
+  restartCount: z.number().int().nonnegative(),
+});
+export type BotStatusDto = z.infer<typeof botStatusDto>;
+
+export const botEventDto = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("status"),
+    userId: z.string(),
+    status: z.enum(BOT_STATUSES),
+    at: z.string().datetime(),
+  }),
+  z.object({
+    type: z.literal("opportunity"),
+    userId: z.string(),
+    mint: z.string(),
+    dex: z.string(),
+    priceSol: z.number(),
+    liquiditySol: z.number(),
+    at: z.string().datetime(),
+  }),
+  z.object({
+    type: z.literal("trade"),
+    userId: z.string(),
+    side: z.enum(TRADE_SIDES),
+    mint: z.string(),
+    priceSol: z.number(),
+    amountSol: z.number(),
+    txSignature: z.string().nullable(),
+    reason: z.string().nullable(),
+    at: z.string().datetime(),
+  }),
+  z.object({
+    type: z.literal("error"),
+    userId: z.string(),
+    message: z.string(),
+    at: z.string().datetime(),
+  }),
+]);
+export type BotEventDto = z.infer<typeof botEventDto>;
 
 export const tradeDto = z.object({
   id: z.string(),

@@ -9,6 +9,19 @@ jobs:
   node:
     name: Node (web / api / shared-types)
     runs-on: ubuntu-latest
+    env:
+      # Dummy-but-valid values so apps/api's module-level env validation
+      # (src/config/env.ts) doesn't fail typecheck/build/test — none of
+      # these need to be real for CI, no network calls happen during
+      # `vitest run`'s pure state-machine tests.
+      NODE_ENV: test
+      DATABASE_URL: postgresql://pablo:pablo@localhost:5432/pablo?schema=public
+      REDIS_URL: redis://localhost:6379
+      JWT_ACCESS_SECRET: ci-only-access-secret-not-real
+      JWT_REFRESH_SECRET: ci-only-refresh-secret-not-real
+      RPC_HTTP: https://api.mainnet-beta.solana.com
+      ENGINE_BRIDGE_INTERNAL_TOKEN: ci-only-token
+      WALLET_ENCRYPTION_KEY: qYBzNoVAAP0znC5S1zPvPwZB4ztFWkaY+8Z8RQilDWY=
     steps:
       - uses: actions/checkout@v4
 
