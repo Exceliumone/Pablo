@@ -5,6 +5,14 @@ import { useWallet } from "@solana/wallet-adapter-react";
 import { WalletReadyState } from "@solana/wallet-adapter-base";
 import { useAuth } from "@/components/providers/auth-provider";
 
+// Matches @solana/wallet-adapter-walletconnect's WalletConnectWalletName
+// constant, kept as a literal rather than imported: that package (via
+// @walletconnect/solana-adapter) has no "sideEffects": false, so pulling in
+// even just the constant drags the whole WalletConnect/QR-modal dependency
+// graph into every bundle that imports it — and ConnectButton renders in
+// the navbar on every page, not just wherever wallet-connect logic lives.
+const WALLET_CONNECT_NAME = "WalletConnect";
+
 function truncate(address: string) {
   return `${address.slice(0, 4)}…${address.slice(-4)}`;
 }
@@ -38,8 +46,14 @@ export function ConnectButton() {
     return () => document.removeEventListener("mousedown", onClickOutside);
   }, []);
 
+  // WalletConnect has no browser extension to detect — it pairs with a
+  // mobile wallet over a QR code — so it never earns Installed/Loadable
+  // the way an extension-based adapter does. Always show it when present;
+  // every other adapter (Phantom, Solflare, Trust, Bitget, ...) keeps the
+  // usual detection-gated behavior.
   const available = wallets.filter(
     (w) =>
+      w.adapter.name === WALLET_CONNECT_NAME ||
       w.readyState === WalletReadyState.Installed ||
       w.readyState === WalletReadyState.Loadable,
   );
