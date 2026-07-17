@@ -43,9 +43,8 @@ fonts.gstatic.com).
   scrolling to the landing page's CTA section.
 
 **Phase 3 — bot terminal.**
-- `app/app/page.tsx`: auth-gated, then subscription-gated (redirects to
-  `/subscribe` if not ACTIVE), then renders the control terminal.
-- `lib/use-bot.ts`: settings/status CRUD against `/bot/*`.
+- `app/app/page.tsx`: the Sniper tab — start/stop plus the live event feed.
+- `lib/use-bot.ts`: status + start/stop against `/bot/*`.
 - `lib/use-bot-events.ts`: opens `GET /ws?token=`, exponential-backoff
   reconnect (capped at 15s) on drop.
 - `components/bot/`: `bot-control-panel.tsx` (start/stop, pid, WS
@@ -56,16 +55,48 @@ fonts.gstatic.com).
 - "Launch App" / the landing CTA now route to `/app` once authenticated
   (still `/subscribe` mid-way through the connect flow).
 
+**Phase 4 — trading dashboard.**
+- `app/app/layout.tsx`: auth- and subscription-gating moved here, once,
+  out of the individual pages — everything under `app/app/*` can assume
+  an authenticated, Premium user. `components/dashboard/dashboard-shell.tsx`
+  is the six-tab shell (Sniper, Portfolio, Historique, Analytics, Wallet,
+  Réglages) all of them share.
+- `app/app/settings/page.tsx`: the settings form, moved out of the Sniper
+  tab into its own page. Uses the new `lib/use-bot-settings.ts` — split
+  out from `use-bot.ts` specifically so an unreachable `engine-bridge`
+  orchestrator (which only `/bot/status` needs) can never blank out the
+  settings form, which only needs `/bot/settings`. That coupling was a
+  real bug caught via live testing (screenshotting the two pages side by
+  side with the orchestrator deliberately not running), not a
+  hypothetical one.
+- `app/app/portfolio/page.tsx` + `components/portfolio/positions-table.tsx`:
+  open/closed positions and a realized-PnL summary from `lib/use-portfolio.ts`.
+- `app/app/history/page.tsx` + `components/history/trades-table.tsx`:
+  cursor-paginated trade log with a buy/sell filter, via `lib/use-trades.ts`.
+- `app/app/analytics/page.tsx` + `components/analytics/pnl-chart.tsx`: win
+  rate, best/worst trade, and a 14-day realized-PnL bar chart — a plain
+  flex/CSS bar chart with a zero baseline and a hover readout, not a
+  charting library dependency, since one signed series per day doesn't
+  need one.
+- `app/app/wallet/page.tsx` + `components/wallet/{deposit-panel,withdraw-form}.tsx`:
+  deposit QR/address (`@solana/pay`'s `createQR` again, reused from the
+  Phase 2 payment panel) and a guarded withdraw form with an explicit
+  confirm step before it calls `POST /wallet/withdraw`.
+
 ## Route map (built incrementally, one phase at a time)
 
 ```
 app/
-  page.tsx              Phase 1 — landing page (done)
-  subscribe/page.tsx      Phase 2 — subscription status + payment (done)
-  app/page.tsx             Phase 3 — bot control terminal (done)
-  (dashboard)/             Phase 4 — sniper, portfolio, history, wallet,
-                            analytics, settings, support
-  (admin)/                  Phase 5 — admin panel
+  page.tsx                 Phase 1 — landing page (done)
+  subscribe/page.tsx       Phase 2 — subscription status + payment (done)
+  app/layout.tsx           Phase 4 — auth/subscription gate + dashboard shell (done)
+  app/page.tsx             Phase 3 — sniper tab: start/stop + live feed (done)
+  app/portfolio/page.tsx   Phase 4 — open/closed positions (done)
+  app/history/page.tsx     Phase 4 — paginated trade log (done)
+  app/analytics/page.tsx   Phase 4 — win rate, PnL chart (done)
+  app/wallet/page.tsx      Phase 4 — deposit/withdraw (done)
+  app/settings/page.tsx    Phase 4 — bot settings form (done)
+  (admin)/                 Phase 5 — admin panel
 ```
 
 ## Local dev

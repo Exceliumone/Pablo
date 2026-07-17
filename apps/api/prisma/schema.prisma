@@ -245,6 +245,16 @@ enum TradeStatus {
   FAILED
 }
 
+/// Persisted from the executor's `trade` BotEvent (see
+/// apps/api/src/jobs/event-persister.ts). `execute_buy` in the engine
+/// returns `Result<()>` with no fill data, so buys land here as PENDING
+/// with a null `txSignature`; sells go through `unified_emergency_sell`,
+/// which does return a signature, so those land CONFIRMED. `amountToken`
+/// and a sell's `amountSol` are estimates (tick price × tracked position
+/// size), not the actual on-chain fill — the engine doesn't expose fills,
+/// only success/failure, so this is the best available approximation
+/// without modifying it. Upgrading this needs the engine itself to surface
+/// fill data, which is out of scope for the control layer.
 model Trade {
   id          String      @id @default(cuid())
   userId      String
@@ -256,7 +266,7 @@ model Trade {
   priceSol    Float
   amountToken Float
   amountSol   Float
-  txSignature String      @unique
+  txSignature String?     @unique // null until the engine reports a signature — see Trade model note below
   status      TradeStatus
   reason      String? // TAKE_PROFIT | STOP_LOSS | TRAILING_STOP | MANUAL | TIME_EXIT
   createdAt   DateTime    @default(now())

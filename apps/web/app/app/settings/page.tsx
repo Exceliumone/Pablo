@@ -2,31 +2,30 @@
 
 import { Loader2, RefreshCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { BotControlPanel } from "@/components/bot/bot-control-panel";
-import { BotEventFeed } from "@/components/bot/bot-event-feed";
+import { BotSettingsForm } from "@/components/bot/bot-settings-form";
 import { useAuth } from "@/components/providers/auth-provider";
-import { useBot } from "@/lib/use-bot";
-import { useBotEvents } from "@/lib/use-bot-events";
+import { useBotSettings } from "@/lib/use-bot-settings";
 
-export default function SniperPage() {
+export default function SettingsPage() {
   const { accessToken } = useAuth();
-  const { status, loading, error, start, stop, actionPending } = useBot(accessToken);
-  const { events, connected } = useBotEvents(accessToken);
+  const { settings, loading, error, updateSettings, saving } = useBotSettings(accessToken);
 
   return (
     <div className="mx-auto max-w-3xl space-y-6">
       <div className="text-center">
-        <p className="text-xs font-semibold uppercase tracking-[0.25em] text-pablo-400">Sniper</p>
+        <p className="text-xs font-semibold uppercase tracking-[0.25em] text-pablo-400">
+          Réglages
+        </p>
         <h1 className="mt-3 text-balance font-display text-4xl font-extrabold tracking-tight text-foreground md:text-5xl">
-          Pilotez votre bot
+          Paramètres du bot
         </h1>
         <p className="mt-3 text-sm text-muted-foreground">
-          Scanner partagé, exécution dédiée à votre wallet — démarrez, observez en direct. Les
-          réglages se trouvent dans l&apos;onglet Réglages.
+          Montant, take-profit / stop-loss, slippage, priority fee, copy-trading — appliqués
+          directement au moteur.
         </p>
       </div>
 
-      {loading && !status && (
+      {loading && !settings && (
         <div className="flex justify-center py-16">
           <Loader2 className="h-6 w-6 animate-spin text-pablo-400" />
         </div>
@@ -42,17 +41,7 @@ export default function SniperPage() {
         </div>
       )}
 
-      {status && (
-        <BotControlPanel
-          status={status}
-          onStart={start}
-          onStop={stop}
-          pending={actionPending}
-          wsConnected={connected}
-        />
-      )}
-
-      <BotEventFeed events={events} />
+      {settings && <BotSettingsForm settings={settings} onSave={updateSettings} saving={saving} />}
     </div>
   );
 }

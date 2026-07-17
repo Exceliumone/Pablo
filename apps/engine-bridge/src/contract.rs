@@ -121,8 +121,17 @@ pub enum BotEvent {
         user_id: String,
         side: TradeSide,
         mint: String,
+        dex: String,
         price_sol: f64,
+        /// SOL side of the trade. On a buy this is the configured spend
+        /// (exact). On a sell this is `amount_token * price_sol` at the
+        /// sell tick — an estimate, since `unified_emergency_sell` doesn't
+        /// return actual fill data. See the Trade model doc comment in
+        /// apps/api/prisma/schema.prisma.
         amount_sol: f64,
+        /// Token side of the trade, estimated the same way: `amount_sol /
+        /// price_sol` at the buy tick, tracked forward to the matching sell.
+        amount_token: f64,
         tx_signature: Option<String>,
         reason: Option<String>,
         at: String,

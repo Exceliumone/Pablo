@@ -199,7 +199,11 @@ async fn main() -> anyhow::Result<()> {
     // half-implemented.
     let _copy_targets: HashSet<String> = payload.settings.copy_trading_targets.iter().cloned().collect();
 
-    let mut held_mints: HashSet<String> = HashSet::new();
+    // mint -> estimated token amount held, derived from amount_sol / price_sol
+    // at buy time. The engine's execute_buy/unified_emergency_sell return no
+    // fill data, so this (and the amount_sol a sell reports below) is the
+    // best available approximation of position size without engine changes.
+    let mut held_positions: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     let mut last_id = "$".to_string();
     let read_opts = StreamReadOptions::default().block(5000).count(100);
 
@@ -232,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let trade_info = tick_to_trade_info(&tick);
-                let is_held = held_mints.contains(&tick.mint);
+                let is_held = held_positions.contains_key(&tick.mint);
 
                 if is_held {
                     if let Err(e) = selling_engine.update_metrics(&tick.mint, &trade_info).await {
@@ -247,15 +251,20 @@ async fn main() -> anyhow::Result<()> {
                                 .await
                             {
                                 Ok(signature) => {
-                                    held_mints.remove(&tick.mint);
+                                    let price_sol = tick.price as f64 / 1_000_000_000.0;
+                                    let amount_token =
+                                        held_positions.remove(&tick.mint).unwrap_or(0.0);
+                                    let amount_sol = amount_token * price_sol;
                                     publish_event(
                                         &mut event_conn,
                                         &BotEvent::Trade {
                                             user_id: user_id.clone(),
                                             side: TradeSide::Sell,
                                             mint: tick.mint.clone(),
-                                            price_sol: tick.price as f64 / 1_000_000_000.0,
-                                            amount_sol: 0.0,
+                                            dex: tick.dex_type.clone(),
+                                            price_sol,
+                                            amount_sol,
+                                            amount_token,
                                             tx_signature: Some(signature),
                                             reason: Some(if is_emergency { "emergency".into() } else { "sell_condition".into() }),
                                             at: now_iso(),
@@ -309,7 +318,13 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 {
                     Ok(()) => {
-                        held_mints.insert(tick.mint.clone());
+                        let price_sol = tick.price as f64 / 1_000_000_000.0;
+                        let amount_token = if price_sol > 0.0 {
+                            swap_config.amount_in / price_sol
+                        } else {
+                            0.0
+                        };
+                        held_positions.insert(tick.mint.clone(), amount_token);
                         let _ = selling_engine.update_metrics(&tick.mint, &trade_info).await;
                         publish_event(
                             &mut event_conn,
@@ -317,8 +332,10 @@ async fn main() -> anyhow::Result<()> {
                                 user_id: user_id.clone(),
                                 side: TradeSide::Buy,
                                 mint: tick.mint.clone(),
-                                price_sol: tick.price as f64 / 1_000_000_000.0,
+                                dex: tick.dex_type.clone(),
+                                price_sol,
                                 amount_sol: swap_config.amount_in,
+                                amount_token,
                                 tx_signature: None,
                                 reason: Some("auto_snipe".into()),
                                 at: now_iso(),

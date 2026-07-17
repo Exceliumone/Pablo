@@ -91,7 +91,29 @@ cargo run --bin engine-bridge   # orchestrator: HTTP API on :8090
   connectivity and actual on-chain trade execution, since Solana RPC/gRPC
   is blocked by network egress policy here — test both on Devnet before
   Mainnet.
-- **Next: Phase 4 (trading dashboard)** — live sniper feed, portfolio,
-  history, analytics.
+- **Phase 4 (trading dashboard) — done.** The single-page terminal split
+  into a six-tab dashboard (Sniper, Portfolio, Historique, Analytics,
+  Wallet, Réglages) sharing one auth/subscription gate. A new process-wide
+  Redis subscriber (`apps/api/src/jobs/event-persister.ts`) turns the
+  executor's `trade`/`error` events into durable `Trade` and `Position`
+  rows — average-cost accounting on repeat buys, full-close PnL on sell,
+  serialized processing so a same-tick buy-then-sell can't race the
+  database. `GET /portfolio`, `GET /trades` (cursor-paginated), and
+  `GET /analytics/summary` (win rate, best/worst trade, a 14-day realized
+  PnL chart) all read from that ledger. `GET /wallet` and
+  `POST /wallet/withdraw` round out the custodial trading wallet — deposit
+  QR/address, live SOL/$PABLO balance (best-effort, `null` where RPC is
+  unavailable), and a guarded SOL transfer out (blocked while the bot is
+  running). Verified end-to-end against a real local Postgres/Redis by
+  injecting real executor events and confirming the full pipeline —
+  including catching and fixing a genuine race condition where an
+  unserialized event handler let a SELL's "find the open position" query
+  run before the matching BUY's insert had committed. **Not verifiable in
+  this sandbox**: live SOL/$PABLO balances and the withdraw transaction
+  itself, since Solana RPC is blocked by network egress policy here — the
+  code fails cleanly (a `null` balance, a sanitized 500) rather than
+  crashing; test the live paths on Devnet before Mainnet.
+- **Next: Phase 5 (landing page polish)** — premium design pass,
+  animations, mobile optimization.
 
 See §14 of `docs/ARCHITECTURE.md` for the full roadmap.

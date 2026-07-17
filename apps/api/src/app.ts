@@ -10,6 +10,10 @@ import authRoutes from "./modules/auth/auth.routes.js";
 import adminRoutes from "./modules/admin/admin.routes.js";
 import billingRoutes from "./modules/billing/billing.routes.js";
 import botRoutes from "./modules/bot/bot.routes.js";
+import portfolioRoutes from "./modules/portfolio/portfolio.routes.js";
+import tradesRoutes from "./modules/trades/trades.routes.js";
+import analyticsRoutes from "./modules/analytics/analytics.routes.js";
+import walletRoutes from "./modules/wallet/wallet.routes.js";
 import wsGateway from "./ws/gateway.js";
 
 export function buildApp() {
@@ -54,12 +58,16 @@ export function buildApp() {
   app.register(adminRoutes, { prefix: "/admin" });
   app.register(billingRoutes, { prefix: "/billing" });
   app.register(botRoutes, { prefix: "/bot" });
+  app.register(portfolioRoutes, { prefix: "/portfolio" });
+  app.register(tradesRoutes, { prefix: "/trades" });
+  app.register(analyticsRoutes, { prefix: "/analytics" });
+  app.register(walletRoutes, { prefix: "/wallet" });
   app.register(wsGateway);
 
   // Domain modules are registered here as they land, one phase at a time:
   // Phase 1 → auth (done). Phase 2 → billing + PlatformConfig admin (done).
   // Phase 3 → bot control + engine-bridge orchestration + WS gateway
-  // (done). Phase 4 → portfolio/trades/notifications history. Phase 5 →
+  // (done). Phase 4 → portfolio/trades/analytics/wallet (done). Phase 5 →
   // full admin console (users, holders, licenses, stats, logs, monitoring).
 
   return app;

@@ -91,6 +91,49 @@ relay carrying real events end-to-end, and JWT rejection on the socket.
 and actual on-chain execution — Solana RPC/gRPC is blocked by network
 egress policy here. Test both on Devnet before Mainnet.
 
+**Phase 4 — trading dashboard.** `src/jobs/event-persister.ts`,
+`src/modules/portfolio/`, `src/modules/trades/`, `src/modules/analytics/`,
+plus the rest of `src/modules/wallet/`.
+- `event-persister.ts`: the one process-wide Redis subscriber (started
+  once at boot, unlike `ws/gateway.ts`'s one-per-connection) that
+  PSUBSCRIBEs `executor:events:*` and turns `trade`/`error` events into
+  `Trade` + `Position` + `Notification` rows. A BUY opens or averages into
+  a `Position`; a SELL closes it and computes `realizedPnlSol`. Processing
+  is serialized onto a single promise chain — ioredis fires `pmessage`
+  handlers without waiting for the previous one, and a same-tick
+  buy-then-sell (the v1 heuristic can react in milliseconds) could
+  otherwise have the SELL's "find the open position" query race the BUY's
+  still-in-flight insert; this was an actual bug caught via live testing,
+  not a theoretical one.
+- `portfolio.service.ts`: `GET /portfolio` — all open positions plus the
+  50 most recently closed, with a `summary` that's a true aggregate over
+  *all* history (not just what's returned). No live price feed yet, so
+  only realized PnL is reported, never a fabricated unrealized number.
+- `trades.service.ts`: `GET /trades` — cursor-paginated (not offset), so
+  a live-growing history never skips or repeats a row between page
+  fetches.
+- `analytics.service.ts`: `GET /analytics/summary` — trade counts, win
+  rate, best/worst trade, average hold time, and a 14-day realized-PnL
+  series, computed in-process (fine at today's per-user scale).
+- `wallet.service.ts` / `wallet.routes.ts`: `GET /wallet` (SOL + $PABLO
+  balance, best-effort — `null` rather than a thrown error where RPC is
+  unavailable) and `POST /wallet/withdraw` (a guarded `SystemProgram`
+  transfer out of the custodial wallet; refuses while the bot is running,
+  since the executor holds a long-lived connection signing with the same
+  key and racing a manual transfer against an in-flight trade is exactly
+  the kind of bug worth preventing outright).
+
+Verified against a real local Postgres/Redis by injecting real
+`BotEvent::Trade` payloads over Redis pub/sub and confirming the full
+pipeline: positions opening/averaging/closing with correct PnL, cursor
+pagination, analytics aggregation, and — after finding and fixing the
+race above — a rapid-fire buy-then-sell closing correctly every time.
+`POST /wallet/withdraw`'s guard (bot-must-be-stopped) was verified
+directly; the transfer itself was verified to fail cleanly (sanitized
+500) when it reaches Solana RPC, which this sandbox's network policy
+blocks. **Not verifiable in this sandbox**: live SOL/$PABLO balances and
+an actual on-chain withdrawal — test both on Devnet before Mainnet.
+
 ## Local dev
 
 ```bash
@@ -107,6 +150,6 @@ pnpm --filter @pablo/api dev
 `/bot/*` routes to do anything beyond validation — see the root README's
 "Local dev" section.
 
-Domain modules still to come (`portfolio`, `trades`, `notifications`,
-`admin` dashboards) land one roadmap phase at a time — see
-`docs/ARCHITECTURE.md` at the repo root.
+The `admin` dashboard (Phase 5's console: users, holders, licenses, stats,
+logs) is the one domain module left — see `docs/ARCHITECTURE.md` at the
+repo root.

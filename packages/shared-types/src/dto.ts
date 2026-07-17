@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { NOTIFICATION_TYPES, PROTOCOLS, TRADE_SIDES, TRADE_STATUSES } from "./enums.js";
+import {
+  NOTIFICATION_TYPES,
+  POSITION_STATUSES,
+  PROTOCOLS,
+  TRADE_SIDES,
+  TRADE_STATUSES,
+} from "./enums.js";
 
 // Wire-format DTOs shared between apps/web and apps/api. REST today; the
 // same shapes are reused verbatim as WebSocket payloads and, later, as
@@ -163,8 +169,13 @@ export const botEventDto = z.discriminatedUnion("type", [
     userId: z.string(),
     side: z.enum(TRADE_SIDES),
     mint: z.string(),
+    dex: z.string(),
     priceSol: z.number(),
+    // Both are estimates on a sell (tick price × tracked position size) —
+    // the engine returns no fill data. Exact on a buy (the configured
+    // spend). See the Trade model doc comment in prisma/schema.prisma.
     amountSol: z.number(),
+    amountToken: z.number(),
     txSignature: z.string().nullable(),
     reason: z.string().nullable(),
     at: z.string().datetime(),
@@ -187,12 +198,18 @@ export const tradeDto = z.object({
   priceSol: z.number(),
   amountToken: z.number(),
   amountSol: z.number(),
-  txSignature: z.string(),
+  txSignature: z.string().nullable(),
   status: z.enum(TRADE_STATUSES),
   reason: z.string().nullable(),
   createdAt: z.string().datetime(),
 });
 export type TradeDto = z.infer<typeof tradeDto>;
+
+export const tradesPageDto = z.object({
+  trades: z.array(tradeDto),
+  nextCursor: z.string().nullable(),
+});
+export type TradesPageDto = z.infer<typeof tradesPageDto>;
 
 export const notificationDto = z.object({
   id: z.string(),
@@ -203,3 +220,68 @@ export const notificationDto = z.object({
   createdAt: z.string().datetime(),
 });
 export type NotificationDto = z.infer<typeof notificationDto>;
+
+export const positionDto = z.object({
+  id: z.string(),
+  tokenMint: z.string(),
+  tokenSymbol: z.string().nullable(),
+  status: z.enum(POSITION_STATUSES),
+  entryPriceSol: z.number(),
+  currentAmount: z.number(),
+  costBasisSol: z.number(),
+  realizedPnlSol: z.number(),
+  openedAt: z.string().datetime(),
+  closedAt: z.string().datetime().nullable(),
+});
+export type PositionDto = z.infer<typeof positionDto>;
+
+export const portfolioDto = z.object({
+  positions: z.array(positionDto),
+  summary: z.object({
+    openCount: z.number().int().nonnegative(),
+    openCostBasisSol: z.number(),
+    closedCount: z.number().int().nonnegative(),
+    totalRealizedPnlSol: z.number(),
+  }),
+});
+export type PortfolioDto = z.infer<typeof portfolioDto>;
+
+export const analyticsSummaryDto = z.object({
+  totalTrades: z.number().int().nonnegative(),
+  buyCount: z.number().int().nonnegative(),
+  sellCount: z.number().int().nonnegative(),
+  closedPositions: z.number().int().nonnegative(),
+  winCount: z.number().int().nonnegative(),
+  lossCount: z.number().int().nonnegative(),
+  winRatePct: z.number().nullable(),
+  totalRealizedPnlSol: z.number(),
+  bestTradePnlSol: z.number().nullable(),
+  worstTradePnlSol: z.number().nullable(),
+  avgHoldTimeMinutes: z.number().nullable(),
+  pnlByDay: z.array(
+    z.object({
+      date: z.string(), // YYYY-MM-DD
+      realizedPnlSol: z.number(),
+    }),
+  ),
+});
+export type AnalyticsSummaryDto = z.infer<typeof analyticsSummaryDto>;
+
+export const walletDto = z.object({
+  publicKey: z.string(),
+  custody: z.enum(["GENERATED", "IMPORTED"]),
+  solBalance: z.number().nullable(), // null when the RPC lookup fails/is unavailable
+  pabloBalance: z.string().nullable(), // human-readable string (can exceed Number precision)
+});
+export type WalletDto = z.infer<typeof walletDto>;
+
+export const withdrawRequestDto = z.object({
+  toAddress: z.string().min(32).max(64),
+  amountSol: z.number().positive(),
+});
+export type WithdrawRequestDto = z.infer<typeof withdrawRequestDto>;
+
+export const withdrawResultDto = z.object({
+  txSignature: z.string(),
+});
+export type WithdrawResultDto = z.infer<typeof withdrawResultDto>;

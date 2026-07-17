@@ -1,23 +1,23 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import type { BotSettingsDto, BotStatusDto } from "@pablo/shared-types";
+import type { BotStatusDto } from "@pablo/shared-types";
 import { apiFetch, ApiError } from "./api";
 
-interface UseBotResult {
-  settings: BotSettingsDto | null;
+interface UseBotStatusResult {
   status: BotStatusDto | null;
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
-  updateSettings: (patch: Partial<BotSettingsDto>) => Promise<void>;
   start: () => Promise<void>;
   stop: () => Promise<void>;
   actionPending: boolean;
 }
 
-export function useBot(accessToken: string | null): UseBotResult {
-  const [settings, setSettings] = useState<BotSettingsDto | null>(null);
+/** Status + start/stop only — independent of settings, so an unreachable
+ * engine-bridge orchestrator (status) never blanks out the settings form,
+ * and vice versa. See use-bot-settings.ts for the other half. */
+export function useBot(accessToken: string | null): UseBotStatusResult {
   const [status, setStatus] = useState<BotStatusDto | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -28,12 +28,7 @@ export function useBot(accessToken: string | null): UseBotResult {
     setLoading(true);
     setError(null);
     try {
-      const [settingsResult, statusResult] = await Promise.all([
-        apiFetch<BotSettingsDto>("/bot/settings", { accessToken }),
-        apiFetch<BotStatusDto>("/bot/status", { accessToken }),
-      ]);
-      setSettings(settingsResult);
-      setStatus(statusResult);
+      setStatus(await apiFetch<BotStatusDto>("/bot/status", { accessToken }));
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not reach the server.");
     } finally {
@@ -44,27 +39,6 @@ export function useBot(accessToken: string | null): UseBotResult {
   useEffect(() => {
     void refresh();
   }, [refresh]);
-
-  const updateSettings = useCallback(
-    async (patch: Partial<BotSettingsDto>) => {
-      if (!accessToken) return;
-      setActionPending(true);
-      setError(null);
-      try {
-        const updated = await apiFetch<BotSettingsDto>("/bot/settings", {
-          method: "PUT",
-          accessToken,
-          body: JSON.stringify(patch),
-        });
-        setSettings(updated);
-      } catch (err) {
-        setError(err instanceof ApiError ? err.message : "Could not save settings.");
-      } finally {
-        setActionPending(false);
-      }
-    },
-    [accessToken],
-  );
 
   const start = useCallback(async () => {
     if (!accessToken) return;
@@ -94,5 +68,5 @@ export function useBot(accessToken: string | null): UseBotResult {
     }
   }, [accessToken, refresh]);
 
-  return { settings, status, loading, error, refresh, updateSettings, start, stop, actionPending };
+  return { status, loading, error, refresh, start, stop, actionPending };
 }

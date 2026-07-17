@@ -31,7 +31,7 @@ const PHASES: { phase: string; title: string; body: string; status: Status }[] =
     phase: "Phase 4",
     title: "Dashboard trading",
     body: "Sniper en direct, portfolio, historique, analytics, notifications temps réel.",
-    status: "upcoming",
+    status: "done",
   },
   {
     phase: "Phase 5",
