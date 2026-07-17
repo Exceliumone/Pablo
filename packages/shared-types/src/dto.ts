@@ -7,6 +7,40 @@ import { NOTIFICATION_TYPES, PROTOCOLS, TRADE_SIDES, TRADE_STATUSES } from "./en
 // see "API surface" in docs/ARCHITECTURE.md for why these are kept flat and
 // transport-agnostic from the start.
 
+export const walletLinkDto = z.object({
+  address: z.string(),
+  provider: z.string(),
+  isPrimary: z.boolean(),
+});
+export type WalletLinkDto = z.infer<typeof walletLinkDto>;
+
+export const userDto = z.object({
+  id: z.string(),
+  role: z.enum(["SUBSCRIBER", "ADMIN", "SUPPORT"]),
+  status: z.enum(["ACTIVE", "BANNED", "SUSPENDED"]),
+  wallets: z.array(walletLinkDto),
+  subscription: z
+    .object({
+      tier: z.enum(["FREE", "PREMIUM"]),
+      status: z.enum(["ACTIVE", "GRACE", "EXPIRED"]),
+    })
+    .nullable(),
+});
+export type UserDto = z.infer<typeof userDto>;
+
+export const authNonceResponse = z.object({
+  message: z.string(),
+  nonce: z.string(),
+  expiresInSeconds: z.number(),
+});
+export type AuthNonceResponse = z.infer<typeof authNonceResponse>;
+
+export const authVerifyResponse = z.object({
+  accessToken: z.string(),
+  user: userDto,
+});
+export type AuthVerifyResponse = z.infer<typeof authVerifyResponse>;
+
 export const botSettingsSchema = z.object({
   isActive: z.boolean(),
   amountPerBuySol: z.number().positive(),

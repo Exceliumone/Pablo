@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { displayFont, monoFont } from "./fonts";
+import { AppProviders } from "@/components/providers/app-providers";
 
 export const metadata: Metadata = {
   title: "PABLO",
@@ -12,8 +14,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className="dark">
-      <body className="min-h-screen antialiased">{children}</body>
+    <html lang="en" className={`dark ${displayFont.variable} ${monoFont.variable}`}>
+      <body className="min-h-screen antialiased">
+        <AppProviders>{children}</AppProviders>
+      </body>
     </html>
   );
 }

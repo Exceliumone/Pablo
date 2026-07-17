@@ -48,6 +48,15 @@ cargo run --bin engine-bridge   # health/version skeleton today
 
 ## Status
 
-Phase 0 (foundations) complete: monorepo tooling, the engine imported
-verbatim, `engine-bridge`/`api`/`web` skeletons all build and boot, CI wired.
-See §14 of the architecture doc for what's next.
+- **Phase 0 (foundations) — done.** Monorepo tooling, the engine imported
+  verbatim, `engine-bridge`/`api`/`web` skeletons all build and boot, CI
+  wired.
+- **Phase 1 (identity & landing) — done.** Sign-In-With-Solana auth
+  end-to-end (nonce → signature → JWT + rotating refresh session, verified
+  against a real Postgres/Redis), wallet-adapter wired into the frontend,
+  and the full premium landing page (hero, features, roadmap, FAQ, stats,
+  launch CTA) with the PABLO brand assets.
+- **Next: Phase 2 (subscription)** — SOL payment verification, $PABLO
+  holder auto-Premium, admin-editable `PlatformConfig`.
+
+See §14 of `docs/ARCHITECTURE.md` for the full roadmap.
