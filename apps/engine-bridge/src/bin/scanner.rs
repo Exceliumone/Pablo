@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
 
     let redis_url = env("REDIS_URL");
     let redis_client = redis::Client::open(redis_url)?;
+    acquire_singleton_lock_or_exit(&redis_client).await;
     let redis_conn: RedisConn = Arc::new(Mutex::new(
         redis_client.get_multiplexed_async_connection().await?,
     ));
@@ -134,6 +135,87 @@ async fn main() -> anyhow::Result<()> {
             run_rpc_websocket(env("RPC_HTTP"), solana_ws_url, redis_conn).await
         }
     }
+}
+
+const SINGLETON_LOCK_KEY: &str = "scanner:singleton-lock";
+const SINGLETON_LOCK_TTL_MS: usize = 30_000;
+const SINGLETON_LOCK_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Enforces, in code, the "exactly one scanner instance" invariant this
+/// file's module doc has always documented but never mechanically checked.
+/// A second instance — a stale process a previous redeploy failed to kill,
+/// a PM2 config accidentally set to more than one instance, ... — doubles
+/// every RPC request this process makes (its own 3x `logsSubscribe` plus
+/// its own full `getTransaction` fan-out), consuming twice the RPS budget
+/// for reasons completely invisible from either single instance's own
+/// logs. Refuses to start rather than silently running duplicated.
+async fn acquire_singleton_lock_or_exit(redis_client: &redis::Client) {
+    let instance_id = format!(
+        "{}-{}",
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string()),
+        std::process::id()
+    );
+
+    let mut conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "scanner: could not reach Redis to acquire the singleton lock — refusing to \
+                 start blind rather than risk running as an undetected duplicate instance"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let acquired: bool = redis::cmd("SET")
+        .arg(SINGLETON_LOCK_KEY)
+        .arg(&instance_id)
+        .arg("NX")
+        .arg("PX")
+        .arg(SINGLETON_LOCK_TTL_MS)
+        .query_async::<Option<String>>(&mut conn)
+        .await
+        .map(|v| v.is_some())
+        .unwrap_or(false);
+
+    if !acquired {
+        let holder: String = conn
+            .get(SINGLETON_LOCK_KEY)
+            .await
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        tracing::error!(
+            this_instance = %instance_id,
+            held_by = %holder,
+            "scanner: ANOTHER INSTANCE ALREADY HOLDS THE SINGLETON LOCK — refusing to start. \
+             Running two scanners against the same RPC/WSS API key doubles every request this \
+             process makes, which can exhaust an RPS budget for reasons invisible in a single \
+             instance's own logs (e.g. logsSubscribe rejected with -32005 from the very first \
+             attempt, with no other explanation in sight). Check for a stale process a previous \
+             redeploy failed to kill, or a process manager config accidentally running more \
+             than one instance."
+        );
+        std::process::exit(1);
+    }
+
+    tracing::info!(instance_id = %instance_id, "scanner: singleton lock acquired");
+
+    // Renewed for as long as this process is alive; an abrupt crash/kill
+    // just lets the TTL lapse instead of requiring any explicit release,
+    // so a dead instance can't permanently deadlock a fresh one.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SINGLETON_LOCK_RENEW_INTERVAL);
+        loop {
+            interval.tick().await;
+            let _: redis::RedisResult<()> = redis::cmd("SET")
+                .arg(SINGLETON_LOCK_KEY)
+                .arg(&instance_id)
+                .arg("PX")
+                .arg(SINGLETON_LOCK_TTL_MS)
+                .query_async(&mut conn)
+                .await;
+        }
+    });
 }
 
 /// Logs the *shape* of SOLANA_WS_URL — scheme, host, and how many path
@@ -532,6 +614,21 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 /// backing off from wherever it left off.
 const RECONNECT_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
 
+/// A small pseudo-random offset (no `rand` dependency needed for this) so
+/// the 3 per-program reconnect tasks below don't retry in lockstep —
+/// without it, all 3 start at the same instant and share the exact same
+/// backoff schedule, so every retry cycle re-creates the same "3 requests
+/// in the same instant" burst that (however small) is worth avoiding when
+/// the account is already rate-limited.
+fn jitter_ms(max_ms: u64) -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    u64::from(nanos) % max_ms.max(1)
+}
+
 async fn run_rpc_websocket(
     rpc_http: String,
     solana_ws_url: String,
@@ -578,7 +675,7 @@ async fn run_rpc_websocket(
                     );
                 }
 
-                tokio::time::sleep(backoff).await;
+                tokio::time::sleep(backoff + Duration::from_millis(jitter_ms(1000))).await;
                 backoff = if attempt_started.elapsed() >= RECONNECT_HEALTHY_UPTIME {
                     RECONNECT_BASE_DELAY
                 } else {
@@ -620,6 +717,12 @@ async fn watch_program_logs(
     // #[derive(Debug)] doesn't care about thiserror's chain wiring — right
     // here, before it's converted to anyhow for this function's own
     // control flow.
+    // Both of these count toward the same per-API-key RPS budget
+    // `getTransaction` does (see `RateLimiter`'s doc comment) — gating them
+    // through it too means the scanner's OWN request rate can never be
+    // what tips the account over the limit, regardless of how much of the
+    // budget getTransaction's fan-out is separately consuming.
+    rate_limiter.acquire().await;
     let pubsub = match PubsubClient::new(solana_ws_url).await {
         Ok(client) => client,
         Err(e) => {
@@ -636,6 +739,7 @@ async fn watch_program_logs(
         }
     };
 
+    rate_limiter.acquire().await;
     let (mut stream, _unsubscribe) = match pubsub
         .logs_subscribe(
             RpcTransactionLogsFilter::Mentions(vec![program.to_string()]),
