@@ -22,12 +22,14 @@
 //!   JSON-RPC — `logsSubscribe` on each watched program via
 //!   `SOLANA_WS_URL`, then `getTransaction` via `RPC_HTTP` for whatever
 //!   `logsSubscribe` doesn't include (inner instructions, token balances).
-//!   Exists so this project can be developed and tested against Chainstack
-//!   (or any provider)'s free/standard RPC+WS tier without also paying for
-//!   a Yellowstone gRPC add-on. **Materially higher latency and lower
-//!   throughput than production — see the module-level warning logged at
-//!   startup, and the doc comment on `run_rpc_websocket` below. Not meant
-//!   to run against real capital.**
+//!   Exists so this project can be developed and tested against any
+//!   provider's free/standard RPC+WS tier — including Solana's own public
+//!   endpoint (`https://api.mainnet-beta.solana.com` /
+//!   `wss://api.mainnet-beta.solana.com`, zero cost, no account needed) —
+//!   without also paying for a Yellowstone gRPC add-on. **Materially
+//!   higher latency and lower throughput than production — see the
+//!   module-level warning logged at startup, and the doc comment on
+//!   `run_rpc_websocket` below. Not meant to run against real capital.**
 //!
 //! Reuses exactly one function from the untouched engine crate:
 //! `transaction_parser::parse_transaction_data`. It never calls
@@ -531,9 +533,17 @@ async fn run_yellowstone(
 /// otherwise fire dozens of concurrent `getTransaction` calls and blow
 /// through the RPC plan's rate limit in one go. Bounds concurrent lookups
 /// instead; excess detections simply wait their turn. Tune to whatever your
-/// Chainstack (or other provider) plan's actual req/s allows — check your
-/// dashboard, this isn't derived from anything provider-specific.
-const MAX_CONCURRENT_LOOKUPS: usize = 8;
+/// provider's actual req/s allows — check your dashboard, this isn't
+/// derived from anything provider-specific.
+///
+/// Currently set low enough for Solana's free public RPC
+/// (`api.mainnet-beta.solana.com`) rather than a paid plan: its documented
+/// limits (solana.com/docs/rpc/http — "Public RPC endpoints") cap a single
+/// method (`getTransaction` here) at 40 requests/10s and total concurrent
+/// connections per IP at 40. A small number here trades detection latency
+/// (this is dev/staging-tier infra by design — see this file's module doc
+/// comment) for never tripping either ceiling.
+const MAX_CONCURRENT_LOOKUPS: usize = 2;
 
 /// getTransaction only serves `confirmed`/`finalized` commitment (Solana's
 /// JSON-RPC does not support `processed` for this method) — unlike
@@ -541,29 +551,35 @@ const MAX_CONCURRENT_LOOKUPS: usize = 8;
 /// logsSubscribe is often not fetchable yet the instant its log arrives. A
 /// short bounded retry covers the normal confirm delay; if it never lands
 /// in time, the trade is skipped rather than blocking this task forever.
+/// The delay is wider than a paid low-latency RPC would need — public RPC
+/// nodes are shared, best-effort infra, and there's no reason to burn one
+/// of a very small requests/sec budget (see `DEFAULT_MAX_RPC_RPS`) polling
+/// faster than a transaction could plausibly have confirmed anyway.
 const GET_TRANSACTION_RETRIES: u32 = 5;
-const GET_TRANSACTION_RETRY_DELAY: Duration = Duration::from_millis(400);
+const GET_TRANSACTION_RETRY_DELAY: Duration = Duration::from_millis(1500);
 
 /// `MAX_CONCURRENT_LOOKUPS` bounds how many `getTransaction` calls can be
-/// *in flight* at once, but says nothing about *rate* — 8 short-lived
-/// requests completing and immediately being replaced by 8 more can easily
-/// sustain triple digits of requests per second once PumpFun/PumpSwap/
-/// Raydium Launchpad's real mainnet-wide volume (every trade on any of
-/// those programs, not just tokens this deployment cares about) is
-/// flowing through `logsSubscribe`, each with up to
-/// `GET_TRANSACTION_RETRIES` attempts. Most providers — Chainstack
-/// included — meter HTTP and WSS requests against the *same* per-API-key
-/// budget, so a `getTransaction` flood exhausting that budget doesn't just
-/// throttle itself: it also starves out the `logsSubscribe` reconnect
-/// attempts below, which is what actually surfaces as "logsSubscribe
-/// failed: RPS limit" even though `getTransaction` is the real source of
-/// the load. This caps *dispatch rate*, independent of concurrency, so the
-/// scanner stays under whatever the plan actually allows. Override via
-/// `SCANNER_MAX_RPC_RPS` — default is deliberately conservative (well
-/// under a typical 250 RPS plan) to leave headroom for the initial
-/// `logsSubscribe` calls and any other consumer of the same API key (e.g.
-/// apps/api's own RPC usage, if it shares a Chainstack project).
-const DEFAULT_MAX_RPC_RPS: usize = 100;
+/// *in flight* at once, but says nothing about *rate* — a handful of
+/// short-lived requests completing and immediately being replaced by more
+/// can still sustain a high rate once PumpFun/PumpSwap/Raydium
+/// Launchpad's real mainnet-wide volume (every trade on any of those
+/// programs, not just tokens this deployment cares about) is flowing
+/// through `logsSubscribe`, each with up to `GET_TRANSACTION_RETRIES`
+/// attempts. Most providers meter HTTP and WSS requests against the
+/// *same* per-key/per-IP budget, so a `getTransaction` flood exhausting
+/// that budget doesn't just throttle itself: it also starves out the
+/// `logsSubscribe` reconnect attempts below, which is what can surface as
+/// a rejected `logsSubscribe` (e.g. Chainstack's "-32005 RPS limit") even
+/// though `getTransaction` is the real source of the load. This caps
+/// *dispatch rate*, independent of concurrency, so the scanner stays
+/// under whatever the endpoint actually allows. Override via
+/// `SCANNER_MAX_RPC_RPS` — the default below is deliberately conservative
+/// for Solana's free public RPC (documented single-method ceiling is 40
+/// requests/10s, i.e. 4/s; defaulting well under half that leaves
+/// headroom for the 3 `logsSubscribe` calls and anything else sharing the
+/// same IP, e.g. apps/api's own RPC usage). Raise this back up if/when
+/// this deployment moves to a paid, higher-limit provider again.
+const DEFAULT_MAX_RPC_RPS: usize = 2;
 
 /// A token bucket refilled once per second, capped at its own capacity —
 /// not a sliding window, just "at most N acquisitions worth of budget
