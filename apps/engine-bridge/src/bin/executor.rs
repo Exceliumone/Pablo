@@ -49,6 +49,7 @@ use solana_vntr_sniper::common::config::{
     create_nonblocking_rpc_client, create_rpc_client, create_zeroslot_rpc_client, AppState,
     SwapConfig,
 };
+use solana_vntr_sniper::library::blockhash_processor::BlockhashProcessor;
 use solana_vntr_sniper::processor::selling_strategy::{SellingConfig, SellingEngine};
 use solana_vntr_sniper::processor::swap::{SwapDirection, SwapInType, SwapProtocol};
 use solana_vntr_sniper::processor::transaction_parser::{DexType, TradeInfoFromToken};
@@ -146,6 +147,27 @@ async fn main() -> anyhow::Result<()> {
             wallet,
             protocol_preference,
         });
+
+        // Every buy/sell path in the engine (sniper_bot.rs, selling_strategy.rs,
+        // transaction_retry.rs) reads the recent blockhash via a bare
+        // `BlockhashProcessor::get_latest_blockhash()` against a 300ms-refreshed
+        // process-global cache — but nothing populates that cache unless
+        // `BlockhashProcessor::start()` has been called at least once in this
+        // OS process. The engine's own standalone binary (engine/src/main.rs)
+        // does call it, which is what made this easy to miss here: PABLO never
+        // runs that binary — this `executor` process is what actually calls
+        // execute_buy/execute_sell — so the cache stayed permanently empty and
+        // every buy failed immediately with "Failed to get real-time
+        // blockhash, skipping transaction". `get_fresh_blockhash()` right after
+        // `start()` both verifies RPC connectivity up front (failing init
+        // loudly here, the same way the rpc_client/wallet/zeroslot construction
+        // above already does, instead of failing silently on the first live
+        // trade) and warms the cache synchronously, closing the otherwise-
+        // possible race where a copy-trading tick arrives and triggers a buy
+        // before the background refresh loop's first 300ms tick has landed.
+        let blockhash_processor = BlockhashProcessor::new(app_state.rpc_client.clone()).await?;
+        blockhash_processor.start().await?;
+        blockhash_processor.get_fresh_blockhash().await?;
 
         let swap_config = Arc::new(SwapConfig {
             swap_direction: SwapDirection::Buy,
