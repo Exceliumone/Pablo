@@ -462,7 +462,30 @@ async fn main() -> anyhow::Result<()> {
                         .await;
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, mint = %tick.mint, "executor: buy skipped/failed");
+                        // Every other failure path in this loop (copy-trade
+                        // sell, take-profit/stop-loss sell) publishes a
+                        // BotEvent::Error so the user can see why nothing
+                        // happened — this one only logged at `debug`, which
+                        // is invisible under the `RUST_LOG=info` this binary
+                        // is always spawned with (see engine-bridge's
+                        // main.rs `spawn_executor`). That made a persistent
+                        // buy failure (e.g. the blockhash cache never being
+                        // populated — since fixed) indistinguishable from
+                        // "nothing to buy": the Sniper page kept showing
+                        // "Nouveau token détecté" (BotEvent::Opportunity,
+                        // published unconditionally just above, before this
+                        // attempt) with no trade and no explanation ever
+                        // following it.
+                        tracing::warn!(error = %e, mint = %tick.mint, "executor: buy failed");
+                        publish_event(
+                            &mut event_conn,
+                            &BotEvent::Error {
+                                user_id: user_id.clone(),
+                                message: format!("buy failed for {}: {e}", tick.mint),
+                                at: now_iso(),
+                            },
+                        )
+                        .await;
                     }
                 }
             }
