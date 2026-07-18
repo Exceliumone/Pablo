@@ -43,6 +43,19 @@ Avant de proposer quoi que ce soit, j'ai lu le code réel dans `Solana-Sniper-Bo
 
 **Ma recommandation : A2.** À 10$/mois par abonné, A1 tue le business model dès qu'il y a plus de quelques utilisateurs actifs simultanément. A2 est aussi, techniquement, ce que font BullX/Photon/Bloom : un moteur de détection centralisé, une exécution personnalisée par compte.
 
+> **Mise à jour (post-lancement) : Yellowstone gRPC entièrement retiré.**
+> Le `scanner` ne supporte plus qu'un seul mode de détection : `logsSubscribe`
+> + `getTransaction` sur un RPC Solana standard (le RPC public officiel,
+> gratuit, par défaut — ou tout fournisseur gratuit/payant compatible
+> configuré via `RPC_HTTP`/`SOLANA_WS_URL`, sans intégration propriétaire).
+> Décision produit : zéro dépendance à un fournisseur imposé (Chainstack,
+> Shyft, Helius...), zéro quota RU, zéro clé API requise pour faire tourner
+> Pablo. La topologie A2 (scanner partagé + executors par utilisateur) reste
+> inchangée et tout aussi valable — elle n'a jamais dépendu de Yellowstone
+> spécifiquement, seulement d'avoir *un* flux de détection partagé au lieu
+> d'un par abonné. Le code du mode Yellowstone (`run_yellowstone` et son
+> client gRPC dédié) a été supprimé plutôt que laissé en option inutilisée.
+
 Note d'implémentation validée : le côté "détection ne monte jamais en plusieurs instances" est une invariante d'infra (un seul déploiement `scanner`), pas une limite technique du code — le binaire `scanner` pourrait physiquement tourner plusieurs fois, mais l'orchestrateur ne le permet jamais. Le chemin `scanner → Redis Stream (consumer groups) → executor-*` est ce qui permet de monter à plusieurs milliers d'utilisateurs sans retoucher cette topologie : chaque nouvel abonné n'ajoute qu'un `executor` léger (process/container, pas un nouveau flux gRPC), donc le coût et la charge de détection restent plats quel que soit N.
 
 Concrètement, ça veut dire créer un nouveau module `apps/engine-bridge/src/bin/scanner.rs` et `.../bin/executor.rs` qui **réutilisent** `dex/`, `processor/swap.rs`, `processor/selling_strategy.rs`, `processor/transaction_parser.rs`, `library/jupiter_api.rs` tels quels comme une librairie (le `Cargo.toml` du moteur a déjà un `lib.rs` — c'est prévu pour ça), et remplacent uniquement l'orchestration de `main.rs`.
@@ -86,7 +99,7 @@ flowchart TB
     end
 
     subgraph RustEngine["Moteur Rust (existant, non réécrit)"]
-        SCANNER["scanner — détection DEX/mempool (Yellowstone gRPC), 1 instance partagée"]
+        SCANNER["scanner — détection DEX (RPC Solana public/gratuit — logsSubscribe + getTransaction), 1 instance partagée"]
         EXEC1["executor #user1 — wallet + réglages user1"]
         EXEC2["executor #user2 — wallet + réglages user2"]
         EXECN["executor #userN"]
@@ -596,7 +609,7 @@ Observabilité : logs structurés (déjà présent dans le moteur via `Logger`, 
 | API REST aujourd'hui + WS temps réel dès le départ, gRPC interne réservé au canal scanner→executor | ✅ Validée |
 | Design : noir profond / violet néon / blanc, glassmorphism, au-dessus de BullX/Photon | ✅ Validée |
 | Roadmap en 8 phases (0 à 7), chaque phase fonctionnelle avant la suivante | ✅ Validée — les 8 phases sont terminées |
-| Fournisseur RPC/Yellowstone gRPC (Shyft, Helius, Triton...) + budget | ⏳ En attente — dimensionne le `scanner`, nécessaire avant tout test Devnet/Mainnet réel |
+| Fournisseur RPC | ✅ Tranchée — RPC public officiel de Solana par défaut (gratuit, aucune clé requise), aucun fournisseur imposé ; Yellowstone gRPC (Chainstack et équivalents payants) entièrement retiré du code |
 | Cible d'hébergement définitive (VPS unique vs cloud managé) | ⏳ En attente — la Phase 0 reste agnostique (Docker Compose), à trancher avant l'ouverture aux premiers abonnés |
 
 Avancement par phase : voir les README de `apps/*` et `engine/UPSTREAM.md` pour

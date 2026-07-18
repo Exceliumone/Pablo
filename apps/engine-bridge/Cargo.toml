@@ -47,18 +47,22 @@ anyhow = "1"
 # Matched to engine/Cargo.toml so Cargo resolves one shared version across
 # the workspace lockfile.
 anchor-client = { version = "0.31.0", features = ["async"] }
-yellowstone-grpc-client = "4.1.0"
+# Only the generated protobuf types are used (scanner.rs constructs a
+# SubscribeUpdateTransaction by hand from a standard getTransaction
+# response) — no gRPC client dependency here; the scanner never speaks
+# Yellowstone gRPC and never depends on a specific paid provider. See
+# scanner.rs's module doc comment.
 yellowstone-grpc-proto = "4.1.1"
 futures-util = "0.3.30"
-maplit = "1.0.2"
 dashmap = "5.5.3"
 bs58 = "0.4"
 chrono = "0.4.26"
 base64 = "0.13"
 
-# scanner's development mode only (logsSubscribe + getTransaction, in place
-# of Yellowstone gRPC — see scanner.rs's module doc). Versions matched to
-# engine/Cargo.toml for the same single-shared-version reason as above.
+# scanner's detection transport: logsSubscribe + getTransaction over
+# standard Solana JSON-RPC — any provider's free or paid tier, no
+# integration specific to one. Versions matched to engine/Cargo.toml for
+# the same single-shared-version reason as above.
 solana-client = "2.1.14"
 solana-sdk = "2.1.14"
 solana-transaction-status = "2.1.14"

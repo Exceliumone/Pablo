@@ -6,9 +6,10 @@ The control surface around the untouched trading engine (`../../engine`).
   member that path-depends on the `engine` crate, so the link between "new
   code" and "existing engine" is established from commit one.
 - **Phase 3:** two binaries built from this crate —
-  - `scanner` — runs DEX/mempool detection exactly once for the whole
-    platform (one Yellowstone gRPC subscription, never duplicated per user),
-    publishing detected opportunities to a Redis stream.
+  - `scanner` — runs DEX detection exactly once for the whole platform
+    (one WebSocket subscription over standard Solana JSON-RPC — the free
+    public RPC by default, no paid gRPC provider, never duplicated per
+    user), publishing detected opportunities to a Redis stream.
   - `executor` — one isolated process per active subscriber, consuming that
     stream, applying that user's `BotSettings`, and signing trades with that
     user's trading wallet. Exposes `PUT /config`, `POST /control/start`,

@@ -31,7 +31,7 @@ const FAQS = [
   },
   {
     q: "Le moteur de trading est-il un simple bot Telegram ?",
-    a: "Non. C'est un moteur Rust natif qui écoute la blockchain via un flux gRPC direct (Yellowstone), piloté par un vrai tableau de bord web — pas des commandes tapées dans un chat.",
+    a: "Non. C'est un moteur Rust natif qui écoute la blockchain en temps réel via WebSocket sur un RPC Solana public, piloté par un vrai tableau de bord web — pas des commandes tapées dans un chat.",
   },
 ];
 

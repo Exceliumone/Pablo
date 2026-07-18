@@ -74,8 +74,9 @@ cargo run --bin engine-bridge   # orchestrator: HTTP API on :8090
   into a library plus three binaries (`engine-bridge` orchestrator,
   `scanner`, `executor`), all built against the unmodified `engine` crate
   as a dependency — no file under `engine/` was touched. One shared
-  scanner (single Yellowstone gRPC subscription, reuses the engine's own
-  parsing functions) publishes detections onto a Redis Stream; one
+  scanner (single public-RPC WebSocket subscription — see below, no paid
+  gRPC provider — reuses the engine's own parsing functions) publishes
+  detections onto a Redis Stream; one
   independent OS process per subscriber consumes it and calls the
   engine's real `execute_buy`/`SellingEngine` functions directly. The
   orchestrator spawns/kills/monitors those processes and self-heals its
@@ -87,10 +88,16 @@ cargo run --bin engine-bridge   # orchestrator: HTTP API on :8090
   or the API. Verified end-to-end against a real local Postgres/Redis:
   process spawn/stop/status, the Redis Stream fan-out, the pub/sub relay,
   and a real WebSocket client receiving live events with JWT auth
-  enforced. **Not verifiable in this sandbox**: actual Yellowstone gRPC
-  connectivity and actual on-chain trade execution, since Solana RPC/gRPC
-  is blocked by network egress policy here — test both on Devnet before
-  Mainnet.
+  enforced. **Not verifiable in this sandbox**: actual Solana RPC
+  connectivity and actual on-chain trade execution, since outbound Solana
+  RPC is blocked by network egress policy here — test on Devnet before
+  Mainnet. As of a later architecture decision, the scanner runs
+  exclusively on standard Solana JSON-RPC (`logsSubscribe` +
+  `getTransaction` — the public official RPC by default, free, no account
+  needed) — the Yellowstone gRPC mode referenced above has since been
+  removed entirely to avoid depending on any paid provider (Chainstack,
+  Shyft, Helius, ...); see `apps/engine-bridge/src/bin/scanner.rs`'s module
+  doc comment.
 - **Phase 4 (trading dashboard) — done.** The single-page terminal split
   into a six-tab dashboard (Sniper, Portfolio, Historique, Analytics,
   Wallet, Réglages) sharing one auth/subscription gate. A new process-wide
@@ -223,9 +230,9 @@ cargo run --bin engine-bridge   # orchestrator: HTTP API on :8090
     correctly under burst load, which is the limiter working as intended,
     not a defect; genuine capacity testing needs multiple simulated
     client IPs, out of scope here. **Not verifiable in this sandbox**:
-    everything already flagged in every phase above — Solana RPC/
-    Yellowstone gRPC connectivity, live balances, real trade execution,
-    real payment confirmation. Nothing in Phase 7 changes that; test all
-    of it on Devnet, then Mainnet, before opening to real subscribers.
+    everything already flagged in every phase above — Solana RPC
+    connectivity, live balances, real trade execution, real payment
+    confirmation. Nothing in Phase 7 changes that; test all of it on
+    Devnet, then Mainnet, before opening to real subscribers.
 
 See §14 of `docs/ARCHITECTURE.md` for the full roadmap.

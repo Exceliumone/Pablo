@@ -72,7 +72,7 @@ before going to production.
 - `bot.service.ts` / `bot.routes.ts`: `GET/PUT /bot/settings`,
   `POST /bot/start` (requires an ACTIVE subscription — 402 otherwise;
   provisions the trading wallet, decrypts its key in-process only, hands
-  it plus RPC/Yellowstone/Redis config to the orchestrator),
+  it plus RPC/Redis config to the orchestrator),
   `POST /bot/stop`, `GET /bot/status`. Changing settings while the bot is
   running restarts the executor, since the engine only reads its config
   at boot (no hot-reload).
@@ -87,9 +87,11 @@ testing), subscription gating on `/bot/start`, the orchestrator spawning
 a real executor process against the real `engine` crate (a genuine
 `execute_buy` call observed), the Redis Stream → pub/sub → WebSocket
 relay carrying real events end-to-end, and JWT rejection on the socket.
-**Not verifiable in this sandbox**: actual Yellowstone gRPC connectivity
-and actual on-chain execution — Solana RPC/gRPC is blocked by network
-egress policy here. Test both on Devnet before Mainnet.
+**Not verifiable in this sandbox**: actual Solana RPC connectivity and
+actual on-chain execution — outbound Solana RPC is blocked by network
+egress policy here. Test both on Devnet before Mainnet. (The scanner runs
+exclusively on standard Solana JSON-RPC, no Yellowstone gRPC or other
+paid provider — see `apps/engine-bridge/src/bin/scanner.rs`'s module doc.)
 
 **Phase 4 — trading dashboard.** `src/jobs/event-persister.ts`,
 `src/modules/portfolio/`, `src/modules/trades/`, `src/modules/analytics/`,

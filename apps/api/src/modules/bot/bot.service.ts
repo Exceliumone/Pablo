@@ -108,8 +108,6 @@ export async function startBot(userId: string) {
     user_id: userId,
     wallet_secret_key_b58: secretKeyB58,
     rpc_http: env.RPC_HTTP,
-    yellowstone_grpc_http: env.YELLOWSTONE_GRPC_HTTP,
-    yellowstone_grpc_token: env.YELLOWSTONE_GRPC_TOKEN,
     zero_slot_url: env.ZERO_SLOT_URL,
     redis_url: env.REDIS_URL,
     settings: {

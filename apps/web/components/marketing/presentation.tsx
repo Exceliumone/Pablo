@@ -5,7 +5,7 @@ import { motion } from "framer-motion";
 const POINTS = [
   {
     title: "Un vrai moteur, pas un script",
-    body: "PABLO pilote un moteur d'exécution écrit en Rust : détection par flux gRPC direct (Yellowstone), pas de polling, pas de scraping.",
+    body: "PABLO pilote un moteur d'exécution écrit en Rust : détection en temps réel via WebSocket sur RPC Solana public, pas de scraping.",
   },
   {
     title: "Une seule interface, tout le contrôle",

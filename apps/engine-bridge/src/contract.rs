@@ -41,9 +41,13 @@ pub struct ExecutorStartPayload {
     /// built; held in this process's memory only for its lifetime.
     pub wallet_secret_key_b58: String,
 
+    /// Standard Solana JSON-RPC HTTP endpoint — the public official RPC by
+    /// default, or any other free/paid provider. No Yellowstone gRPC or
+    /// other paid-provider-specific field exists here by design: this
+    /// executor never establishes its own detection subscription (it tails
+    /// the shared scanner's Redis stream — see executor.rs's module doc),
+    /// and the scanner itself is public-RPC-only.
     pub rpc_http: String,
-    pub yellowstone_grpc_http: String,
-    pub yellowstone_grpc_token: String,
     /// Required by the engine's AppState even when zeroslot landing isn't
     /// used — its lazy static loader hangs forever if unset, so the
     /// orchestrator always fills this (falling back to a harmless

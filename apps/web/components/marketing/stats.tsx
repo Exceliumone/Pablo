@@ -5,7 +5,7 @@ import { motion } from "framer-motion";
 const STATS = [
   { value: "4+", label: "Protocoles DEX", detail: "PumpFun, PumpSwap, Raydium, Meteora" },
   { value: "1", label: "Abonnement", detail: "10 $/mois, en SOL uniquement" },
-  { value: "gRPC", label: "Détection", detail: "Flux direct Yellowstone, pas de polling" },
+  { value: "WS", label: "Détection", detail: "Flux WebSocket temps réel, RPC public gratuit" },
   { value: "0", label: "Fichier .env à toucher", detail: "Tous les réglages depuis le dashboard" },
 ];
 

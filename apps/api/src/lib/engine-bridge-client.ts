@@ -12,9 +12,11 @@ import { env } from "../config/env.js";
 export interface ExecutorStartPayload {
   user_id: string;
   wallet_secret_key_b58: string;
+  // Standard Solana JSON-RPC HTTP endpoint (the public official RPC by
+  // default, or any other free/paid provider) — no Yellowstone gRPC or
+  // other paid-provider-specific field: the executor never establishes
+  // its own detection subscription, and the scanner is public-RPC-only.
   rpc_http: string;
-  yellowstone_grpc_http: string;
-  yellowstone_grpc_token: string;
   zero_slot_url: string;
   redis_url: string;
   settings: {

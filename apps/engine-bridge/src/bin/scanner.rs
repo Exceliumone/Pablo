@@ -6,42 +6,37 @@
 //! instead of scaling with the number of users (see docs/ARCHITECTURE.md
 //! §1, Décision A).
 //!
-//! Two data-source modes, auto-selected by environment — the rest of the
-//! pipeline (CPI-log extraction, `parse_transaction_data`, `ScannerTick`
-//! shape, Redis publish) is identical either way, so `engine-bridge`,
-//! `executor`, and `apps/api` never see a difference:
-//!
-//! - **Production** (`YELLOWSTONE_GRPC_HTTP` set): subscribes once to
-//!   Yellowstone gRPC for the watched DEX programs. Full transaction data
-//!   (including inner instructions) is pushed at `Processed` commitment,
-//!   no extra round trip per detection. This is what the original
-//!   implementation always did — unchanged behavior, just refactored into
-//!   `run_yellowstone()` below and sharing `detect_trade()`/`publish_tick()`
-//!   with the mode below instead of inlining that logic in `main()`.
-//! - **Development** (`YELLOWSTONE_GRPC_HTTP` unset): standard Solana
-//!   JSON-RPC — `logsSubscribe` on each watched program via
-//!   `SOLANA_WS_URL`, then `getTransaction` via `RPC_HTTP` for whatever
-//!   `logsSubscribe` doesn't include (inner instructions, token balances).
-//!   Exists so this project can be developed and tested against any
-//!   provider's free/standard RPC+WS tier — including Solana's own public
-//!   endpoint (`https://api.mainnet-beta.solana.com` /
-//!   `wss://api.mainnet-beta.solana.com`, zero cost, no account needed) —
-//!   without also paying for a Yellowstone gRPC add-on. **Materially
-//!   higher latency and lower throughput than production — see the
-//!   module-level warning logged at startup, and the doc comment on
-//!   `run_rpc_websocket` below. Not meant to run against real capital.**
+//! Runs on standard Solana JSON-RPC only, by design: `logsSubscribe` on
+//! each watched program via `SOLANA_WS_URL`, then `getTransaction` via
+//! `RPC_HTTP` for whatever `logsSubscribe` doesn't include (inner
+//! instructions, token balances). Works against any provider's free or
+//! paid RPC+WS tier — including Solana's own public endpoint
+//! (`https://api.mainnet-beta.solana.com` / `wss://api.mainnet-beta.solana.com`,
+//! zero cost, no account needed), which is the default in `.env.example`.
+//! No provider-specific integration, no paid gRPC add-on, no API key
+//! required to run this at all. There used to be a second mode here
+//! (`run_yellowstone`, a Yellowstone gRPC subscription) that traded that
+//! independence for lower latency — removed entirely per an explicit
+//! product decision to never depend on a specific paid provider again (no
+//! free public RPC offers Yellowstone gRPC), rather than keep an unused
+//! paid-only code path around. `SCANNER_MAX_RPC_RPS` (see
+//! `DEFAULT_MAX_RPC_RPS` below) and `MAX_PENDING_LOOKUPS` exist because of
+//! that tradeoff — this is materially higher-latency than a gRPC push
+//! feed, by design, not a bug.
 //!
 //! Reuses exactly one function from the untouched engine crate:
 //! `transaction_parser::parse_transaction_data`. It never calls
 //! execute_buy/execute_sell or touches the engine's position-tracking
 //! globals — this process makes no trading decisions, it only observes.
-//! Development mode hand-assembles a `SubscribeUpdateTransaction` (the
-//! Yellowstone protobuf type this function is typed against) from a
-//! standard `getTransaction` response instead of receiving one over gRPC —
-//! `parse_transaction_data` only ever reads `meta.log_messages` and
-//! `meta.post_token_balances` from it (verified by inspection, not
-//! assumed), both of which a standard RPC response also provides, so this
-//! doesn't require touching `engine/` at all.
+//! `to_synthetic_subscribe_update` below hand-assembles a
+//! `SubscribeUpdateTransaction` (the Yellowstone protobuf *type* this
+//! function is typed against — kept as a dependency purely for its
+//! generated Rust structs, not the gRPC client that used to populate it)
+//! from a standard `getTransaction` response. `parse_transaction_data`
+//! only ever reads `meta.log_messages` and `meta.post_token_balances` from
+//! it (verified by inspection, not assumed), both of which a standard RPC
+//! response also provides, so this doesn't require touching `engine/` at
+//! all.
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use engine_bridge::contract::{ScannerTick, SCANNER_TICKS_STREAM};
 use futures_util::stream::select_all;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use redis::AsyncCommands;
 use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -71,12 +66,12 @@ use solana_vntr_sniper::processor::transaction_parser::{
     parse_transaction_data, DexType, TradeInfoFromToken,
 };
 use tokio::sync::{Mutex, Semaphore};
-use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
-use yellowstone_grpc_proto::geyser::{
-    subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-    SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdateTransaction,
-    SubscribeUpdateTransactionInfo,
-};
+// Only the generated protobuf structs are used here, never the gRPC client
+// — `SubscribeUpdateTransaction` is the type `engine::transaction_parser::
+// parse_transaction_data` is typed against (see this file's module doc),
+// so `to_synthetic_subscribe_update` below must keep constructing this
+// exact shape even though nothing here ever speaks gRPC.
+use yellowstone_grpc_proto::geyser::{SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo};
 use yellowstone_grpc_proto::solana::storage::confirmed_block::{
     InnerInstruction, InnerInstructions, Message, TokenBalance, Transaction, TransactionStatusMeta,
     UiTokenAmount,
@@ -110,37 +105,13 @@ async fn main() -> anyhow::Result<()> {
         redis_client.get_multiplexed_async_connection().await?,
     ));
 
-    // Mode is auto-selected, not configured separately: YELLOWSTONE_GRPC_HTTP
-    // set -> production; unset -> development. One less setting to keep in
-    // sync, and a deploy that forgets to set it fails loud in dev mode's own
-    // startup warning rather than silently running degraded in production.
-    match env_opt("YELLOWSTONE_GRPC_HTTP") {
-        Some(yellowstone_grpc_http) => {
-            tracing::info!(
-                "scanner: YELLOWSTONE_GRPC_HTTP is set — production mode (Yellowstone gRPC)"
-            );
-            run_yellowstone(
-                yellowstone_grpc_http,
-                env("YELLOWSTONE_GRPC_TOKEN"),
-                redis_conn,
-            )
-            .await
-        }
-        None => {
-            tracing::warn!(
-                "scanner: YELLOWSTONE_GRPC_HTTP not set — DEVELOPMENT MODE (RPC_HTTP + \
-                 SOLANA_WS_URL, logsSubscribe + getTransaction). Materially higher latency than \
-                 Yellowstone (waits for `confirmed` commitment, not `processed`, plus one \
-                 getTransaction round trip per detection) and consumes your RPC provider's \
-                 request quota per detected trade. Expect to miss fast-moving opportunities \
-                 under load. Not intended to run against real capital — see this file's module \
-                 doc comment."
-            );
-            let solana_ws_url = env("SOLANA_WS_URL");
-            log_redacted_ws_url(&solana_ws_url);
-            run_rpc_websocket(env("RPC_HTTP"), solana_ws_url, redis_conn).await
-        }
-    }
+    tracing::info!(
+        "scanner: starting on standard Solana JSON-RPC (logsSubscribe + getTransaction) — no \
+         paid provider, no gRPC add-on, see this file's module doc comment"
+    );
+    let solana_ws_url = env("SOLANA_WS_URL");
+    log_redacted_ws_url(&solana_ws_url);
+    run_rpc_websocket(env("RPC_HTTP"), solana_ws_url, redis_conn).await
 }
 
 const SINGLETON_LOCK_KEY: &str = "scanner:singleton-lock";
@@ -339,12 +310,11 @@ fn emitting_program_at(log_messages: &[String], target_line: usize) -> Option<St
 
 /// Same extraction pattern as the engine's own process_message_for_dex_monitoring:
 /// the CPI log carrying the trade payload is the inner instruction whose data
-/// length matches one of these known instruction encodings. Shared by both
-/// modes: once a `SubscribeUpdateTransaction` exists — straight off
-/// Yellowstone, or hand-assembled from a standard `getTransaction` response
-/// (see `to_synthetic_subscribe_update` below) — the rest of the detection
-/// pipeline is identical. `log_signature` is diagnostic-only, matching the
-/// convention already used by `detect_trade`/`fetch_and_detect`.
+/// length matches one of these known instruction encodings. Operates on the
+/// `SubscribeUpdateTransaction` hand-assembled from a standard
+/// `getTransaction` response (see `to_synthetic_subscribe_update` below).
+/// `log_signature` is diagnostic-only, matching the convention already used
+/// by `detect_trade`/`fetch_and_detect`.
 fn extract_cpi_log_data(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option<Vec<u8>> {
     let inner_instructions = txn
         .transaction
@@ -474,9 +444,8 @@ fn extract_cpi_log_data(txn: &SubscribeUpdateTransaction, log_signature: &str) -
 /// Mirrors the engine's own (private-to-sniper_bot.rs) `extract_signer_from_
 /// transaction`: by Solana convention the first account key in a message is
 /// the transaction's fee payer, which is also its first required signer —
-/// i.e. whoever actually submitted this trade. Works identically for both
-/// modes because dev mode's `to_synthetic_subscribe_update` populates this
-/// same field (with just that one key) from the real decoded transaction.
+/// i.e. whoever actually submitted this trade. `to_synthetic_subscribe_update`
+/// below populates this field from the real decoded transaction.
 fn extract_trader_from_transaction(txn: &SubscribeUpdateTransaction) -> Option<String> {
     let first_account_key = txn
         .transaction
@@ -894,111 +863,7 @@ fn detect_trade(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Production mode: Yellowstone gRPC
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Unchanged from before this file grew a second mode — same subscription,
-/// same retry/heartbeat behavior, same "log and exit" ending. Only the
-/// per-transaction handling changed shape, delegating to the
-/// `detect_trade`/`publish_tick` helpers now shared with dev mode instead
-/// of inlining the same logic twice.
-async fn run_yellowstone(
-    yellowstone_grpc_http: String,
-    yellowstone_grpc_token: String,
-    redis_conn: RedisConn,
-) -> anyhow::Result<()> {
-    tracing::info!("scanner: connecting to Yellowstone gRPC");
-    let mut client = GeyserGrpcClient::build_from_shared(yellowstone_grpc_http)?
-        .x_token::<String>(Some(yellowstone_grpc_token))?
-        .tls_config(ClientTlsConfig::new().with_native_roots())?
-        .connect()
-        .await?;
-
-    let mut retry_count = 0;
-    const MAX_RETRIES: u32 = 3;
-    let (subscribe_tx, mut stream) = loop {
-        match client.subscribe().await {
-            Ok(pair) => break pair,
-            Err(e) => {
-                retry_count += 1;
-                if retry_count >= MAX_RETRIES {
-                    anyhow::bail!("scanner: failed to subscribe after {MAX_RETRIES} attempts: {e}");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    };
-    let subscribe_tx = Arc::new(Mutex::new(subscribe_tx));
-
-    let subscription_request = SubscribeRequest {
-        transactions: maplit::hashmap! {
-            "All".to_owned() => SubscribeRequestFilterTransactions {
-                vote: Some(false),
-                failed: Some(false),
-                signature: None,
-                account_include: watched_programs(),
-                account_exclude: vec![],
-                account_required: Vec::<String>::new(),
-            }
-        },
-        commitment: Some(CommitmentLevel::Processed as i32),
-        ..Default::default()
-    };
-    subscribe_tx.lock().await.send(subscription_request).await?;
-    tracing::info!("scanner: subscribed, watching PumpFun / PumpSwap / Raydium Launchpad");
-
-    // Keep the stream alive.
-    let heartbeat_tx = subscribe_tx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            let ping = SubscribeRequest {
-                ping: Some(SubscribeRequestPing { id: 0 }),
-                ..Default::default()
-            };
-            if heartbeat_tx.lock().await.send(ping).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    while let Some(msg_result) = stream.next().await {
-        let msg = match msg_result {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!(error = ?e, "scanner: stream error");
-                continue;
-            }
-        };
-
-        let Some(UpdateOneof::Transaction(txn)) = &msg.update_oneof else {
-            continue;
-        };
-
-        let log_signature = txn
-            .transaction
-            .as_ref()
-            .map(|t| bs58::encode(&t.signature).into_string())
-            .unwrap_or_default();
-        tracing::debug!(signature = %log_signature, "scanner: transaction update received (Yellowstone)");
-
-        let Some(tick) = detect_trade(txn, &log_signature) else {
-            continue;
-        };
-
-        let redis_conn = redis_conn.clone();
-        tokio::spawn(async move {
-            publish_tick(&redis_conn, tick).await;
-        });
-    }
-
-    tracing::warn!("scanner: stream ended");
-    Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Development mode: standard Solana JSON-RPC (logsSubscribe + getTransaction)
+// Detection: standard Solana JSON-RPC (logsSubscribe + getTransaction)
 // ─────────────────────────────────────────────────────────────────────────
 
 /// A burst of near-simultaneous detections (common right after a popular
@@ -1129,8 +994,8 @@ impl RateLimiter {
 /// implementation's `mentions` filter only ever reliably supports a single
 /// address per subscription — most providers, Chainstack included, follow
 /// that same reference behavior) plus a bounded pool of `getTransaction`
-/// follow-ups. See this file's module doc comment for the latency/quota
-/// tradeoffs versus `run_yellowstone` above.
+/// follow-ups. See this file's module doc comment for the latency tradeoff
+/// this design accepts in exchange for never depending on a paid gRPC feed.
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(5);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 /// A connection that stays up at least this long is treated as a real
@@ -1310,7 +1175,7 @@ async fn watch_all_programs(
                 "scanner: REJECTED — transaction failed on-chain (err present in the \
                  notification), never worth a getTransaction lookup"
             );
-            continue; // matches the Yellowstone filter's `failed: Some(false)`
+            continue; // never worth spending part of the RPS budget on a doomed lookup
         }
         tracing::debug!(
             program = %program,
@@ -1496,8 +1361,8 @@ fn log_raw_transaction_response_shape(
 
 /// Fetches the full transaction via `getTransaction` (retrying through the
 /// normal confirm delay — see `GET_TRANSACTION_RETRIES`'s doc comment),
-/// then runs it through the exact same `detect_trade` pipeline Yellowstone
-/// mode uses. Every attempt — including retries — goes through
+/// then runs it through the `detect_trade` pipeline. Every attempt —
+/// including retries — goes through
 /// `rate_limiter` first: a signature that needs all 5 attempts to confirm
 /// would otherwise burst 5 requests regardless of the configured RPS cap.
 async fn fetch_and_detect(

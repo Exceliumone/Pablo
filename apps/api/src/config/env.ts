@@ -50,8 +50,6 @@ const envSchema = z.object({
   // admin-editable like PlatformConfig — these are ops/infra credentials,
   // not product settings.
   ENGINE_BRIDGE_URL: z.string().url().default("http://localhost:8090"),
-  YELLOWSTONE_GRPC_HTTP: z.string().default("https://not-configured.invalid"),
-  YELLOWSTONE_GRPC_TOKEN: z.string().default("not-configured"),
   ZERO_SLOT_URL: z.string().default("https://not-configured.invalid"),
 });
 
