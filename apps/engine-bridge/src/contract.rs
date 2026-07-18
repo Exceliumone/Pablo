@@ -48,10 +48,12 @@ pub struct ExecutorStartPayload {
     /// the shared scanner's Redis stream — see executor.rs's module doc),
     /// and the scanner itself is public-RPC-only.
     pub rpc_http: String,
-    /// Required by the engine's AppState even when zeroslot landing isn't
-    /// used — its lazy static loader hangs forever if unset, so the
-    /// orchestrator always fills this (falling back to a harmless
-    /// placeholder rather than leaving it empty).
+    /// Optional paid transaction-landing service. Empty by default — the
+    /// engine (engine/src/library/zeroslot.rs) treats an unset/empty value
+    /// as "not configured" and sends every transaction over the standard
+    /// RPC instead, without requiring ZERO_SLOT_TIP_VALUE or any other
+    /// ZeroSlot-specific setting. Set this only once ZeroSlot is actually
+    /// wanted.
     pub zero_slot_url: String,
 
     pub redis_url: String,

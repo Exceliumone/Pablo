@@ -64,9 +64,27 @@ pub async fn new_signed_and_send_zeroslot(
     zeroslot_rpc_client: Arc<crate::library::zeroslot::ZeroSlotClient>,
     recent_blockhash: solana_sdk::hash::Hash,
     keypair: &Keypair,
-    mut instructions: Vec<Instruction>,
+    instructions: Vec<Instruction>,
     logger: &Logger,
 ) -> Result<Vec<String>> {
+    // ZeroSlot has no configuration (ZERO_SLOT_URL unset/empty) — send over
+    // the standard public RPC instead, without adding a tip instruction or
+    // touching any ZERO_SLOT_* env var, rather than failing the trade.
+    if !zeroslot_rpc_client.is_configured() {
+        logger.log(
+            "STEP 5-8: ZeroSlot not configured (ZERO_SLOT_URL unset) — sending via standard RPC, no tip added"
+                .yellow().to_string(),
+        );
+        return new_signed_and_send_normal(
+            zeroslot_rpc_client.fallback_rpc_client(),
+            recent_blockhash,
+            keypair,
+            instructions,
+            logger,
+        ).await;
+    }
+
+    let mut instructions = instructions;
     let tip_account = zeroslot::get_tip_account()?;
     let start_time = Instant::now();
     let mut txs: Vec<String> = vec![];

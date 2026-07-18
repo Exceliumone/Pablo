@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
         let wallet = Arc::new(Keypair::from_base58_string(&payload.wallet_secret_key_b58));
         let rpc_client = create_rpc_client()?;
         let rpc_nonblocking_client = create_nonblocking_rpc_client().await?;
-        let zeroslot_rpc_client = create_zeroslot_rpc_client().await?;
+        let zeroslot_rpc_client = create_zeroslot_rpc_client(rpc_nonblocking_client.clone()).await?;
 
         let protocol_preference = match payload.settings.protocol_preference.as_str() {
             "pumpfun" => SwapProtocol::PumpFun,

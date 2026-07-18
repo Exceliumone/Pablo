@@ -3,12 +3,8 @@ use anyhow::{anyhow, Result};
 use rand::{seq::IteratorRandom, thread_rng};
 use serde_json::{json, Value};
 use anchor_client::solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::Transaction};
-use std::{str::FromStr, sync::LazyLock};
+use std::{str::FromStr, sync::Arc};
 use bs64;
-
-use crate::common::config::import_env_var;
-
-pub static ZERO_SLOT_URL: LazyLock<String> = LazyLock::new(|| import_env_var("ZERO_SLOT_URL"));
 
 pub fn get_tip_account() -> Result<Pubkey> {
     let accounts = [
@@ -81,20 +77,55 @@ impl Default for TransactionConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ZeroSlotClient {
-    endpoint: String,
+    /// `None` means ZeroSlot has no configuration (`ZERO_SLOT_URL` unset or
+    /// empty) — by explicit product decision, PABLO must be able to run
+    /// entirely on the free public RPC until the operator opts in to a paid
+    /// landing service later. `is_configured()` reports this so callers
+    /// (see `block_engine::tx::new_signed_and_send_zeroslot`) skip the
+    /// ZeroSlot-specific tip instruction and any `ZERO_SLOT_*` env var reads
+    /// entirely and send over `fallback_rpc_client` instead, rather than
+    /// erroring out asking for configuration that was never provided.
+    endpoint: Option<String>,
     client: reqwest::Client,
     config: TransactionConfig,
+    fallback_rpc_client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
+}
+
+impl std::fmt::Debug for ZeroSlotClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZeroSlotClient")
+            .field("endpoint", &self.endpoint)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ZeroSlotClient {
-    pub fn new(endpoint: &str) -> Self {
+    pub fn new(
+        endpoint: Option<&str>,
+        fallback_rpc_client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
+    ) -> Self {
         Self {
-            endpoint: endpoint.to_string(),
+            endpoint: endpoint.map(|e| e.to_string()),
             client: reqwest::Client::new(),
             config: TransactionConfig::default(),
+            fallback_rpc_client,
         }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.endpoint.is_some()
+    }
+
+    /// The plain public-RPC client to send through when ZeroSlot isn't
+    /// configured — the same nonblocking RPC client the rest of this
+    /// process already uses, not a second connection.
+    pub fn fallback_rpc_client(
+        &self,
+    ) -> Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient> {
+        self.fallback_rpc_client.clone()
     }
 
     pub async fn send_transaction(
@@ -153,6 +184,13 @@ impl ZeroSlotClient {
     }
 
     async fn send_request(&self, method: &str, params: Value) -> Result<Value, ClientError> {
+        let endpoint = self.endpoint.as_deref().ok_or_else(|| {
+            ClientError::Other(
+                "ZeroSlot is not configured (ZERO_SLOT_URL unset) — caller should have used \
+                 fallback_rpc_client()/is_configured() instead of reaching send_transaction()"
+                    .to_string(),
+            )
+        })?;
         let request_body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -162,7 +200,7 @@ impl ZeroSlotClient {
 
         let response = self
             .client
-            .post(&self.endpoint)
+            .post(endpoint)
             .header("Content-Type", "application/json")
             .json(&request_body)
             .send()

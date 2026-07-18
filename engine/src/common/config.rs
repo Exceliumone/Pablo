@@ -97,7 +97,7 @@ impl Config {
             let solana_price = create_coingecko_proxy().await.unwrap_or(200_f64);
             let rpc_client = create_rpc_client().unwrap();
             let rpc_nonblocking_client = create_nonblocking_rpc_client().await.unwrap();
-            let zeroslot_rpc_client = create_zeroslot_rpc_client().await.unwrap();
+            let zeroslot_rpc_client = create_zeroslot_rpc_client(rpc_nonblocking_client.clone()).await.unwrap();
             let wallet: std::sync::Arc<anchor_client::solana_sdk::signature::Keypair> = import_wallet().unwrap();
             let balance = match rpc_nonblocking_client
                 .get_account(&wallet.pubkey())
@@ -297,9 +297,22 @@ pub async fn create_nonblocking_rpc_client(
     Ok(Arc::new(rpc_client))
 }
 
-pub async fn create_zeroslot_rpc_client() -> Result<Arc<crate::library::zeroslot::ZeroSlotClient>> {
+/// Builds the ZeroSlot client used for transaction landing. `ZERO_SLOT_URL`
+/// is optional by explicit product decision — PABLO must run entirely on
+/// the free public RPC when it's unset or empty (no key, no tip value, no
+/// other `ZERO_SLOT_*` variable required); the returned client reports
+/// `is_configured() == false` in that case and every send path falls back
+/// to `rpc_nonblocking_client` instead (see
+/// `block_engine::tx::new_signed_and_send_zeroslot`).
+pub async fn create_zeroslot_rpc_client(
+    rpc_nonblocking_client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
+) -> Result<Arc<crate::library::zeroslot::ZeroSlotClient>> {
+    let endpoint = std::env::var("ZERO_SLOT_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty());
     let client = crate::library::zeroslot::ZeroSlotClient::new(
-        crate::library::zeroslot::ZERO_SLOT_URL.as_str()
+        endpoint.as_deref(),
+        rpc_nonblocking_client,
     );
     Ok(Arc::new(client))
 }

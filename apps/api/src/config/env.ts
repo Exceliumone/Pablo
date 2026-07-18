@@ -50,7 +50,13 @@ const envSchema = z.object({
   // admin-editable like PlatformConfig — these are ops/infra credentials,
   // not product settings.
   ENGINE_BRIDGE_URL: z.string().url().default("http://localhost:8090"),
-  ZERO_SLOT_URL: z.string().default("https://not-configured.invalid"),
+  // Optional paid transaction-landing service. Empty by default — PABLO
+  // runs entirely on the free public RPC until this is set. An empty
+  // string here (relayed through ExecutorStartPayload.zero_slot_url) is
+  // what the engine reads as "not configured": it skips ZeroSlot's tip
+  // instruction and never asks for ZERO_SLOT_TIP_VALUE or any other
+  // ZERO_SLOT_* variable. See engine/src/library/zeroslot.rs.
+  ZERO_SLOT_URL: z.string().default(""),
 });
 
 export type Env = z.infer<typeof envSchema>;
