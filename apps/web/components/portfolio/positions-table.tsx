@@ -1,6 +1,7 @@
 "use client";
 
 import type { PositionDto } from "@pablo/shared-types";
+import { EntityLink } from "@/components/ui/entity-link";
 import { cn } from "@/lib/utils";
 
 function formatSol(n: number, digits = 4): string {
@@ -33,8 +34,8 @@ export function PositionsTable({ positions }: { positions: PositionDto[] }) {
         <tbody>
           {positions.map((p) => (
             <tr key={p.id} className="border-b border-surface-border/10 last:border-0">
-              <td className="text-tabular px-5 py-3 text-foreground">
-                {p.tokenSymbol ?? `${p.tokenMint.slice(0, 6)}…${p.tokenMint.slice(-4)}`}
+              <td className="px-5 py-3 text-foreground">
+                <EntityLink kind="token" value={p.tokenMint} label={p.tokenSymbol ?? undefined} />
               </td>
               <td className="px-5 py-3">
                 <span

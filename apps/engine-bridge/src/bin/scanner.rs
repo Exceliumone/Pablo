@@ -73,7 +73,8 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeUpdateTransactionInfo,
 };
 use yellowstone_grpc_proto::solana::storage::confirmed_block::{
-    InnerInstruction, InnerInstructions, TokenBalance, TransactionStatusMeta, UiTokenAmount,
+    InnerInstruction, InnerInstructions, Message, TokenBalance, Transaction, TransactionStatusMeta,
+    UiTokenAmount,
 };
 
 type RedisConn = Arc<Mutex<redis::aio::MultiplexedConnection>>;
@@ -203,7 +204,26 @@ fn extract_cpi_log_data(txn: &SubscribeUpdateTransaction) -> Option<Vec<u8>> {
         .map(|ix| ix.data.clone())
 }
 
-fn to_scanner_tick(parsed: &TradeInfoFromToken) -> ScannerTick {
+/// Mirrors the engine's own (private-to-sniper_bot.rs) `extract_signer_from_
+/// transaction`: by Solana convention the first account key in a message is
+/// the transaction's fee payer, which is also its first required signer —
+/// i.e. whoever actually submitted this trade. Works identically for both
+/// modes because dev mode's `to_synthetic_subscribe_update` populates this
+/// same field (with just that one key) from the real decoded transaction.
+fn extract_trader_from_transaction(txn: &SubscribeUpdateTransaction) -> Option<String> {
+    let first_account_key = txn
+        .transaction
+        .as_ref()?
+        .transaction
+        .as_ref()?
+        .message
+        .as_ref()?
+        .account_keys
+        .first()?;
+    Some(bs58::encode(first_account_key).into_string())
+}
+
+fn to_scanner_tick(parsed: &TradeInfoFromToken, trader: Option<String>) -> ScannerTick {
     ScannerTick {
         dex_type: format!("{:?}", parsed.dex_type),
         slot: parsed.slot,
@@ -220,6 +240,7 @@ fn to_scanner_tick(parsed: &TradeInfoFromToken) -> ScannerTick {
         liquidity: parsed.liquidity,
         virtual_sol_reserves: parsed.virtual_sol_reserves,
         virtual_token_reserves: parsed.virtual_token_reserves,
+        trader,
     }
 }
 
@@ -252,7 +273,8 @@ fn detect_trade(txn: &SubscribeUpdateTransaction) -> Option<ScannerTick> {
     if parsed.mint == "So11111111111111111111111111111111111111112" {
         return None;
     }
-    Some(to_scanner_tick(&parsed))
+    let trader = extract_trader_from_transaction(txn);
+    Some(to_scanner_tick(&parsed, trader))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -554,6 +576,25 @@ async fn fetch_and_detect(rpc_client: &RpcClient, signature: Signature) -> Optio
 fn to_synthetic_subscribe_update(
     confirmed: EncodedConfirmedTransactionWithStatusMeta,
 ) -> Option<SubscribeUpdateTransaction> {
+    // The only reason this decodes the full transaction (rather than only
+    // reading `meta`, like the rest of this function) is to recover the fee
+    // payer for copy-trading matching — `EncodedTransaction::decode()`
+    // rejects anything that doesn't pass `VersionedTransaction::sanitize()`,
+    // so a `None` here (malformed/unexpected encoding) just means this tick
+    // won't match any copy-trading target; it never blocks detection itself.
+    let fee_payer_account_keys: Vec<Vec<u8>> = confirmed
+        .transaction
+        .transaction
+        .decode()
+        .and_then(|versioned_tx| {
+            versioned_tx
+                .message
+                .static_account_keys()
+                .first()
+                .map(|fee_payer| vec![fee_payer.to_bytes().to_vec()])
+        })
+        .unwrap_or_default();
+
     let meta: UiTransactionStatusMeta = confirmed.transaction.meta?;
 
     let log_messages: Vec<String> = Option::from(meta.log_messages).unwrap_or_default();
@@ -611,7 +652,13 @@ fn to_synthetic_subscribe_update(
         transaction: Some(SubscribeUpdateTransactionInfo {
             signature: Vec::new(),
             is_vote: false,
-            transaction: None,
+            transaction: Some(Transaction {
+                signatures: Vec::new(),
+                message: Some(Message {
+                    account_keys: fee_payer_account_keys,
+                    ..Default::default()
+                }),
+            }),
             meta: Some(TransactionStatusMeta {
                 log_messages,
                 post_token_balances,

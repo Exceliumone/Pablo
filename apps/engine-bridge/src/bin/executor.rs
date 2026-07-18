@@ -13,13 +13,26 @@
 //! keyed by mint only, with no user dimension, so they'd corrupt across
 //! users inside a shared process — see docs/ARCHITECTURE.md.
 //!
-//! v1 entry heuristic: buy the first tick seen for any not-yet-held mint.
-//! This is intentionally minimal (no honeypot/risk scoring yet — that's
-//! Sniper page territory for a later phase) and copy-trading target
-//! matching is a documented no-op for now (the engine's parsed trade data
-//! doesn't carry the transaction signer, only pool/price data — matching
-//! against `copy_trading_targets` needs that added, see the TODO below).
-//! Get this reviewed against real devnet activity before relying on it.
+//! Two entry modes, chosen by `copy_trading_enabled` + a non-empty
+//! `copy_trading_targets`:
+//! - **Copy-trading**: only mints bought by a watched wallet are entered,
+//!   and a watched wallet's own sell is mirrored immediately (independent
+//!   of this position's own take-profit/stop-loss), matched via
+//!   `ScannerTick::trader` (the tx fee payer, extracted by the scanner —
+//!   see scanner.rs's `extract_trader_from_transaction`). This only ever
+//!   sees a target's trades from the moment this executor started
+//!   watching onward: there is no backfill of positions a target wallet
+//!   already held before that (would need `getSignaturesForAddress` +
+//!   historical parsing on startup — not implemented, since there's
+//!   nothing to mirror-buy for a position whose entry already happened).
+//! - **Generic sniper** (copy-trading disabled or no targets set): the
+//!   v1 heuristic — buy the first tick seen for any not-yet-held mint,
+//!   from any trader. Intentionally minimal (no honeypot/risk scoring
+//!   yet — that's Sniper page territory for a later phase).
+//! Either way, a held position's own take-profit/stop-loss/trailing-stop
+//! exit (via `SellingEngine`) always keeps running regardless of what the
+//! target wallet does next. Get this reviewed against real devnet activity
+//! before relying on it.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -190,20 +203,27 @@ async fn main() -> anyhow::Result<()> {
     .await;
     tracing::info!(%user_id, "executor: running");
 
-    // TODO(copy-trading): TradeInfoFromToken carries no transaction signer,
-    // only pool/price data, so `copy_trading_targets` can't be matched yet
-    // from scanner ticks alone. Wiring this needs the scanner to also
-    // extract+publish the fee payer (the engine has
-    // extract_signer_from_transaction for this, currently private to
-    // sniper_bot.rs). Left as a follow-up rather than silently
-    // half-implemented.
-    let _copy_targets: HashSet<String> = payload.settings.copy_trading_targets.iter().cloned().collect();
+    let copy_targets: HashSet<String> = if payload.settings.copy_trading_enabled {
+        payload
+            .settings
+            .copy_trading_targets
+            .iter()
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let copy_trading_active = !copy_targets.is_empty();
+    if copy_trading_active {
+        tracing::info!(%user_id, target_count = copy_targets.len(), "executor: copy-trading mode — entries gated to watched wallets");
+    }
 
     // mint -> estimated token amount held, derived from amount_sol / price_sol
     // at buy time. The engine's execute_buy/unified_emergency_sell return no
     // fill data, so this (and the amount_sol a sell reports below) is the
     // best available approximation of position size without engine changes.
-    let mut held_positions: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut held_positions: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
     let mut last_id = "$".to_string();
     let read_opts = StreamReadOptions::default().block(5000).count(100);
 
@@ -237,6 +257,65 @@ async fn main() -> anyhow::Result<()> {
 
                 let trade_info = tick_to_trade_info(&tick);
                 let is_held = held_positions.contains_key(&tick.mint);
+                let is_from_target_wallet = copy_trading_active
+                    && tick
+                        .trader
+                        .as_deref()
+                        .is_some_and(|t| copy_targets.contains(t));
+
+                // Copy-trading mode: mirror a watched wallet's own sell
+                // immediately, independent of this position's own
+                // take-profit/stop-loss — we're following their exit, not
+                // making an independent one.
+                if is_held && is_from_target_wallet && !tick.is_buy {
+                    let protocol = protocol_from_dex(&trade_info.dex_type);
+                    match selling_engine
+                        .unified_emergency_sell(
+                            &tick.mint,
+                            false,
+                            Some(&trade_info),
+                            Some(protocol),
+                        )
+                        .await
+                    {
+                        Ok(signature) => {
+                            let price_sol = tick.price as f64 / 1_000_000_000.0;
+                            let amount_token = held_positions.remove(&tick.mint).unwrap_or(0.0);
+                            let amount_sol = amount_token * price_sol;
+                            publish_event(
+                                &mut event_conn,
+                                &BotEvent::Trade {
+                                    user_id: user_id.clone(),
+                                    side: TradeSide::Sell,
+                                    mint: tick.mint.clone(),
+                                    dex: tick.dex_type.clone(),
+                                    price_sol,
+                                    amount_sol,
+                                    amount_token,
+                                    tx_signature: Some(signature),
+                                    reason: Some("copy_trade_sell".into()),
+                                    at: now_iso(),
+                                },
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            publish_event(
+                                &mut event_conn,
+                                &BotEvent::Error {
+                                    user_id: user_id.clone(),
+                                    message: format!(
+                                        "copy-trade sell failed for {}: {e}",
+                                        tick.mint
+                                    ),
+                                    at: now_iso(),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    continue;
+                }
 
                 if is_held {
                     if let Err(e) = selling_engine.update_metrics(&tick.mint, &trade_info).await {
@@ -247,7 +326,12 @@ async fn main() -> anyhow::Result<()> {
                         Ok((should_sell, is_emergency)) if should_sell => {
                             let protocol = protocol_from_dex(&trade_info.dex_type);
                             match selling_engine
-                                .unified_emergency_sell(&tick.mint, is_emergency, Some(&trade_info), Some(protocol))
+                                .unified_emergency_sell(
+                                    &tick.mint,
+                                    is_emergency,
+                                    Some(&trade_info),
+                                    Some(protocol),
+                                )
                                 .await
                             {
                                 Ok(signature) => {
@@ -266,7 +350,11 @@ async fn main() -> anyhow::Result<()> {
                                             amount_sol,
                                             amount_token,
                                             tx_signature: Some(signature),
-                                            reason: Some(if is_emergency { "emergency".into() } else { "sell_condition".into() }),
+                                            reason: Some(if is_emergency {
+                                                "emergency".into()
+                                            } else {
+                                                "sell_condition".into()
+                                            }),
                                             at: now_iso(),
                                         },
                                     )
@@ -293,8 +381,16 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // Not held yet: the v1 entry heuristic is "buy the first
-                // tick seen for a new mint." See the module doc comment.
+                // Not held yet. In copy-trading mode, only mirror an entry
+                // when this tick is a watched wallet's own buy — everything
+                // else (other wallets trading the same mint) is deliberately
+                // ignored. Otherwise, the v1 heuristic is "buy the first
+                // tick seen for a new mint," from any trader. See the
+                // module doc comment.
+                if copy_trading_active && !(is_from_target_wallet && tick.is_buy) {
+                    continue;
+                }
+
                 publish_event(
                     &mut event_conn,
                     &BotEvent::Opportunity {

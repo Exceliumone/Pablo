@@ -99,6 +99,14 @@ pub struct ScannerTick {
     pub liquidity: f64,
     pub virtual_sol_reserves: u64,
     pub virtual_token_reserves: u64,
+
+    /// Base58 pubkey of the transaction's fee payer (by Solana convention,
+    /// the first account key in the message) — i.e. whoever actually made
+    /// this trade. `None` when it couldn't be determined (should be rare;
+    /// see scanner.rs's extract_trader_from_transaction). This is what lets
+    /// `executor` match a tick against `copy_trading_targets` instead of
+    /// just reacting to any trade on any watched DEX program.
+    pub trader: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

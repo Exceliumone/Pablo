@@ -1,6 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import { withdrawRequestDto } from "@pablo/shared-types";
-import { WalletError, getWalletView, withdrawFromTradingWallet } from "./wallet.service.js";
+import {
+  WalletError,
+  getWalletView,
+  getWithdrawalQuote,
+  withdrawFromTradingWallet,
+} from "./wallet.service.js";
 
 export default async function walletRoutes(fastify: FastifyInstance) {
   fastify.addHook("preHandler", fastify.authenticate);
@@ -14,6 +19,8 @@ export default async function walletRoutes(fastify: FastifyInstance) {
   });
 
   fastify.get("/", async (request) => getWalletView(request.user.sub));
+
+  fastify.get("/withdraw-quote", async (request) => getWithdrawalQuote(request.user.sub));
 
   fastify.post(
     "/withdraw",

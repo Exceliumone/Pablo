@@ -2,14 +2,15 @@
 
 import { useState } from "react";
 import { CheckCircle2, Loader2, Send } from "lucide-react";
+import type { WithdrawalQuoteDto } from "@pablo/shared-types";
 import { Button } from "@/components/ui/button";
 
 export function WithdrawForm({
-  maxSol,
+  quote,
   withdrawing,
   onWithdraw,
 }: {
-  maxSol: number | null;
+  quote: WithdrawalQuoteDto | null;
   withdrawing: boolean;
   onWithdraw: (toAddress: string, amountSol: number) => Promise<string>;
 }) {
@@ -19,6 +20,7 @@ export function WithdrawForm({
   const [result, setResult] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
 
+  const maxSol = quote?.maxWithdrawableSol ?? null;
   const amount = Number(amountSol);
   const validAmount = amount > 0 && (maxSol === null || amount <= maxSol);
   const validAddress = toAddress.trim().length >= 32;
@@ -67,16 +69,49 @@ export function WithdrawForm({
           <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
             Montant {maxSol !== null && <span className="normal-case text-muted-foreground/70">— max {maxSol.toFixed(4)} SOL</span>}
           </span>
-          <input
-            type="number"
-            step="0.001"
-            min="0"
-            className="text-tabular w-full rounded-md border border-surface-border/20 bg-white/[0.03] px-3 py-2 text-sm text-foreground outline-none transition-colors focus:border-pablo-500/50"
-            placeholder="0.00"
-            value={amountSol}
-            onChange={(e) => setAmountSol(e.target.value)}
-          />
+          <div className="flex gap-2">
+            <input
+              type="number"
+              step="0.001"
+              min="0"
+              className="text-tabular w-full rounded-md border border-surface-border/20 bg-white/[0.03] px-3 py-2 text-sm text-foreground outline-none transition-colors focus:border-pablo-500/50"
+              placeholder="0.00"
+              value={amountSol}
+              onChange={(e) => setAmountSol(e.target.value)}
+            />
+            {maxSol !== null && maxSol > 0 && (
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                onClick={() => setAmountSol(maxSol.toFixed(6))}
+              >
+                Max
+              </Button>
+            )}
+          </div>
         </label>
+
+        {quote && (
+          <div className="space-y-1 rounded-md border border-surface-border/20 bg-white/[0.02] p-3 text-xs text-muted-foreground">
+            <div className="flex justify-between">
+              <span>Solde du wallet</span>
+              <span className="text-tabular">{quote.balanceSol.toFixed(6)} SOL</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Réserve rent-exempt</span>
+              <span className="text-tabular">− {quote.rentExemptReserveSol.toFixed(6)} SOL</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Frais de réseau estimés</span>
+              <span className="text-tabular">− {quote.networkFeeSol.toFixed(6)} SOL</span>
+            </div>
+            <div className="flex justify-between border-t border-surface-border/20 pt-1 font-medium text-foreground">
+              <span>Max retirable</span>
+              <span className="text-tabular">{quote.maxWithdrawableSol.toFixed(6)} SOL</span>
+            </div>
+          </div>
+        )}
 
         {!confirming ? (
           <Button

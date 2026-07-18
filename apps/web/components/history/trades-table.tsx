@@ -2,6 +2,7 @@
 
 import type { TradeDto } from "@pablo/shared-types";
 import { ArrowDownRight, ArrowUpRight } from "lucide-react";
+import { EntityLink } from "@/components/ui/entity-link";
 import { cn } from "@/lib/utils";
 
 const STATUS_LABEL: Record<TradeDto["status"], string> = {
@@ -52,8 +53,8 @@ export function TradesTable({ trades }: { trades: TradeDto[] }) {
                   {t.side === "BUY" ? "Achat" : "Vente"}
                 </span>
               </td>
-              <td className="text-tabular px-5 py-3 text-foreground">
-                {t.tokenSymbol ?? `${t.tokenMint.slice(0, 6)}…${t.tokenMint.slice(-4)}`}
+              <td className="px-5 py-3 text-foreground">
+                <EntityLink kind="token" value={t.tokenMint} label={t.tokenSymbol ?? undefined} />
               </td>
               <td className="px-5 py-3 text-muted-foreground">{t.protocol}</td>
               <td className="text-tabular px-5 py-3 text-muted-foreground">
@@ -75,7 +76,7 @@ export function TradesTable({ trades }: { trades: TradeDto[] }) {
                 </span>
               </td>
               <td className="px-5 py-3 text-xs text-muted-foreground">
-                {t.txSignature ? `${t.txSignature.slice(0, 6)}…` : "—"}
+                {t.txSignature ? <EntityLink kind="tx" value={t.txSignature} /> : "—"}
               </td>
               <td className="text-tabular px-5 py-3 text-xs text-muted-foreground">
                 {new Date(t.createdAt).toLocaleString("fr-FR")}

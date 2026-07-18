@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import type { BotSettingsDto } from "@pablo/shared-types";
 import { Loader2, Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { TagInput } from "@/components/ui/tag-input";
 import { cn } from "@/lib/utils";
 
 function Field({
@@ -148,21 +149,11 @@ export function BotSettingsForm({
           />
         </Field>
 
-        <Field label="Wallets de copy trading" hint="adresses séparées par une virgule">
-          <input
-            type="text"
-            className={inputClass}
-            value={draft.copyTradingTargets.join(",")}
-            onChange={(e) =>
-              setDraft({
-                ...draft,
-                copyTradingTargets: e.target.value
-                  .split(",")
-                  .map((s) => s.trim())
-                  .filter(Boolean),
-              })
-            }
-            placeholder="aucun"
+        <Field label="Wallets de copy trading" hint="Entrée pour ajouter une adresse">
+          <TagInput
+            values={draft.copyTradingTargets}
+            onChange={(copyTradingTargets) => setDraft({ ...draft, copyTradingTargets })}
+            placeholder="Coller une adresse et appuyer sur Entrée"
           />
         </Field>
       </div>

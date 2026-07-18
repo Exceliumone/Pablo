@@ -9,7 +9,7 @@ import { useWallet } from "@/lib/use-wallet";
 
 export default function WalletPage() {
   const { accessToken } = useAuth();
-  const { wallet, loading, error, withdraw, withdrawing } = useWallet(accessToken);
+  const { wallet, withdrawalQuote, loading, error, withdraw, withdrawing } = useWallet(accessToken);
 
   return (
     <div className="mx-auto max-w-4xl space-y-6">
@@ -67,7 +67,7 @@ export default function WalletPage() {
 
           <div className="grid gap-6 lg:grid-cols-2">
             <DepositPanel wallet={wallet} />
-            <WithdrawForm maxSol={wallet.solBalance} withdrawing={withdrawing} onWithdraw={withdraw} />
+            <WithdrawForm quote={withdrawalQuote} withdrawing={withdrawing} onWithdraw={withdraw} />
           </div>
         </>
       )}

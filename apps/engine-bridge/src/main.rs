@@ -13,9 +13,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dashmap::DashMap;
-use engine_bridge::contract::{
-    BotEvent, BotStatus, ExecutorStartPayload, ExecutorStatusView,
-};
+use engine_bridge::contract::{BotEvent, BotStatus, ExecutorStartPayload, ExecutorStatusView};
 use engine_bridge::events::{now_iso, publish_event};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -27,7 +25,23 @@ struct ExecutorState {
     started_at: Option<String>,
     last_event_at: Option<String>,
     last_error: Option<String>,
+    /// Total number of times this user's executor has been spawned —
+    /// explicit starts and auto-restarts both count, since both are real
+    /// process restarts the user should be able to see (`restart_count` on
+    /// `ExecutorStatusView`).
     restart_count: u32,
+    /// Consecutive *unexpected-exit* restarts since the last time this
+    /// executor reported `Running`, or since the user last explicitly
+    /// clicked Start. Resets to 0 on either signal; caps auto-restart via
+    /// `MAX_CONSECUTIVE_CRASHES` so a persistently broken config (bad RPC
+    /// URL, empty wallet) doesn't spin the process forever.
+    consecutive_crash_count: u32,
+    /// The payload needed to respawn this user's executor after an
+    /// unexpected crash, without another `/start` call from apps/api.
+    /// Cleared on an explicit stop — see `stop_executor` — so a decrypted
+    /// wallet secret doesn't linger in this registry longer than there's
+    /// an actual use for it.
+    last_payload: Option<ExecutorStartPayload>,
 }
 
 impl Default for ExecutorState {
@@ -39,6 +53,8 @@ impl Default for ExecutorState {
             last_event_at: None,
             last_error: None,
             restart_count: 0,
+            consecutive_crash_count: 0,
+            last_payload: None,
         }
     }
 }
@@ -99,30 +115,29 @@ fn check_auth(ctx: &AppCtx, headers: &HeaderMap) -> Result<(), StatusCode> {
     }
 }
 
-async fn start_executor(
-    State(ctx): State<Arc<AppCtx>>,
-    Path(user_id): Path<String>,
-    headers: HeaderMap,
-    Json(payload): Json<ExecutorStartPayload>,
-) -> Result<Json<ExecutorStatusView>, StatusCode> {
-    check_auth(&ctx, &headers)?;
-    if payload.user_id != user_id {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+/// An unexpected exit is retried at most this many times in a row (reset
+/// whenever the executor reaches `Running`, or the user explicitly starts
+/// it again) before giving up and leaving it in `Error` — a persistently
+/// broken config (bad RPC URL, empty wallet) should surface as a visible
+/// error, not spin the process forever.
+const MAX_CONSECUTIVE_CRASHES: u32 = 5;
 
-    // Starting again while already running is a restart: stop the old
-    // process first so we never have two executors for the same user.
-    if let Some(existing) = ctx.registry.get(&user_id) {
-        if matches!(existing.status, BotStatus::Running | BotStatus::Starting) {
-            if let Some(pid) = existing.pid {
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status()
-                    .await;
-            }
-        }
-    }
+fn restart_backoff(consecutive_crash_count: u32) -> std::time::Duration {
+    let secs = 2u64.saturating_pow(consecutive_crash_count.min(6));
+    std::time::Duration::from_secs(secs.min(60))
+}
 
+/// Spawns the executor child process for `user_id`, wires up its
+/// stdout/stderr relay, and owns it in an exit-monitor task. Shared by the
+/// HTTP start handler and the crash-recovery path in that monitor task —
+/// the only difference between "a user clicked Start" and "the previous
+/// attempt just crashed and this is a retry" is `consecutive_crash_count`.
+fn spawn_executor(
+    ctx: Arc<AppCtx>,
+    user_id: String,
+    payload: ExecutorStartPayload,
+    consecutive_crash_count: u32,
+) -> Result<(), StatusCode> {
     let payload_json = serde_json::to_string(&payload).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let mut child = tokio::process::Command::new(&ctx.executor_bin_path)
@@ -133,7 +148,7 @@ async fn start_executor(
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
-            tracing::error!(error = %e, "failed to spawn executor");
+            tracing::error!(error = %e, %user_id, "failed to spawn executor");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -153,6 +168,8 @@ async fn start_executor(
             last_event_at: None,
             last_error: None,
             restart_count,
+            consecutive_crash_count,
+            last_payload: Some(payload),
         },
     );
 
@@ -204,11 +221,17 @@ async fn start_executor(
             Ok(status) => (BotStatus::Error, Some(format!("exited with {status}"))),
             Err(e) => (BotStatus::Error, Some(format!("wait failed: {e}"))),
         };
-        if let Some(mut entry) = ctx_bg.registry.get_mut(&user_id_bg) {
-            entry.status = status;
-            entry.pid = None;
-            entry.last_error = error.clone();
-        }
+
+        let (crash_count, retry_payload) =
+            if let Some(mut entry) = ctx_bg.registry.get_mut(&user_id_bg) {
+                entry.status = status;
+                entry.pid = None;
+                entry.last_error = error.clone();
+                (entry.consecutive_crash_count, entry.last_payload.clone())
+            } else {
+                (consecutive_crash_count, None)
+            };
+
         publish_event(
             &mut conn,
             &BotEvent::Status {
@@ -222,14 +245,77 @@ async fn start_executor(
             publish_event(
                 &mut conn,
                 &BotEvent::Error {
-                    user_id: user_id_bg,
+                    user_id: user_id_bg.clone(),
                     message,
                     at: now_iso(),
                 },
             )
             .await;
         }
+
+        // Auto-restart an unexpected crash — never an explicitly requested
+        // stop, never a clean exit — so a transient failure (a dropped RPC
+        // connection, a momentary Redis blip) doesn't strand the user with
+        // a bot that silently stopped until they notice and click Start
+        // again.
+        if status == BotStatus::Error && !was_requested_stop {
+            if crash_count < MAX_CONSECUTIVE_CRASHES {
+                if let Some(payload) = retry_payload {
+                    let delay = restart_backoff(crash_count);
+                    tracing::warn!(
+                        %user_id_bg,
+                        crash_count,
+                        delay_secs = delay.as_secs(),
+                        "executor: unexpected exit, auto-restarting"
+                    );
+                    tokio::time::sleep(delay).await;
+                    if let Err(status_code) =
+                        spawn_executor(ctx_bg.clone(), user_id_bg.clone(), payload, crash_count + 1)
+                    {
+                        tracing::error!(%user_id_bg, ?status_code, "executor: auto-restart failed to spawn");
+                    }
+                }
+            } else {
+                tracing::error!(
+                    %user_id_bg,
+                    crash_count,
+                    "executor: giving up after repeated crashes, staying stopped"
+                );
+            }
+        }
     });
+
+    Ok(())
+}
+
+async fn start_executor(
+    State(ctx): State<Arc<AppCtx>>,
+    Path(user_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<ExecutorStartPayload>,
+) -> Result<Json<ExecutorStatusView>, StatusCode> {
+    check_auth(&ctx, &headers)?;
+    if payload.user_id != user_id {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Starting again while already running is a restart: stop the old
+    // process first so we never have two executors for the same user.
+    if let Some(existing) = ctx.registry.get(&user_id) {
+        if matches!(existing.status, BotStatus::Running | BotStatus::Starting) {
+            if let Some(pid) = existing.pid {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status()
+                    .await;
+            }
+        }
+    }
+
+    // An explicit start always resets the crash-backoff counter — the user
+    // asking for this is itself a fresh attempt, not a continuation of
+    // whatever crash loop (if any) preceded it.
+    spawn_executor(ctx.clone(), user_id.clone(), payload, 0)?;
 
     let view = to_view(&user_id, &ctx.registry.get(&user_id).unwrap());
     Ok(Json(view))
@@ -250,11 +336,18 @@ async fn stop_executor(
             .await;
         if let Some(mut entry) = ctx.registry.get_mut(&user_id) {
             entry.status = BotStatus::Stopping;
+            // An explicit stop is never auto-restarted (the exit-monitor's
+            // was_requested_stop check already guarantees that), so there's
+            // no more use for the decrypted wallet secret this holds —
+            // drop it rather than let it linger in memory.
+            entry.last_payload = None;
         }
     } else if let Some(mut entry) = ctx.registry.get_mut(&user_id) {
         entry.status = BotStatus::Stopped;
+        entry.last_payload = None;
     } else {
-        ctx.registry.insert(user_id.clone(), ExecutorState::default());
+        ctx.registry
+            .insert(user_id.clone(), ExecutorState::default());
     }
 
     let view = to_view(&user_id, &ctx.registry.get(&user_id).unwrap());
@@ -267,7 +360,11 @@ async fn get_status(
     headers: HeaderMap,
 ) -> Result<Json<ExecutorStatusView>, StatusCode> {
     check_auth(&ctx, &headers)?;
-    let state = ctx.registry.get(&user_id).map(|s| s.clone()).unwrap_or_default();
+    let state = ctx
+        .registry
+        .get(&user_id)
+        .map(|s| s.clone())
+        .unwrap_or_default();
     Ok(Json(to_view(&user_id, &state)))
 }
 
@@ -334,8 +431,12 @@ async fn main() -> anyhow::Result<()> {
                         }
                         let mut stream = pubsub.on_message();
                         while let Some(msg) = stream.next().await {
-                            let Ok(payload) = msg.get_payload::<String>() else { continue };
-                            let Ok(event) = serde_json::from_str::<BotEvent>(&payload) else { continue };
+                            let Ok(payload) = msg.get_payload::<String>() else {
+                                continue;
+                            };
+                            let Ok(event) = serde_json::from_str::<BotEvent>(&payload) else {
+                                continue;
+                            };
                             let user_id = match &event {
                                 BotEvent::Status { user_id, .. }
                                 | BotEvent::Opportunity { user_id, .. }
@@ -345,7 +446,18 @@ async fn main() -> anyhow::Result<()> {
                             let mut entry = ctx.registry.entry(user_id).or_default();
                             entry.last_event_at = Some(now_iso());
                             match event {
-                                BotEvent::Status { status, .. } => entry.status = status,
+                                BotEvent::Status { status, .. } => {
+                                    entry.status = status;
+                                    // Reaching Running is the signal that
+                                    // this attempt actually worked — clears
+                                    // the crash counter so a later
+                                    // unrelated crash gets the full retry
+                                    // budget again instead of inheriting
+                                    // an old streak.
+                                    if status == BotStatus::Running {
+                                        entry.consecutive_crash_count = 0;
+                                    }
+                                }
                                 BotEvent::Error { message, .. } => entry.last_error = Some(message),
                                 _ => {}
                             }

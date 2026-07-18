@@ -1,6 +1,6 @@
 import { Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
 import bs58 from "bs58";
-import type { WalletDto } from "@pablo/shared-types";
+import type { WalletDto, WithdrawalQuoteDto } from "@pablo/shared-types";
 import { prisma } from "../../lib/prisma.js";
 import { encryptSecret, decryptSecret } from "../../lib/wallet-crypto.js";
 import { connection, getTokenBalanceRaw, rawToHumanString } from "../../lib/solana.js";
@@ -15,10 +15,10 @@ export class WalletError extends Error {
   }
 }
 
-// Leave the account rent-exempt and with a little headroom for the network
-// fee on this and the bot's own next trade — a withdrawal can't drain the
-// wallet to exactly zero.
-const MIN_REMAINING_LAMPORTS = 0.01 * LAMPORTS_PER_SOL;
+// A flat, generic fee estimate for the rare case getFeeForMessage returns
+// null (RPC that doesn't support it) — matches Solana's normal one-signature
+// base fee, so this only ever under- rather than over-reserves.
+const FALLBACK_NETWORK_FEE_LAMPORTS = 5000;
 
 /**
  * The wallet the executor actually trades with — separate from the
@@ -92,6 +92,44 @@ export async function getWalletView(userId: string): Promise<WalletDto> {
 }
 
 /**
+ * The real, on-chain-derived numbers behind "how much can I withdraw" —
+ * the wallet's actual rent-exempt minimum (`getMinimumBalanceForRentExemption`,
+ * not a guessed constant) plus this transfer's actual estimated network fee
+ * (`getFeeForMessage` against a real probe transaction). Used both to show
+ * the user a real max/fee breakdown before they submit, and to validate the
+ * withdrawal server-side — so the two never disagree the way a UI-only
+ * balance and a hardcoded backend reserve used to.
+ */
+export async function getWithdrawalQuote(userId: string): Promise<WithdrawalQuoteDto> {
+  const wallet = await getOrCreateTradingWallet(userId);
+  const pubkey = new PublicKey(wallet.publicKey);
+
+  const [balanceLamports, rentExemptReserveLamports, { blockhash }] = await Promise.all([
+    connection.getBalance(pubkey),
+    connection.getMinimumBalanceForRentExemption(0),
+    connection.getLatestBlockhash(),
+  ]);
+
+  const probeTx = new Transaction({ feePayer: pubkey, recentBlockhash: blockhash }).add(
+    SystemProgram.transfer({ fromPubkey: pubkey, toPubkey: pubkey, lamports: 0 }),
+  );
+  const feeResult = await connection.getFeeForMessage(probeTx.compileMessage());
+  const networkFeeLamports = feeResult.value ?? FALLBACK_NETWORK_FEE_LAMPORTS;
+
+  const maxWithdrawableLamports = Math.max(
+    0,
+    balanceLamports - rentExemptReserveLamports - networkFeeLamports,
+  );
+
+  return {
+    balanceSol: balanceLamports / LAMPORTS_PER_SOL,
+    networkFeeSol: networkFeeLamports / LAMPORTS_PER_SOL,
+    rentExemptReserveSol: rentExemptReserveLamports / LAMPORTS_PER_SOL,
+    maxWithdrawableSol: maxWithdrawableLamports / LAMPORTS_PER_SOL,
+  };
+}
+
+/**
  * Sends SOL out of the custodial trading wallet to a user-specified
  * address. Blocked while the bot is running: the executor holds its own
  * long-lived RPC connection and signs with this same key, and racing a
@@ -121,17 +159,20 @@ export async function withdrawFromTradingWallet(
     throw new WalletError("Invalid destination address.", 400);
   }
 
-  const secretB58 = await decryptTradingWalletSecret(userId);
-  const keypair = Keypair.fromSecretKey(bs58.decode(secretB58));
-
+  const quote = await getWithdrawalQuote(userId);
   const lamports = Math.round(amountSol * LAMPORTS_PER_SOL);
-  const balance = await connection.getBalance(keypair.publicKey);
-  if (lamports + MIN_REMAINING_LAMPORTS > balance) {
+  const maxWithdrawableLamports = Math.round(quote.maxWithdrawableSol * LAMPORTS_PER_SOL);
+  if (lamports > maxWithdrawableLamports) {
     throw new WalletError(
-      "Amount exceeds the withdrawable balance (a small buffer is kept for rent and fees).",
+      `Amount exceeds the withdrawable balance. Max withdrawable is ${quote.maxWithdrawableSol.toFixed(6)} SOL ` +
+        `(a ${quote.rentExemptReserveSol.toFixed(6)} SOL rent-exempt reserve and ` +
+        `~${quote.networkFeeSol.toFixed(6)} SOL network fee are kept back).`,
       400,
     );
   }
+
+  const secretB58 = await decryptTradingWalletSecret(userId);
+  const keypair = Keypair.fromSecretKey(bs58.decode(secretB58));
 
   const tx = new Transaction().add(
     SystemProgram.transfer({

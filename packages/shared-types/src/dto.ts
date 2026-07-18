@@ -291,6 +291,17 @@ export const withdrawResultDto = z.object({
 });
 export type WithdrawResultDto = z.infer<typeof withdrawResultDto>;
 
+// All amounts in SOL (not lamports) — this is a UI-facing quote, not an
+// on-chain payload, so it matches the rest of this file's convention of
+// human units for SOL amounts (see e.g. amountPerBuySol above).
+export const withdrawalQuoteDto = z.object({
+  balanceSol: z.number(),
+  networkFeeSol: z.number(),
+  rentExemptReserveSol: z.number(),
+  maxWithdrawableSol: z.number(),
+});
+export type WithdrawalQuoteDto = z.infer<typeof withdrawalQuoteDto>;
+
 // ── Admin console (Phase 6) ────────────────────────────────────────────
 
 export const adminSubscriptionSummaryDto = z.object({
