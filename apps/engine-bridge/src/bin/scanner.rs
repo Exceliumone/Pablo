@@ -267,14 +267,27 @@ fn watched_programs() -> Vec<String> {
     ]
 }
 
+/// Rough, padding-adjusted base64-decoded length — good enough for a
+/// diagnostic size comparison, not a claim of exact correctness (no
+/// `base64` crate dependency added just for this one log field).
+fn approx_base64_decoded_len(s: &str) -> usize {
+    let trimmed = s.trim_end();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let padding = trimmed.chars().rev().take_while(|&c| c == '=').count();
+    (trimmed.len() / 4) * 3 - padding.min(3)
+}
+
 /// Same extraction pattern as the engine's own process_message_for_dex_monitoring:
 /// the CPI log carrying the trade payload is the inner instruction whose data
 /// length matches one of these known instruction encodings. Shared by both
 /// modes: once a `SubscribeUpdateTransaction` exists — straight off
 /// Yellowstone, or hand-assembled from a standard `getTransaction` response
 /// (see `to_synthetic_subscribe_update` below) — the rest of the detection
-/// pipeline is identical.
-fn extract_cpi_log_data(txn: &SubscribeUpdateTransaction) -> Option<Vec<u8>> {
+/// pipeline is identical. `log_signature` is diagnostic-only, matching the
+/// convention already used by `detect_trade`/`fetch_and_detect`.
+fn extract_cpi_log_data(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option<Vec<u8>> {
     let inner_instructions = txn
         .transaction
         .as_ref()
@@ -282,11 +295,118 @@ fn extract_cpi_log_data(txn: &SubscribeUpdateTransaction) -> Option<Vec<u8>> {
         .map(|m| m.inner_instructions.clone())
         .unwrap_or_default();
 
-    inner_instructions
+    let matched = inner_instructions
         .iter()
         .flat_map(|inner| &inner.instructions)
         .find(|ix| matches!(ix.data.len(), 368 | 266 | 270 | 146 | 170 | 138))
-        .map(|ix| ix.data.clone())
+        .map(|ix| ix.data.clone());
+
+    // Everything below is diagnostic-only, gated on the reject path, so it
+    // costs nothing when a match is found (the normal/expected case).
+    if matched.is_none() {
+        let account_keys = txn
+            .transaction
+            .as_ref()
+            .and_then(|t| t.transaction.as_ref())
+            .and_then(|t| t.message.as_ref())
+            .map(|m| m.account_keys.clone())
+            .unwrap_or_default();
+        let log_messages = txn
+            .transaction
+            .as_ref()
+            .and_then(|t| t.meta.as_ref())
+            .map(|m| m.log_messages.clone())
+            .unwrap_or_default();
+
+        tracing::debug!(
+            signature = %log_signature,
+            inner_instruction_group_count = inner_instructions.len(),
+            total_inner_instruction_count =
+                inner_instructions.iter().map(|g| g.instructions.len()).sum::<usize>(),
+            log_message_count = log_messages.len(),
+            known_lengths = "368, 266, 270, 146, 170, 138",
+            "scanner: REJECTED — no inner instruction matched a recognized CPI-log data length; \
+             dumping full instruction/log detail below to identify the actual format in use"
+        );
+
+        if inner_instructions.is_empty() {
+            tracing::debug!(
+                signature = %log_signature,
+                "scanner: this transaction has ZERO inner instruction groups at all — nothing to \
+                 even compare a length against"
+            );
+        }
+
+        for group in &inner_instructions {
+            for (ix_idx, ix) in group.instructions.iter().enumerate() {
+                let program_id = account_keys
+                    .get(ix.program_id_index as usize)
+                    .map(|key| bs58::encode(key).into_string())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "<unresolvable: program_id_index {} but this transaction's message \
+                             only carries {} account key(s) — dev mode's synthetic message only \
+                             ever populates the fee payer at index 0, see \
+                             to_synthetic_subscribe_update>",
+                            ix.program_id_index,
+                            account_keys.len()
+                        )
+                    });
+                tracing::debug!(
+                    signature = %log_signature,
+                    inner_instruction_group_index = group.index,
+                    instruction_index = ix_idx,
+                    program_id_index = ix.program_id_index,
+                    program_id = %program_id,
+                    account_indices = ?ix.accounts,
+                    data_len = ix.data.len(),
+                    data_len_is_a_known_length = matches!(ix.data.len(), 368 | 266 | 270 | 146 | 170 | 138),
+                    stack_height = ?ix.stack_height,
+                    "scanner: inner instruction detail"
+                );
+            }
+        }
+
+        // A "CPI log" can also mean a `sol_log_data`-emitted event — shown
+        // as a "Program data: <base64>" log line — which is a completely
+        // different mechanism from inner-instruction call data above and
+        // is NOT currently read anywhere in this file. If PumpFun/
+        // PumpSwap/Raydium Launchpad moved their event emission to this
+        // mechanism, inner-instruction lengths would never match again
+        // regardless of what they are, which is exactly this symptom.
+        let program_data_logs: Vec<(usize, usize)> = log_messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                line.strip_prefix("Program data: ")
+                    .map(|b64| (i, approx_base64_decoded_len(b64)))
+            })
+            .collect();
+
+        if program_data_logs.is_empty() {
+            tracing::debug!(
+                signature = %log_signature,
+                "scanner: no \"Program data:\" log lines found either (checked both possible \
+                 CPI-event mechanisms — inner-instruction data and sol_log_data — neither \
+                 matched anything recognizable)"
+            );
+        } else {
+            for (line_index, decoded_len) in &program_data_logs {
+                tracing::debug!(
+                    signature = %log_signature,
+                    log_line_index = line_index,
+                    cpi_log_present = true,
+                    cpi_log_decoded_len_approx = decoded_len,
+                    raw_log = %log_messages[*line_index],
+                    "scanner: \"Program data:\" (sol_log_data) log present — not currently read \
+                     by this scanner; its approximate decoded length is logged in case this is \
+                     where the trade data actually lives now"
+                );
+            }
+        }
+    }
+
+    matched
 }
 
 /// Mirrors the engine's own (private-to-sniper_bot.rs) `extract_signer_from_
@@ -374,7 +494,7 @@ async fn publish_tick(redis_conn: &RedisConn, tick: ScannerTick) {
 /// pipeline's per-signature logs even when several are in flight
 /// concurrently) — it plays no role in the detection logic itself.
 fn detect_trade(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option<ScannerTick> {
-    let Some(data) = extract_cpi_log_data(txn) else {
+    let Some(data) = extract_cpi_log_data(txn, log_signature) else {
         tracing::debug!(
             signature = %log_signature,
             "scanner: REJECTED — no inner instruction with a recognized CPI-log data length \
