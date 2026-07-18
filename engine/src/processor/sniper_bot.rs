@@ -707,6 +707,43 @@ async fn verify_transaction(
     Err("Transaction verification failed after retries".to_string())
 }
 
+/// Get a blockhash for signing a buy transaction, never giving up on a
+/// live opportunity just because BlockhashProcessor's 300ms-interval
+/// background refresh loop (engine/src/library/blockhash_processor.rs)
+/// happens to be stale — e.g. because the shared free public RPC briefly
+/// rate-limited that loop's own polling. Tries the process-wide cache
+/// first (cheap, no I/O); if it's empty or older than
+/// BLOCKHASH_STALENESS_THRESHOLD, falls back to fetching one directly via
+/// `app_state.rpc_client` before giving up.
+async fn get_blockhash_or_fallback(
+    app_state: &Arc<AppState>,
+    logger: &Logger,
+) -> Result<solana_sdk::hash::Hash, String> {
+    logger.log("STEP 3: Request latest blockhash (from cached BlockhashProcessor)".cyan().to_string());
+    if let Some(hash) = crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+        logger.log(format!("STEP 4: Blockhash received (cache) — {}", hash).green().to_string());
+        return Ok(hash);
+    }
+
+    logger.log(
+        "STEP 4: Cache empty/stale — falling back to a direct RPC fetch instead of \
+         abandoning the trade".yellow().to_string(),
+    );
+    let processor = crate::library::blockhash_processor::BlockhashProcessor::new(app_state.rpc_client.clone())
+        .await
+        .map_err(|e| format!("STEP 4 FAILED: could not construct fallback BlockhashProcessor: {}", e))?;
+    match processor.get_fresh_blockhash().await {
+        Ok(hash) => {
+            logger.log(format!("STEP 4: Blockhash received (RPC fallback) — {}", hash).green().to_string());
+            Ok(hash)
+        }
+        Err(e) => {
+            logger.log(format!("STEP 4 FAILED: RPC fallback also failed — {}", e).red().to_string());
+            Err(format!("STEP 4 FAILED: no cached blockhash available and RPC fallback failed: {}", e))
+        }
+    }
+}
+
 /// Execute buy operation based on detected transaction
 pub async fn execute_buy(
     trade_info: transaction_parser::TradeInfoFromToken,
@@ -779,14 +816,9 @@ pub async fn execute_buy(
                     logger.log(format!("Generated PumpFun buy instruction at price: {}", price));
                     logger.log(format!("copy transaction {}", trade_info.signature));
                     let start_time = Instant::now();
-                    // Get real-time blockhash from processor
-                    let recent_blockhash = match crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                        Some(hash) => hash,
-                        None => {
-                            logger.log("Failed to get real-time blockhash, skipping transaction".red().to_string());
-                            return Err("Failed to get real-time blockhash".to_string());
-                        }
-                    };
+                    // Get real-time blockhash from processor, falling back to a direct
+                    // RPC fetch if the cache is empty or stale
+                    let recent_blockhash = get_blockhash_or_fallback(&app_state, &logger).await?;
                     println!("time taken for get_latest_blockhash: {:?}", start_time.elapsed());
                     println!("using zeroslot for buy transaction >>>>>>>>");
                     // Execute the transaction using zeroslot for buying
@@ -801,17 +833,17 @@ pub async fn execute_buy(
                             if signatures.is_empty() {
                                 return Err("No transaction signature returned".to_string());
                             }
-                            
+
                             let signature = &signatures[0];
                             logger.log(format!("Buy transaction sent: {}", signature));
-                            
-                            
+
+
                             // Verify transaction
                             match verify_transaction(&signature.to_string(), app_state.clone(), &logger).await {
                                 Ok(verified) => {
                                     if verified {
                                         logger.log("Buy transaction verified successfully".to_string());
-                                        
+
                                         // Add token account to our global list and tracking
                                         if let Ok(wallet_pubkey) = app_state.wallet.try_pubkey() {
                                             let token_mint = Pubkey::from_str(&trade_info.mint)
@@ -819,7 +851,7 @@ pub async fn execute_buy(
                                             let token_ata = get_associated_token_address(&wallet_pubkey, &token_mint);
                                             WALLET_TOKEN_ACCOUNTS.insert(token_ata);
                                             logger.log(format!("Added token account {} to global list", token_ata));
-                                            
+
                                             // Add to enhanced tracking system for PumpFun
                                             let bought_token_info = BoughtTokenInfo::new(
                                                 trade_info.mint.clone(),
@@ -900,23 +932,9 @@ pub async fn execute_buy(
                     ).green().to_string());
                     logger.log(format!("copy transaction {}", trade_info.signature));
 
-                    // Get real-time blockhash from processor
-                    logger.log("STEP 3: Request latest blockhash (from cached BlockhashProcessor)".cyan().to_string());
-                    let recent_blockhash = match crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                        Some(hash) => {
-                            logger.log(format!("STEP 4: Blockhash received — {}", hash).green().to_string());
-                            hash
-                        }
-                        None => {
-                            logger.log(
-                                "STEP 4: Blockhash received — FAILED (BlockhashProcessor's cache is empty or \
-                                 older than BLOCKHASH_STALENESS_THRESHOLD; either start() was never called in \
-                                 this process, or its background refresh loop hasn't succeeded recently — see \
-                                 engine/src/library/blockhash_processor.rs)".red().to_string(),
-                            );
-                            return Err("STEP 4 FAILED: no cached blockhash available (BlockhashProcessor cache empty/stale)".to_string());
-                        }
-                    };
+                    // Get real-time blockhash from processor, falling back to a direct
+                    // RPC fetch if the cache is empty or stale
+                    let recent_blockhash = get_blockhash_or_fallback(&app_state, &logger).await?;
 
                     println!("using zeroslot for buy transaction >>>>>>>>");
                     let instruction_count = instructions.len();
@@ -1028,16 +1046,11 @@ pub async fn execute_buy(
             // Build swap instructions from parsed data for buy
             match raydium.build_swap_from_parsed_data(&trade_info, buy_config.clone()).await {
                 Ok((keypair, instructions, _price)) => {
-                    
-                    // Get real-time blockhash from processor
-                    let recent_blockhash = match crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                        Some(hash) => hash,
-                        None => {
-                            logger.log("Failed to get real-time blockhash, skipping transaction".red().to_string());
-                            return Err("Failed to get real-time blockhash".to_string());
-                        }
-                    };
-                    
+
+                    // Get real-time blockhash from processor, falling back to a direct
+                    // RPC fetch if the cache is empty or stale
+                    let recent_blockhash = get_blockhash_or_fallback(&app_state, &logger).await?;
+
                     // Execute the transaction using zeroslot for buying
                     match crate::block_engine::tx::new_signed_and_send_zeroslot(
                         app_state.zeroslot_rpc_client.clone(),
@@ -1050,16 +1063,16 @@ pub async fn execute_buy(
                             if signatures.is_empty() {
                                 return Err("No transaction signature returned".to_string());
                             }
-                            
+
                             let signature = &signatures[0];
                             logger.log(format!("Buy transaction sent: {}", signature));
-                            
+
                             // Verify transaction
                             match verify_transaction(&signature.to_string(), app_state.clone(), &logger).await {
                                 Ok(verified) => {
                                     if verified {
                                         logger.log("Buy transaction verified successfully".to_string());
-                                        
+
                                         // Add token account to our global list and tracking
                                         if let Ok(wallet_pubkey) = app_state.wallet.try_pubkey() {
                                             let token_mint = Pubkey::from_str(&trade_info.mint)
@@ -1067,7 +1080,7 @@ pub async fn execute_buy(
                                             let token_ata = get_associated_token_address(&wallet_pubkey, &token_mint);
                                             WALLET_TOKEN_ACCOUNTS.insert(token_ata);
                                             logger.log(format!("Added token account {} to global list", token_ata));
-                                            
+
                                             // Add to enhanced tracking system for Raydium
                                             let bought_token_info = BoughtTokenInfo::new(
                                                 trade_info.mint.clone(),
@@ -1135,14 +1148,9 @@ pub async fn execute_buy(
                     logger.log(format!("Generated PumpFun buy instruction at price: {}", price));
                     logger.log(format!("copy transaction {}", trade_info.signature));
                     let start_time = Instant::now();
-                    // Get real-time blockhash from processor
-                    let recent_blockhash = match crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                        Some(hash) => hash,
-                        None => {
-                            logger.log("Failed to get real-time blockhash, skipping transaction".red().to_string());
-                            return Err("Failed to get real-time blockhash".to_string());
-                        }
-                    };
+                    // Get real-time blockhash from processor, falling back to a direct
+                    // RPC fetch if the cache is empty or stale
+                    let recent_blockhash = get_blockhash_or_fallback(&app_state, &logger).await?;
                     println!("time taken for get_latest_blockhash: {:?}", start_time.elapsed());
                     println!("using zeroslot for buy transaction >>>>>>>>");
                     // Execute the transaction using zeroslot for buying

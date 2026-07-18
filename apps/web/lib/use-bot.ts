@@ -40,6 +40,19 @@ export function useBot(accessToken: string | null): UseBotStatusResult {
     void refresh();
   }, [refresh]);
 
+  // Poll status periodically, not just right after a button click — the
+  // STOPPING→STOPPED transition happens asynchronously in the orchestrator
+  // (it waits on the process to actually exit), and an auto-restart after a
+  // crash changes status without any local action at all. Without this, the
+  // UI can sit on a stale status indefinitely until the user does something.
+  useEffect(() => {
+    if (!accessToken) return;
+    const interval = setInterval(() => {
+      void refresh();
+    }, 8000);
+    return () => clearInterval(interval);
+  }, [accessToken, refresh]);
+
   const start = useCallback(async () => {
     if (!accessToken) return;
     setActionPending(true);

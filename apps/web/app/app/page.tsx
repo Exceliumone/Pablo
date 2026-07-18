@@ -11,7 +11,11 @@ import { useBotEvents } from "@/lib/use-bot-events";
 export default function SniperPage() {
   const { accessToken } = useAuth();
   const { status, loading, error, start, stop, actionPending } = useBot(accessToken);
-  const { events, connected } = useBotEvents(accessToken);
+  // The live feed (and the "Flux temps réel" indicator it drives) should
+  // only be connected while this user's bot is actually running or coming
+  // up — not merely while the dashboard tab happens to be open.
+  const botActive = status !== null && (status.status === "RUNNING" || status.status === "STARTING");
+  const { events, connected } = useBotEvents(accessToken, botActive);
 
   return (
     <div className="mx-auto max-w-3xl space-y-6">

@@ -37,8 +37,15 @@ function tradeToBotEvent(t: TradeDto): Extract<BotEventDto, { type: "trade" }> {
 /** Live feed of this user's bot events (opportunity/trade/status/error),
  * relayed by apps/api's WS gateway from the engine's Redis pub/sub channel.
  * Reconnects with backoff — a dropped tab-backgrounded connection shouldn't
- * require a manual page refresh to pick back up. */
-export function useBotEvents(accessToken: string | null) {
+ * require a manual page refresh to pick back up.
+ *
+ * `active` should reflect the bot's own RUNNING/STARTING state, not just
+ * "is the user logged in" — otherwise this connects (and the "Flux temps
+ * réel" indicator reads Connecté) even while the user's bot is stopped,
+ * since the WS gateway's channel exists independently of whether anything
+ * is currently publishing to it. Defaults to `true` so callers that don't
+ * care about bot state (or haven't been updated yet) keep prior behavior. */
+export function useBotEvents(accessToken: string | null, active = true) {
   const [events, setEvents] = useState<BotEventDto[]>([]);
   const [connected, setConnected] = useState(false);
   const retryRef = useRef(0);
@@ -76,7 +83,12 @@ export function useBotEvents(accessToken: string | null) {
   }, [accessToken]);
 
   useEffect(() => {
-    if (!accessToken) return;
+    if (!accessToken || !active) {
+      // Bot is stopped (or there's no token yet) — ensure the indicator
+      // reflects that rather than whatever the last connection left behind.
+      setConnected(false);
+      return;
+    }
 
     let socket: WebSocket | null = null;
     let closedByEffect = false;
@@ -115,7 +127,7 @@ export function useBotEvents(accessToken: string | null) {
       clearTimeout(retryTimer);
       socket?.close();
     };
-  }, [accessToken]);
+  }, [accessToken, active]);
 
   return { events, connected };
 }
