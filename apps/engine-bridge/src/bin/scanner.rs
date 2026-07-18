@@ -58,6 +58,7 @@ use solana_client::rpc_config::{
 };
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
+use solana_transaction_status::option_serializer::OptionSerializer;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiInnerInstructions, UiInstruction,
     UiTransactionEncoding, UiTransactionStatusMeta, UiTransactionTokenBalance,
@@ -1028,6 +1029,60 @@ async fn watch_all_programs(
     anyhow::bail!("logs_subscribe stream(s) closed")
 }
 
+/// Describes an `OptionSerializer`-wrapped list field's exact state —
+/// distinguishing "the RPC response omitted this field entirely" (`Skip`)
+/// from "explicitly null" (`None`) from "present but empty" from
+/// "present with N items" — all four of which collapse to indistinguishable
+/// downstream behavior (nothing) if only checked with `.is_empty()`/
+/// `unwrap_or_default()`, but mean very different things when the question
+/// is "did the RPC node itself never send this, or did something after it
+/// lose it."
+fn describe_option_serializer_vec<T>(opt: &OptionSerializer<Vec<T>>) -> String {
+    match opt {
+        OptionSerializer::Skip => "Skip (field omitted from the RPC response entirely)".to_string(),
+        OptionSerializer::None => "None (explicitly null in the RPC response)".to_string(),
+        OptionSerializer::Some(v) if v.is_empty() => "Some([]) (present but empty)".to_string(),
+        OptionSerializer::Some(v) => format!("Some(<{} item(s)>)", v.len()),
+    }
+}
+
+/// Inspects the RAW `getTransaction` response — before any of this file's
+/// own conversion in `to_synthetic_subscribe_update` touches it — to
+/// answer definitively whether the RPC node itself returned no inner
+/// instructions, or whether they existed here and were lost somewhere in
+/// our own conversion. Read-only: this changes nothing about what gets
+/// parsed, it only reports what's already there.
+fn log_raw_transaction_response_shape(
+    signature: Signature,
+    tx: &EncodedConfirmedTransactionWithStatusMeta,
+) {
+    let meta_present = tx.transaction.meta.is_some();
+    let (inner_instructions_state, log_message_count) = match &tx.transaction.meta {
+        Some(meta) => (
+            describe_option_serializer_vec(&meta.inner_instructions),
+            match &meta.log_messages {
+                OptionSerializer::Some(v) => Some(v.len()),
+                OptionSerializer::None | OptionSerializer::Skip => None,
+            },
+        ),
+        None => (
+            "<meta itself is None — nothing to describe>".to_string(),
+            None,
+        ),
+    };
+
+    tracing::debug!(
+        %signature,
+        meta_present,
+        inner_instructions_state = %inner_instructions_state,
+        log_message_count = ?log_message_count,
+        transaction_version = ?tx.transaction.version,
+        slot = tx.slot,
+        "scanner: raw getTransaction response shape (before any conversion) — this is exactly \
+         what the RPC node itself returned"
+    );
+}
+
 /// Fetches the full transaction via `getTransaction` (retrying through the
 /// normal confirm delay — see `GET_TRANSACTION_RETRIES`'s doc comment),
 /// then runs it through the exact same `detect_trade` pipeline Yellowstone
@@ -1047,7 +1102,14 @@ async fn fetch_and_detect(
             max_supported_transaction_version: Some(0),
         };
         rate_limiter.acquire().await;
-        tracing::debug!("calling getTransaction for {signature}");
+        tracing::debug!(
+            %signature,
+            attempt,
+            encoding = ?config.encoding,
+            commitment = ?config.commitment,
+            max_supported_transaction_version = ?config.max_supported_transaction_version,
+            "calling getTransaction for {signature}"
+        );
         let rpc_call_started = Instant::now();
         let rpc_result = rpc_client
             .get_transaction_with_config(&signature, config)
@@ -1062,6 +1124,7 @@ async fn fetch_and_detect(
                     rpc_elapsed_ms,
                     "scanner: getTransaction succeeded — transaction found"
                 );
+                log_raw_transaction_response_shape(signature, &tx);
                 confirmed = Some(tx);
                 break;
             }
