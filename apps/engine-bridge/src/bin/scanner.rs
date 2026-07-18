@@ -396,12 +396,77 @@ const MAX_CONCURRENT_LOOKUPS: usize = 8;
 const GET_TRANSACTION_RETRIES: u32 = 5;
 const GET_TRANSACTION_RETRY_DELAY: Duration = Duration::from_millis(400);
 
+/// `MAX_CONCURRENT_LOOKUPS` bounds how many `getTransaction` calls can be
+/// *in flight* at once, but says nothing about *rate* — 8 short-lived
+/// requests completing and immediately being replaced by 8 more can easily
+/// sustain triple digits of requests per second once PumpFun/PumpSwap/
+/// Raydium Launchpad's real mainnet-wide volume (every trade on any of
+/// those programs, not just tokens this deployment cares about) is
+/// flowing through `logsSubscribe`, each with up to
+/// `GET_TRANSACTION_RETRIES` attempts. Most providers — Chainstack
+/// included — meter HTTP and WSS requests against the *same* per-API-key
+/// budget, so a `getTransaction` flood exhausting that budget doesn't just
+/// throttle itself: it also starves out the `logsSubscribe` reconnect
+/// attempts below, which is what actually surfaces as "logsSubscribe
+/// failed: RPS limit" even though `getTransaction` is the real source of
+/// the load. This caps *dispatch rate*, independent of concurrency, so the
+/// scanner stays under whatever the plan actually allows. Override via
+/// `SCANNER_MAX_RPC_RPS` — default is deliberately conservative (well
+/// under a typical 250 RPS plan) to leave headroom for the initial
+/// `logsSubscribe` calls and any other consumer of the same API key (e.g.
+/// apps/api's own RPC usage, if it shares a Chainstack project).
+const DEFAULT_MAX_RPC_RPS: usize = 100;
+
+/// A token bucket refilled once per second, capped at its own capacity —
+/// not a sliding window, just "at most N acquisitions worth of budget
+/// available in any given second, unused budget doesn't roll over." Good
+/// enough to keep this scanner's own request rate under a provider's
+/// limit without pulling in a rate-limiting crate for one call site.
+struct RateLimiter {
+    semaphore: Arc<Semaphore>,
+}
+
+impl RateLimiter {
+    fn new(permits_per_second: usize) -> Arc<Self> {
+        let semaphore = Arc::new(Semaphore::new(permits_per_second));
+        let refill_target = semaphore.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let available = refill_target.available_permits();
+                if available < permits_per_second {
+                    refill_target.add_permits(permits_per_second - available);
+                }
+            }
+        });
+        Arc::new(Self { semaphore })
+    }
+
+    /// Waits for budget, then consumes it — the permit is deliberately
+    /// never returned; the refill task above is what replenishes the
+    /// bucket, not the caller finishing its request.
+    async fn acquire(&self) {
+        if let Ok(permit) = self.semaphore.clone().acquire_owned().await {
+            permit.forget();
+        }
+    }
+}
+
 /// Runs one `logsSubscribe` per watched program (Solana's reference RPC
 /// implementation's `mentions` filter only ever reliably supports a single
 /// address per subscription — most providers, Chainstack included, follow
 /// that same reference behavior) plus a bounded pool of `getTransaction`
 /// follow-ups. See this file's module doc comment for the latency/quota
 /// tradeoffs versus `run_yellowstone` above.
+const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(5);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+/// A connection that stays up at least this long is treated as a real
+/// success — its next failure starts the backoff over from
+/// `RECONNECT_BASE_DELAY` — rather than an instant-fail that should keep
+/// backing off from wherever it left off.
+const RECONNECT_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
+
 async fn run_rpc_websocket(
     rpc_http: String,
     solana_ws_url: String,
@@ -409,6 +474,14 @@ async fn run_rpc_websocket(
 ) -> anyhow::Result<()> {
     let rpc_client = Arc::new(RpcClient::new(rpc_http));
     let lookup_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_LOOKUPS));
+    let max_rpc_rps = env_opt("SCANNER_MAX_RPC_RPS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_RPC_RPS);
+    let rate_limiter = RateLimiter::new(max_rpc_rps);
+    tracing::info!(
+        max_rpc_rps,
+        "scanner: getTransaction dispatch capped at this rate"
+    );
 
     let mut handles = Vec::new();
     for program in watched_programs() {
@@ -416,25 +489,36 @@ async fn run_rpc_websocket(
         let rpc_client = rpc_client.clone();
         let redis_conn = redis_conn.clone();
         let lookup_limiter = lookup_limiter.clone();
+        let rate_limiter = rate_limiter.clone();
 
         handles.push(tokio::spawn(async move {
+            let mut backoff = RECONNECT_BASE_DELAY;
             loop {
+                let attempt_started = tokio::time::Instant::now();
                 if let Err(e) = watch_program_logs(
                     &solana_ws_url,
                     &program,
                     rpc_client.clone(),
                     redis_conn.clone(),
                     lookup_limiter.clone(),
+                    rate_limiter.clone(),
                 )
                 .await
                 {
                     tracing::warn!(
                         error = %e,
                         program = %program,
-                        "scanner: logsSubscribe stream for this program ended, reconnecting in 5s"
+                        delay_secs = backoff.as_secs(),
+                        "scanner: logsSubscribe stream for this program ended, reconnecting"
                     );
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                tokio::time::sleep(backoff).await;
+                backoff = if attempt_started.elapsed() >= RECONNECT_HEALTHY_UPTIME {
+                    RECONNECT_BASE_DELAY
+                } else {
+                    (backoff * 2).min(RECONNECT_MAX_DELAY)
+                };
             }
         }));
     }
@@ -457,6 +541,7 @@ async fn watch_program_logs(
     rpc_client: Arc<RpcClient>,
     redis_conn: RedisConn,
     lookup_limiter: Arc<Semaphore>,
+    rate_limiter: Arc<RateLimiter>,
 ) -> anyhow::Result<()> {
     // PubsubClientError's ConnectionError/WsError variants wrap the real
     // tokio-tungstenite error (DNS, TLS, a non-101 HTTP response i.e.
@@ -519,11 +604,12 @@ async fn watch_program_logs(
         let rpc_client = rpc_client.clone();
         let redis_conn = redis_conn.clone();
         let lookup_limiter = lookup_limiter.clone();
+        let rate_limiter = rate_limiter.clone();
         tokio::spawn(async move {
             let Ok(_permit) = lookup_limiter.acquire().await else {
                 return;
             };
-            if let Some(tick) = fetch_and_detect(&rpc_client, signature).await {
+            if let Some(tick) = fetch_and_detect(&rpc_client, signature, &rate_limiter).await {
                 publish_tick(&redis_conn, tick).await;
             }
         });
@@ -535,8 +621,14 @@ async fn watch_program_logs(
 /// Fetches the full transaction via `getTransaction` (retrying through the
 /// normal confirm delay — see `GET_TRANSACTION_RETRIES`'s doc comment),
 /// then runs it through the exact same `detect_trade` pipeline Yellowstone
-/// mode uses.
-async fn fetch_and_detect(rpc_client: &RpcClient, signature: Signature) -> Option<ScannerTick> {
+/// mode uses. Every attempt — including retries — goes through
+/// `rate_limiter` first: a signature that needs all 5 attempts to confirm
+/// would otherwise burst 5 requests regardless of the configured RPS cap.
+async fn fetch_and_detect(
+    rpc_client: &RpcClient,
+    signature: Signature,
+    rate_limiter: &RateLimiter,
+) -> Option<ScannerTick> {
     let mut confirmed: Option<EncodedConfirmedTransactionWithStatusMeta> = None;
     for attempt in 0..GET_TRANSACTION_RETRIES {
         let config = RpcTransactionConfig {
@@ -544,6 +636,7 @@ async fn fetch_and_detect(rpc_client: &RpcClient, signature: Signature) -> Optio
             commitment: Some(CommitmentConfig::confirmed()),
             max_supported_transaction_version: Some(0),
         };
+        rate_limiter.acquire().await;
         match rpc_client
             .get_transaction_with_config(&signature, config)
             .await
