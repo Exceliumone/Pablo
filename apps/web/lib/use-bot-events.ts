@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { BotEventDto } from "@pablo/shared-types";
+import type { BotEventDto, TradeDto, TradesPageDto } from "@pablo/shared-types";
+import { apiFetch } from "./api";
 
 const MAX_EVENTS = 100;
 
@@ -9,6 +10,28 @@ function wsUrl(accessToken: string): string {
   const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
   const wsBase = apiUrl.replace(/^http/, "ws");
   return `${wsBase}/ws?token=${encodeURIComponent(accessToken)}`;
+}
+
+/** Redis pub/sub (what the WS gateway relays live) has no history —
+ * opportunity/status events really are gone once missed, by design (see
+ * event-persister.ts's doc comment: "high-frequency and disposable, not
+ * history"). Trades ARE durably persisted, though, so a page refresh
+ * doesn't have to lose those: reconstruct synthetic trade events from
+ * GET /trades to reseed the feed on mount. */
+function tradeToBotEvent(t: TradeDto): Extract<BotEventDto, { type: "trade" }> {
+  return {
+    type: "trade",
+    userId: "",
+    side: t.side,
+    mint: t.tokenMint,
+    dex: t.protocol,
+    priceSol: t.priceSol,
+    amountSol: t.amountSol,
+    amountToken: t.amountToken,
+    txSignature: t.txSignature,
+    reason: t.reason,
+    at: t.createdAt,
+  };
 }
 
 /** Live feed of this user's bot events (opportunity/trade/status/error),
@@ -19,6 +42,38 @@ export function useBotEvents(accessToken: string | null) {
   const [events, setEvents] = useState<BotEventDto[]>([]);
   const [connected, setConnected] = useState(false);
   const retryRef = useRef(0);
+
+  useEffect(() => {
+    if (!accessToken) return;
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const page = await apiFetch<TradesPageDto>(`/trades?limit=${MAX_EVENTS}`, { accessToken });
+        if (cancelled) return;
+        const seeded = page.trades.map(tradeToBotEvent);
+        setEvents((prev) => {
+          // Anything already live (arrived while this fetch was in flight)
+          // takes priority over its own persisted copy.
+          const seenSignatures = new Set(
+            prev
+              .filter((e): e is Extract<BotEventDto, { type: "trade" }> => e.type === "trade")
+              .map((e) => e.txSignature)
+              .filter((sig): sig is string => sig !== null),
+          );
+          const rest = seeded.filter((e) => !e.txSignature || !seenSignatures.has(e.txSignature));
+          return [...prev, ...rest].slice(0, MAX_EVENTS);
+        });
+      } catch {
+        // Best-effort seed only — a failed fetch just leaves the feed
+        // empty until live events arrive, same as before this existed.
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken]);
 
   useEffect(() => {
     if (!accessToken) return;
