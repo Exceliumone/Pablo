@@ -38,7 +38,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anchor_client::solana_sdk::signature::Keypair;
+use anchor_client::solana_sdk::signature::{Keypair, Signer};
 use engine_bridge::contract::{
     BotEvent, BotStatus, ExecutorStartPayload, ScannerTick, TradeSide, SCANNER_TICKS_STREAM,
 };
@@ -427,11 +427,23 @@ async fn main() -> anyhow::Result<()> {
                 .await;
 
                 let protocol = protocol_from_dex(&trade_info.dex_type);
+                tracing::info!(
+                    %user_id,
+                    mint = %tick.mint,
+                    dex = %tick.dex_type,
+                    protocol = ?protocol,
+                    price_sol = tick.price as f64 / 1_000_000_000.0,
+                    source_signature = %tick.signature,
+                    trader = ?tick.trader,
+                    amount_sol = swap_config.amount_in,
+                    slippage_bps = swap_config.slippage,
+                    "executor: STEP 1: Event received — dispatching buy attempt to engine::execute_buy"
+                );
                 match solana_vntr_sniper::processor::sniper_bot::execute_buy(
                     trade_info.clone(),
                     app_state.clone(),
                     swap_config.clone(),
-                    protocol,
+                    protocol.clone(),
                 )
                 .await
                 {
@@ -476,12 +488,35 @@ async fn main() -> anyhow::Result<()> {
                         // published unconditionally just above, before this
                         // attempt) with no trade and no explanation ever
                         // following it.
-                        tracing::warn!(error = %e, mint = %tick.mint, "executor: buy failed");
+                        // engine::execute_buy's own STEP 2-9 logs (relayed
+                        // via this process's stdout, see main.rs's
+                        // spawn_executor) carry the step-by-step detail;
+                        // this is the final outcome plus the context needed
+                        // to reproduce it (wallet, RPC, amount) without
+                        // having to go dig those logs up.
+                        let wallet_pubkey = app_state
+                            .wallet
+                            .try_pubkey()
+                            .map(|pk| pk.to_string())
+                            .unwrap_or_else(|_| "<unavailable>".to_string());
+                        tracing::warn!(
+                            error = %e,
+                            mint = %tick.mint,
+                            protocol = ?protocol,
+                            wallet = %wallet_pubkey,
+                            rpc_http = %payload.rpc_http,
+                            amount_sol = swap_config.amount_in,
+                            slippage_bps = swap_config.slippage,
+                            "executor: buy failed"
+                        );
                         publish_event(
                             &mut event_conn,
                             &BotEvent::Error {
                                 user_id: user_id.clone(),
-                                message: format!("buy failed for {}: {e}", tick.mint),
+                                message: format!(
+                                    "buy failed for {} (protocol={:?}, wallet={}, amount_sol={}): {e}",
+                                    tick.mint, protocol, wallet_pubkey, swap_config.amount_in
+                                ),
                                 at: now_iso(),
                             },
                         )

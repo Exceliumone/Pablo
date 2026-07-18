@@ -70,14 +70,14 @@ pub async fn new_signed_and_send_zeroslot(
     let tip_account = zeroslot::get_tip_account()?;
     let start_time = Instant::now();
     let mut txs: Vec<String> = vec![];
-    
+
     // zeroslot tip, the upper limit is 0.1
     let tip = zeroslot::get_tip_value().await?;
     let tip_lamports = ui_amount_to_amount(tip, spl_token::native_mint::DECIMALS);
 
-    let zeroslot_tip_instruction = 
+    let zeroslot_tip_instruction =
         system_instruction::transfer(&keypair.pubkey(), &tip_account, tip_lamports);
-        
+
         let unit_limit = get_unit_limit(); // TODO: update in mev boost
         let unit_price = get_unit_price(); // TODO: update in mev boost
         let modify_compute_units =
@@ -86,8 +86,14 @@ pub async fn new_signed_and_send_zeroslot(
         solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(unit_price);
         instructions.insert(1, modify_compute_units);
         instructions.insert(2, add_priority_fee);
-        
+
         instructions.push(zeroslot_tip_instruction); // zeroslot is different with others.
+
+    logger.log(format!(
+        "STEP 5: Transaction built — {} instruction(s), payer={}, blockhash={}, tip_lamports={}, unit_limit={}, unit_price={}",
+        instructions.len(), keypair.pubkey(), recent_blockhash, tip_lamports, unit_limit, unit_price
+    ).cyan().to_string());
+
     // send init tx
     let txn = Transaction::new_signed_with_payer(
         &instructions,
@@ -96,20 +102,34 @@ pub async fn new_signed_and_send_zeroslot(
         recent_blockhash,
     );
 
+    logger.log(format!("STEP 6: Transaction signed — signer={}", keypair.pubkey()).cyan().to_string());
+
+    logger.log(format!(
+        "STEP 7: Transaction submitted — target=zeroslot, tip_account={}", tip_account
+    ).cyan().to_string());
     let tx_result = zeroslot_rpc_client.send_transaction(&txn).await;
-    
+
     match tx_result {
         Ok(signature) => {
             txs.push(signature.to_string());
             logger.log(
-                format!("[TXN-ELAPSED(ZEROSLOT)]: {:?}", start_time.elapsed())
+                format!("STEP 8: Signature returned — {} ([TXN-ELAPSED(ZEROSLOT)]: {:?})", signature, start_time.elapsed())
                     .yellow()
                     .to_string(),
             );
         }
-        Err(_) => {
-            // Convert the error to a Send-compatible form
-            return Err(anyhow::anyhow!("zeroslot send_transaction failed"));
+        Err(e) => {
+            // Previously this was `Err(_) => anyhow!("zeroslot send_transaction failed")`
+            // — the real error (insufficient balance, invalid account, RPC rejection, ...)
+            // was discarded and replaced with a fixed generic string, so every submission
+            // failure looked identical regardless of cause. Preserving `e`'s Debug output
+            // is an observability-only change: return type, control flow, and retry
+            // behavior (inside zeroslot_rpc_client.send_transaction itself) are unchanged.
+            logger.log(format!(
+                "STEP 7/8: Transaction submission FAILED — full error: {:?} (payer={}, blockhash={}, instruction_count={}, tip_account={})",
+                e, keypair.pubkey(), recent_blockhash, instructions.len(), tip_account
+            ).red().to_string());
+            return Err(anyhow::anyhow!("zeroslot send_transaction failed: {e:?}"));
         }
     };
 

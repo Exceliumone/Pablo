@@ -646,12 +646,13 @@ async fn verify_transaction(
     app_state: Arc<AppState>,
     logger: &Logger,
 ) -> Result<bool, String> {
+    logger.log(format!("STEP 9: Awaiting confirmation for {}", signature_str).cyan().to_string());
     // Parse signature
     let signature = match Signature::from_str(signature_str) {
         Ok(sig) => sig,
         Err(e) => return Err(format!("Invalid signature: {}", e)),
     };
-    
+
     // Verify transaction success with retries
     let max_retries = 5;
     for retry in 0..max_retries {
@@ -662,14 +663,22 @@ async fn verify_transaction(
                     if let Some(status) = status_opt {
                         if status.err.is_some() {
                             // Transaction failed
+                            logger.log(format!(
+                                "STEP 9: Confirmation received — transaction FAILED on-chain: {:?} (signature={})",
+                                status.err, signature_str
+                            ).red().to_string());
                             return Err(format!("Transaction failed: {:?}", status.err));
                         } else if let Some(conf_status) = &status.confirmation_status {
-                            if matches!(conf_status, TransactionConfirmationStatus::Finalized | 
+                            if matches!(conf_status, TransactionConfirmationStatus::Finalized |
                                                       TransactionConfirmationStatus::Confirmed) {
+                                logger.log(format!(
+                                    "STEP 9: Confirmation received — {:?} (signature={})",
+                                    conf_status, signature_str
+                                ).green().to_string());
                                 return Ok(true);
                             } else {
-                                logger.log(format!("Transaction not yet confirmed (status: {:?}), retrying...", 
-                                         conf_status).yellow().to_string());
+                                logger.log(format!("Transaction not yet confirmed (status: {:?}), retrying... (attempt {}/{})",
+                                         conf_status, retry + 1, max_retries).yellow().to_string());
                             }
                         } else {
                         }
@@ -678,18 +687,22 @@ async fn verify_transaction(
                 }
             },
             Err(e) => {
-                logger.log(format!("Failed to get transaction status: {}, retrying...", e).red().to_string());
+                logger.log(format!("Failed to get transaction status: {}, retrying... (attempt {}/{})", e, retry + 1, max_retries).red().to_string());
             }
         }
-        
+
         if retry < max_retries - 1 {
             // Wait before retrying
             sleep(Duration::from_millis(500)).await;
         } else {
+            logger.log(format!(
+                "STEP 9: Confirmation received — TIMED OUT after {} retries (~{}ms) for {}",
+                max_retries, max_retries * 500, signature_str
+            ).red().to_string());
             return Err("Transaction verification timed out".to_string());
         }
     }
-    
+
     // If we get here, verification failed
     Err("Transaction verification failed after retries".to_string())
 }
@@ -866,30 +879,47 @@ pub async fn execute_buy(
         },
         SwapProtocol::PumpSwap => {
             logger.log("Using PumpSwap protocol for buy".to_string());
-            
+            logger.log(format!(
+                "STEP 2: Build instruction — mint={}, pool_id={}, coin_creator={:?}, amount_in_sol={}, slippage_bps={}",
+                trade_info.mint, trade_info.pool_id, trade_info.coin_creator, buy_config.amount_in, buy_config.slippage
+            ).cyan().to_string());
+
             // Create the PumpSwap instance
             let pump_swap = crate::dex::pump_swap::PumpSwap::new(
                 app_state.wallet.clone(),
                 Some(app_state.rpc_client.clone()),
                 Some(app_state.rpc_nonblocking_client.clone()),
             );
-            
+
             // Build swap instructions from parsed data for buy
             match pump_swap.build_swap_from_parsed_data(&trade_info, buy_config.clone()).await {
                 Ok((keypair, instructions, price)) => {
-                    logger.log(format!("Generated PumpSwap buy instruction at price: {}", price));
+                    logger.log(format!(
+                        "STEP 2: Build instruction — OK ({} instruction(s), price={})",
+                        instructions.len(), price
+                    ).green().to_string());
                     logger.log(format!("copy transaction {}", trade_info.signature));
-                    
+
                     // Get real-time blockhash from processor
+                    logger.log("STEP 3: Request latest blockhash (from cached BlockhashProcessor)".cyan().to_string());
                     let recent_blockhash = match crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                        Some(hash) => hash,
+                        Some(hash) => {
+                            logger.log(format!("STEP 4: Blockhash received — {}", hash).green().to_string());
+                            hash
+                        }
                         None => {
-                            logger.log("Failed to get real-time blockhash, skipping transaction".red().to_string());
-                            return Err("Failed to get real-time blockhash".to_string());
+                            logger.log(
+                                "STEP 4: Blockhash received — FAILED (BlockhashProcessor's cache is empty or \
+                                 older than BLOCKHASH_STALENESS_THRESHOLD; either start() was never called in \
+                                 this process, or its background refresh loop hasn't succeeded recently — see \
+                                 engine/src/library/blockhash_processor.rs)".red().to_string(),
+                            );
+                            return Err("STEP 4 FAILED: no cached blockhash available (BlockhashProcessor cache empty/stale)".to_string());
                         }
                     };
 
                     println!("using zeroslot for buy transaction >>>>>>>>");
+                    let instruction_count = instructions.len();
                     // Execute the transaction using zeroslot for buying
                     match crate::block_engine::tx::new_signed_and_send_zeroslot(
                         app_state.zeroslot_rpc_client.clone(),
@@ -900,18 +930,19 @@ pub async fn execute_buy(
                     ).await {
                         Ok(signatures) => {
                             if signatures.is_empty() {
+                                logger.log("STEP 8: Signature returned — FAILED (zeroslot returned an empty signature list)".red().to_string());
                                 return Err("No transaction signature returned".to_string());
                             }
-                            
+
                             let signature = &signatures[0];
                             logger.log(format!("Buy transaction sent: {}", signature));
-                            
+
                             // Verify transaction
                             match verify_transaction(&signature.to_string(), app_state.clone(), &logger).await {
                                 Ok(verified) => {
                                     if verified {
                                         logger.log("Buy transaction verified successfully".to_string());
-                                        
+
                                         // Add token account to our global list and tracking
                                         if let Ok(wallet_pubkey) = app_state.wallet.try_pubkey() {
                                             let token_mint = Pubkey::from_str(&trade_info.mint)
@@ -919,7 +950,7 @@ pub async fn execute_buy(
                                             let token_ata = get_associated_token_address(&wallet_pubkey, &token_mint);
                                             WALLET_TOKEN_ACCOUNTS.insert(token_ata);
                                             logger.log(format!("Added token account {} to global list", token_ata));
-                                            
+
                                             // Add to enhanced tracking system for PumpSwap
                                             let bought_token_info = BoughtTokenInfo::new(
                                                 trade_info.mint.clone(),
@@ -932,7 +963,7 @@ pub async fn execute_buy(
                                             );
                                             BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
                                             logger.log(format!("Added {} to enhanced tracking system (PumpSwap)", trade_info.mint));
-                                            
+
                                             // Add to permanent blacklist (never rebuy this token)
                                             let timestamp = std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
@@ -940,7 +971,7 @@ pub async fn execute_buy(
                                                 .as_secs();
                                             BOUGHT_TOKENS_BLACKLIST.insert(trade_info.mint.clone(), timestamp);
                                             logger.log(format!("🚫 Added {} to permanent blacklist", trade_info.mint));
-                                            
+
                                             // CRITICAL FIX: Update selling strategy with actual token balance after successful buy
                                             let selling_engine = crate::processor::selling_strategy::SellingEngine::new(
                                                 app_state.clone(),
@@ -951,7 +982,7 @@ pub async fn execute_buy(
                                                 logger.log(format!("Warning: Failed to update token metrics after buy: {}", e).yellow().to_string());
                                             }
                                         }
-                                        
+
                                         Ok(())
                                     } else {
                                         Err("Buy transaction verification failed".to_string())
@@ -963,12 +994,24 @@ pub async fn execute_buy(
                             }
                         },
                         Err(e) => {
-                            Err(format!("Transaction error: {}", e))
+                            logger.log(format!(
+                                "STEP 7/8: Transaction submission FAILED — full error: {:?} (mint={}, wallet={}, blockhash={}, instruction_count={})",
+                                e,
+                                trade_info.mint,
+                                app_state.wallet.try_pubkey().map(|pk| pk.to_string()).unwrap_or_else(|_| "<unavailable>".to_string()),
+                                recent_blockhash,
+                                instruction_count
+                            ).red().to_string());
+                            Err(format!("Transaction error: {:#}", e))
                         },
                     }
                 },
                 Err(e) => {
-                    Err(format!("Failed to build PumpSwap buy instruction: {}", e))
+                    logger.log(format!(
+                        "STEP 2: Build instruction — FAILED: {:#} (mint={}, pool_id={}, amount_in_sol={})",
+                        e, trade_info.mint, trade_info.pool_id, buy_config.amount_in
+                    ).red().to_string());
+                    Err(format!("Failed to build PumpSwap buy instruction: {:#}", e))
                 },
             }
         },
