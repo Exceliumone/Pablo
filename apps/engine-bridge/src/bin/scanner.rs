@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine_bridge::contract::{ScannerTick, SCANNER_TICKS_STREAM};
+use futures_util::stream::select_all;
 use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
 use solana_client::nonblocking::pubsub_client::PubsubClient;
@@ -645,61 +646,59 @@ async fn run_rpc_websocket(
         "scanner: getTransaction dispatch capped at this rate"
     );
 
-    let mut handles = Vec::new();
-    for program in watched_programs() {
-        let solana_ws_url = solana_ws_url.clone();
-        let rpc_client = rpc_client.clone();
-        let redis_conn = redis_conn.clone();
-        let lookup_limiter = lookup_limiter.clone();
-        let rate_limiter = rate_limiter.clone();
+    // One WebSocket connection, all 3 watched-program subscriptions
+    // multiplexed over it — `PubsubClient::logs_subscribe` takes `&self`
+    // specifically so multiple subscriptions CAN share one connection; the
+    // previous version of this file missed that and opened one
+    // `PubsubClient` (i.e. one full TCP+TLS+WS handshake) per program,
+    // tripling both the connection count and the number of simultaneous
+    // `logsSubscribe` requests fired at startup for no reason — 3 requests
+    // landing in the same instant is a much easier way to trip a
+    // provider's short-window burst limiter than 3 requests spread out
+    // even by a few tens of milliseconds, and that kind of burst limit
+    // wouldn't show up as a sustained RPS violation on a dashboard at all.
+    let mut backoff = RECONNECT_BASE_DELAY;
+    loop {
+        let attempt_started = tokio::time::Instant::now();
+        if let Err(e) = watch_all_programs(
+            &solana_ws_url,
+            rpc_client.clone(),
+            redis_conn.clone(),
+            lookup_limiter.clone(),
+            rate_limiter.clone(),
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                delay_secs = backoff.as_secs(),
+                "scanner: logsSubscribe stream(s) ended, reconnecting"
+            );
+        }
 
-        handles.push(tokio::spawn(async move {
-            let mut backoff = RECONNECT_BASE_DELAY;
-            loop {
-                let attempt_started = tokio::time::Instant::now();
-                if let Err(e) = watch_program_logs(
-                    &solana_ws_url,
-                    &program,
-                    rpc_client.clone(),
-                    redis_conn.clone(),
-                    lookup_limiter.clone(),
-                    rate_limiter.clone(),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        program = %program,
-                        delay_secs = backoff.as_secs(),
-                        "scanner: logsSubscribe stream for this program ended, reconnecting"
-                    );
-                }
-
-                tokio::time::sleep(backoff + Duration::from_millis(jitter_ms(1000))).await;
-                backoff = if attempt_started.elapsed() >= RECONNECT_HEALTHY_UPTIME {
-                    RECONNECT_BASE_DELAY
-                } else {
-                    (backoff * 2).min(RECONNECT_MAX_DELAY)
-                };
-            }
-        }));
+        tokio::time::sleep(backoff + Duration::from_millis(jitter_ms(1000))).await;
+        backoff = if attempt_started.elapsed() >= RECONNECT_HEALTHY_UPTIME {
+            RECONNECT_BASE_DELAY
+        } else {
+            (backoff * 2).min(RECONNECT_MAX_DELAY)
+        };
     }
-
-    tracing::info!(
-        "scanner: subscribed (development mode), watching PumpFun / PumpSwap / Raydium Launchpad"
-    );
-    futures_util::future::join_all(handles).await;
-    Ok(())
 }
 
-/// One `logsSubscribe` subscription for a single program. Runs until the
-/// stream ends or errors, then returns — `run_rpc_websocket`'s caller loop
-/// reconnects it. Each detected (non-failed) log spawns its own bounded
+/// Opens exactly one `PubsubClient` (one WebSocket connection) and issues
+/// one `logsSubscribe` per watched program on it (Solana's reference RPC
+/// implementation's `mentions` filter only ever reliably supports a single
+/// address per subscription — most providers, Chainstack included, follow
+/// that same reference behavior, so 3 separate subscribe calls are still
+/// required; only the underlying connection is shared). The 3 resulting
+/// notification streams are merged into one so a single loop handles all
+/// of them. Runs until the connection ends or errors, then returns —
+/// `run_rpc_websocket`'s caller loop reconnects (and resubscribes all 3)
+/// from scratch. Each detected (non-failed) log spawns its own bounded
 /// `getTransaction` + parse + publish task so one slow lookup can't stall
 /// the next log notification from being received.
-async fn watch_program_logs(
+async fn watch_all_programs(
     solana_ws_url: &str,
-    program: &str,
     rpc_client: Arc<RpcClient>,
     redis_conn: RedisConn,
     lookup_limiter: Arc<Semaphore>,
@@ -717,18 +716,12 @@ async fn watch_program_logs(
     // #[derive(Debug)] doesn't care about thiserror's chain wiring — right
     // here, before it's converted to anyhow for this function's own
     // control flow.
-    // Both of these count toward the same per-API-key RPS budget
-    // `getTransaction` does (see `RateLimiter`'s doc comment) — gating them
-    // through it too means the scanner's OWN request rate can never be
-    // what tips the account over the limit, regardless of how much of the
-    // budget getTransaction's fan-out is separately consuming.
     rate_limiter.acquire().await;
     let pubsub = match PubsubClient::new(solana_ws_url).await {
         Ok(client) => client,
         Err(e) => {
             tracing::error!(
                 url = %solana_ws_url,
-                program = %program,
                 error_display = %e,
                 error_debug = ?e,
                 "scanner: PubsubClient::new failed — error_debug has the real cause \
@@ -739,30 +732,42 @@ async fn watch_program_logs(
         }
     };
 
-    rate_limiter.acquire().await;
-    let (mut stream, _unsubscribe) = match pubsub
-        .logs_subscribe(
-            RpcTransactionLogsFilter::Mentions(vec![program.to_string()]),
-            RpcTransactionLogsConfig {
-                commitment: Some(CommitmentConfig::processed()),
-            },
-        )
-        .await
-    {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::error!(
-                url = %solana_ws_url,
-                program = %program,
-                error_display = %e,
-                error_debug = ?e,
-                "scanner: logs_subscribe failed — see error_debug for the real cause"
-            );
-            anyhow::bail!("logs_subscribe failed: {e}");
+    let mut tagged_streams = Vec::new();
+    for program in watched_programs() {
+        // Each of the 3 calls is its own JSON-RPC request over the ONE
+        // connection above — still rate-limited individually, since the
+        // provider counts them as 3 requests regardless of the shared
+        // socket.
+        rate_limiter.acquire().await;
+        let subscribe_result = pubsub
+            .logs_subscribe(
+                RpcTransactionLogsFilter::Mentions(vec![program.clone()]),
+                RpcTransactionLogsConfig {
+                    commitment: Some(CommitmentConfig::processed()),
+                },
+            )
+            .await;
+        match subscribe_result {
+            Ok((stream, _unsubscribe)) => {
+                let tagged = stream.map(move |update| (program.clone(), update));
+                tagged_streams.push(tagged.boxed());
+            }
+            Err(e) => {
+                tracing::error!(
+                    url = %solana_ws_url,
+                    program = %program,
+                    error_display = %e,
+                    error_debug = ?e,
+                    "scanner: logs_subscribe failed — see error_debug for the real cause"
+                );
+                anyhow::bail!("logs_subscribe failed for {program}: {e}");
+            }
         }
-    };
+    }
 
-    while let Some(update) = stream.next().await {
+    let mut merged = select_all(tagged_streams);
+
+    while let Some((program, update)) = merged.next().await {
         tracing::debug!(
             program = %program,
             signature = %update.value.signature,
@@ -807,7 +812,7 @@ async fn watch_program_logs(
         });
     }
 
-    anyhow::bail!("logs_subscribe stream closed")
+    anyhow::bail!("logs_subscribe stream(s) closed")
 }
 
 /// Fetches the full transaction via `getTransaction` (retrying through the
