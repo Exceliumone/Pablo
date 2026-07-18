@@ -45,7 +45,7 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use engine_bridge::contract::{ScannerTick, SCANNER_TICKS_STREAM};
 use futures_util::stream::select_all;
@@ -330,6 +330,12 @@ fn to_scanner_tick(parsed: &TradeInfoFromToken, trader: Option<String>) -> Scann
 }
 
 async fn publish_tick(redis_conn: &RedisConn, tick: ScannerTick) {
+    tracing::debug!(
+        signature = %tick.signature,
+        mint = %tick.mint,
+        is_buy = tick.is_buy,
+        "scanner: publishing copy-trade event"
+    );
     let Ok(payload) = serde_json::to_string(&tick) else {
         tracing::warn!(signature = %tick.signature, "scanner: failed to serialize tick, dropping");
         return;
@@ -847,12 +853,54 @@ async fn watch_all_programs(
         let redis_conn = redis_conn.clone();
         let lookup_limiter = lookup_limiter.clone();
         let rate_limiter = rate_limiter.clone();
-        tokio::spawn(async move {
+        let lookup_handle = tokio::spawn(async move {
             let Ok(_permit) = lookup_limiter.acquire().await else {
+                tracing::warn!(
+                    %signature,
+                    "scanner: lookup_limiter semaphore was closed, dropping this signature \
+                     without a getTransaction attempt"
+                );
                 return;
             };
-            if let Some(tick) = fetch_and_detect(&rpc_client, signature, &rate_limiter).await {
-                publish_tick(&redis_conn, tick).await;
+            match fetch_and_detect(&rpc_client, signature, &rate_limiter).await {
+                Some(tick) => publish_tick(&redis_conn, tick).await,
+                None => {
+                    tracing::debug!(
+                        %signature,
+                        "scanner: fetch_and_detect produced no tick — see its own REJECTED log \
+                         above for the exact reason; nothing to publish for this signature"
+                    );
+                }
+            }
+        });
+        // A spawned task's panic is otherwise completely silent — nobody
+        // ever inspects `lookup_handle`'s result, so tokio just drops it.
+        // That's indistinguishable from this exact symptom report ("we see
+        // 'dispatching getTransaction lookup' and then literally nothing
+        // else, ever, ever again for this signature"): if anything in
+        // fetch_and_detect/detect_trade/publish_tick — including the
+        // untouched engine's own parse_transaction_data — ever panics
+        // (an unwrap, an out-of-bounds index, ...) instead of returning
+        // an error, this is the only way it would ever surface at all.
+        // Spawning a second, tiny task to await the first one's handle
+        // keeps this from blocking the notification loop above.
+        tokio::spawn(async move {
+            if let Err(join_error) = lookup_handle.await {
+                if join_error.is_panic() {
+                    tracing::error!(
+                        %signature,
+                        panic = %join_error,
+                        "scanner: PANIC in the getTransaction/parse/publish task for this \
+                         signature — this is why nothing was logged after \"dispatching \
+                         getTransaction lookup\"; the panic itself was otherwise silent"
+                    );
+                } else {
+                    tracing::error!(
+                        %signature,
+                        error = %join_error,
+                        "scanner: getTransaction/parse/publish task ended abnormally (cancelled?)"
+                    );
+                }
             }
         });
     }
@@ -879,22 +927,45 @@ async fn fetch_and_detect(
             max_supported_transaction_version: Some(0),
         };
         rate_limiter.acquire().await;
-        tracing::debug!(%signature, attempt, "scanner: calling getTransaction");
-        match rpc_client
+        tracing::debug!("calling getTransaction for {signature}");
+        let rpc_call_started = Instant::now();
+        let rpc_result = rpc_client
             .get_transaction_with_config(&signature, config)
-            .await
-        {
+            .await;
+        let rpc_elapsed_ms = rpc_call_started.elapsed().as_millis();
+        match rpc_result {
             Ok(tx) => {
-                tracing::debug!(%signature, attempt, slot = tx.slot, "scanner: getTransaction succeeded");
+                tracing::debug!(
+                    %signature,
+                    attempt,
+                    slot = tx.slot,
+                    rpc_elapsed_ms,
+                    "scanner: getTransaction succeeded — transaction found"
+                );
                 confirmed = Some(tx);
                 break;
             }
             Err(e) if attempt + 1 < GET_TRANSACTION_RETRIES => {
-                tracing::debug!(error = %e, %signature, attempt, "scanner: getTransaction not ready yet, retrying");
+                tracing::debug!(
+                    error_display = %e,
+                    error_debug = ?e,
+                    %signature,
+                    attempt,
+                    rpc_elapsed_ms,
+                    "scanner: getTransaction not ready yet, retrying"
+                );
                 tokio::time::sleep(GET_TRANSACTION_RETRY_DELAY).await;
             }
             Err(e) => {
-                tracing::warn!(error = %e, %signature, "scanner: getTransaction failed, giving up on this signature");
+                tracing::warn!(
+                    error_display = %e,
+                    error_debug = ?e,
+                    %signature,
+                    attempt,
+                    rpc_elapsed_ms,
+                    "scanner: getTransaction failed, giving up on this signature — full RPC \
+                     error above (error_debug), not just its Display summary"
+                );
             }
         }
     }
@@ -909,6 +980,7 @@ async fn fetch_and_detect(
     };
 
     let signature_str = signature.to_string();
+    tracing::debug!(%signature, "scanner: starting transaction parser");
     let Some(txn) = to_synthetic_subscribe_update(confirmed, &signature_str) else {
         tracing::debug!(
             %signature,
