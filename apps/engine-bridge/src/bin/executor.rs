@@ -13,26 +13,30 @@
 //! keyed by mint only, with no user dimension, so they'd corrupt across
 //! users inside a shared process — see docs/ARCHITECTURE.md.
 //!
-//! Two entry modes, chosen by `copy_trading_enabled` + a non-empty
-//! `copy_trading_targets`:
-//! - **Copy-trading**: only mints bought by a watched wallet are entered,
-//!   and a watched wallet's own sell is mirrored immediately (independent
-//!   of this position's own take-profit/stop-loss), matched via
-//!   `ScannerTick::trader` (the tx fee payer, extracted by the scanner —
-//!   see scanner.rs's `extract_trader_from_transaction`). This only ever
-//!   sees a target's trades from the moment this executor started
-//!   watching onward: there is no backfill of positions a target wallet
-//!   already held before that (would need `getSignaturesForAddress` +
-//!   historical parsing on startup — not implemented, since there's
-//!   nothing to mirror-buy for a position whose entry already happened).
-//! - **Generic sniper** (copy-trading disabled or no targets set): the
-//!   v1 heuristic — buy the first tick seen for any not-yet-held mint,
-//!   from any trader. Intentionally minimal (no honeypot/risk scoring
-//!   yet — that's Sniper page territory for a later phase).
-//! Either way, a held position's own take-profit/stop-loss/trailing-stop
-//! exit (via `SellingEngine`) always keeps running regardless of what the
-//! target wallet does next. Get this reviewed against real devnet activity
-//! before relying on it.
+//! **Copy-trading only** — by explicit product decision, there is no
+//! "generic sniper" fallback (buy any new token from any trader) anymore.
+//! Every entry requires a tick whose `ScannerTick::trader` (the tx fee
+//! payer, extracted by the scanner — see scanner.rs's
+//! `extract_trader_from_transaction`) is one of this user's own
+//! `copy_trading_targets`. A watched wallet's own sell is mirrored
+//! immediately (independent of this position's own take-profit/stop-loss).
+//! This only ever sees a target's trades from the moment this executor
+//! started watching onward: there is no backfill of positions a target
+//! wallet already held before that (would need `getSignaturesForAddress` +
+//! historical parsing on startup — not implemented, since there's nothing
+//! to mirror-buy for a position whose entry already happened). A held
+//! position's own take-profit/stop-loss/trailing-stop exit (via
+//! `SellingEngine`) always keeps running regardless of what the target
+//! wallet does next. Get this reviewed against real devnet activity before
+//! relying on it.
+//!
+//! The scanner itself only ever subscribes to this user's (and every other
+//! active user's) configured target wallets — never to PumpFun/PumpSwap/
+//! Raydium Launchpad program-wide activity — so every tick arriving on the
+//! shared `scanner:ticks` stream already comes from *some* user's target
+//! wallet; the `copy_trading_targets` check below is what scopes that down
+//! to *this* user's own targets specifically (the stream is shared across
+//! all users, their target lists usually aren't).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -272,9 +276,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         HashSet::new()
     };
-    let copy_trading_active = !copy_targets.is_empty();
-    if copy_trading_active {
-        tracing::info!(%user_id, target_count = copy_targets.len(), "executor: copy-trading mode — entries gated to watched wallets");
+    if copy_targets.is_empty() {
+        tracing::warn!(
+            %user_id,
+            "executor: no copy-trading target wallets configured (or copy-trading disabled) — \
+             this executor will never enter a new position; there is no generic-sniper fallback. \
+             Configure at least one target wallet to trade."
+        );
+    } else {
+        tracing::info!(%user_id, target_count = copy_targets.len(), targets = ?copy_targets, "executor: copy-trading — entries gated to these watched wallets");
     }
 
     // mint -> estimated token amount held, derived from amount_sol / price_sol
@@ -349,11 +359,10 @@ async fn main() -> anyhow::Result<()> {
 
                 let trade_info = tick_to_trade_info(&tick);
                 let is_held = held_positions.contains_key(&tick.mint);
-                let is_from_target_wallet = copy_trading_active
-                    && tick
-                        .trader
-                        .as_deref()
-                        .is_some_and(|t| copy_targets.contains(t));
+                let is_from_target_wallet = tick
+                    .trader
+                    .as_deref()
+                    .is_some_and(|t| copy_targets.contains(t));
 
                 // Copy-trading mode: mirror a watched wallet's own sell
                 // immediately, independent of this position's own
@@ -473,13 +482,14 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // Not held yet. In copy-trading mode, only mirror an entry
-                // when this tick is a watched wallet's own buy — everything
-                // else (other wallets trading the same mint) is deliberately
-                // ignored. Otherwise, the v1 heuristic is "buy the first
-                // tick seen for a new mint," from any trader. See the
-                // module doc comment.
-                if copy_trading_active && !(is_from_target_wallet && tick.is_buy) {
+                // Not held yet. Only ever mirror an entry when this tick is
+                // one of THIS user's own watched wallets' buys — no
+                // generic-sniper fallback (see module doc comment). The
+                // shared `scanner:ticks` stream carries every active
+                // user's target wallets' trades, so without this check a
+                // user would silently copy-trade wallets someone ELSE
+                // configured.
+                if !(is_from_target_wallet && tick.is_buy) {
                     continue;
                 }
 

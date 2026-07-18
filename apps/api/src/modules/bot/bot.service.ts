@@ -3,6 +3,7 @@ import { prisma } from "../../lib/prisma.js";
 import { env } from "../../config/env.js";
 import { startExecutor, stopExecutor, getExecutorStatus } from "../../lib/engine-bridge-client.js";
 import { decryptTradingWalletSecret, getOrCreateTradingWallet } from "../wallet/wallet.service.js";
+import { trackWalletsForUser, untrackWalletsForUser } from "../../lib/tracked-wallets.js";
 
 export class BotError extends Error {
   constructor(
@@ -104,6 +105,21 @@ export async function startBot(userId: string) {
 
   await prisma.botSettings.update({ where: { userId }, data: { isActive: true } });
 
+  // The scanner is a copy-trading wallet tracker, not a DEX-wide sniper
+  // feed (see apps/engine-bridge/src/bin/scanner.rs's module doc) — it
+  // only ever watches wallets registered here. Register this user's full,
+  // current target list (or nothing, if copy-trading is off) *before*
+  // spawning the executor, so the scanner has a chance to pick up the new
+  // wallet on its next tracked-wallet poll instead of racing the executor
+  // itself. Also re-run on every settings update applied to a running bot
+  // (updateBotSettings calls startBot again below) — this always fully
+  // replaces this user's previous set rather than merging into it, so a
+  // removed target wallet is correctly no longer tracked once this runs.
+  await trackWalletsForUser(
+    userId,
+    settings.copyTradingEnabled ? settings.copyTradingTargets : [],
+  );
+
   const status = await startExecutor({
     user_id: userId,
     wallet_secret_key_b58: secretKeyB58,
@@ -129,6 +145,7 @@ export async function startBot(userId: string) {
 
 export async function stopBot(userId: string) {
   await prisma.botSettings.updateMany({ where: { userId }, data: { isActive: false } });
+  await untrackWalletsForUser(userId);
   return stopExecutor(userId);
 }
 

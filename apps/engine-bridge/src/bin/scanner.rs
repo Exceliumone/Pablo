@@ -1,28 +1,37 @@
-//! The shared, singleton detection process. Exactly one instance ever runs
+//! The shared, singleton **wallet tracker**. Exactly one instance ever runs
 //! (an operational invariant enforced by the orchestrator/deployment, not
-//! by this binary) — republishes every parsed trade as a `ScannerTick` on a
-//! Redis Stream that any number of `executor` processes can tail
+//! by this binary) — republishes every detected trade as a `ScannerTick` on
+//! a Redis Stream that any number of `executor` processes can tail
 //! independently. This is what keeps per-subscriber infra cost flat
 //! instead of scaling with the number of users (see docs/ARCHITECTURE.md
 //! §1, Décision A).
 //!
-//! Runs on standard Solana JSON-RPC only, by design: `logsSubscribe` on
-//! each watched program via `SOLANA_WS_URL`, then `getTransaction` via
-//! `RPC_HTTP` for whatever `logsSubscribe` doesn't include (inner
-//! instructions, token balances). Works against any provider's free or
-//! paid RPC+WS tier — including Solana's own public endpoint
-//! (`https://api.mainnet-beta.solana.com` / `wss://api.mainnet-beta.solana.com`,
-//! zero cost, no account needed), which is the default in `.env.example`.
-//! No provider-specific integration, no paid gRPC add-on, no API key
-//! required to run this at all. There used to be a second mode here
-//! (`run_yellowstone`, a Yellowstone gRPC subscription) that traded that
-//! independence for lower latency — removed entirely per an explicit
-//! product decision to never depend on a specific paid provider again (no
-//! free public RPC offers Yellowstone gRPC), rather than keep an unused
-//! paid-only code path around. `SCANNER_MAX_RPC_RPS` (see
-//! `DEFAULT_MAX_RPC_RPS` below) and `MAX_PENDING_LOOKUPS` exist because of
-//! that tradeoff — this is materially higher-latency than a gRPC push
-//! feed, by design, not a bug.
+//! **This is a copy-trading wallet tracker, not a DEX-wide sniper feed.**
+//! It never subscribes to PumpFun/PumpSwap/Raydium Launchpad program-wide
+//! activity — by explicit product decision, it only ever watches the
+//! specific wallet addresses currently configured as a copy-trading target
+//! by at least one active user (`scanner:tracked-wallets`, a Redis Set
+//! maintained by apps/api — see `fetch_tracked_wallets` below). One
+//! `logsSubscribe(Mentions([wallet]))` per tracked wallet, re-read from
+//! Redis on every (re)connect and periodically thereafter so a wallet
+//! added/removed from any user's settings takes effect without a process
+//! restart — see `watch_tracked_wallets`. A transaction merely *mentioning*
+//! a tracked wallet (e.g. as an unrelated counterparty's account) is not
+//! enough to publish a tick: `extract_trader_from_transaction` must confirm
+//! the tracked wallet is the transaction's actual fee payer/signer before
+//! anything is published — see the trader-match check in
+//! `watch_tracked_wallets`'s notification loop.
+//!
+//! Runs on standard Solana JSON-RPC only, by design: `logsSubscribe` via
+//! `SOLANA_WS_URL`, then `getTransaction` via `RPC_HTTP` for whatever
+//! `logsSubscribe` doesn't include (inner instructions, token balances).
+//! Works against any provider's free or paid RPC+WS tier — including
+//! Solana's own public endpoint (`https://api.mainnet-beta.solana.com` /
+//! `wss://api.mainnet-beta.solana.com`, zero cost, no account needed),
+//! which is the default in `.env.example`. No provider-specific
+//! integration, no paid gRPC add-on, no API key required to run this at
+//! all — see `SCANNER_MAX_RPC_RPS`/`MAX_PENDING_LOOKUPS` for the
+//! latency/throughput tradeoff this accepts in exchange.
 //!
 //! Reuses exactly one function from the untouched engine crate:
 //! `transaction_parser::parse_transaction_data`. It never calls
@@ -31,12 +40,11 @@
 //! `to_synthetic_subscribe_update` below hand-assembles a
 //! `SubscribeUpdateTransaction` (the Yellowstone protobuf *type* this
 //! function is typed against — kept as a dependency purely for its
-//! generated Rust structs, not the gRPC client that used to populate it)
-//! from a standard `getTransaction` response. `parse_transaction_data`
-//! only ever reads `meta.log_messages` and `meta.post_token_balances` from
-//! it (verified by inspection, not assumed), both of which a standard RPC
-//! response also provides, so this doesn't require touching `engine/` at
-//! all.
+//! generated Rust structs, not a gRPC client) from a standard
+//! `getTransaction` response. `parse_transaction_data` only ever reads
+//! `meta.log_messages` and `meta.post_token_balances` from it (verified by
+//! inspection, not assumed), both of which a standard RPC response also
+//! provides, so this doesn't require touching `engine/` at all.
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,9 +67,6 @@ use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiInnerInstructions, UiInstruction,
     UiTransactionEncoding, UiTransactionStatusMeta, UiTransactionTokenBalance,
 };
-use solana_vntr_sniper::dex::pump_fun::PUMP_FUN_PROGRAM;
-use solana_vntr_sniper::dex::pump_swap::PUMP_SWAP_PROGRAM;
-use solana_vntr_sniper::dex::raydium_launchpad::RAYDIUM_LAUNCHPAD_PROGRAM;
 use solana_vntr_sniper::processor::transaction_parser::{
     parse_transaction_data, DexType, TradeInfoFromToken,
 };
@@ -259,12 +264,41 @@ fn log_redacted_ws_url(url: &str) {
     );
 }
 
-fn watched_programs() -> Vec<String> {
-    vec![
-        PUMP_FUN_PROGRAM.to_string(),
-        PUMP_SWAP_PROGRAM.to_string(),
-        RAYDIUM_LAUNCHPAD_PROGRAM.to_string(),
-    ]
+/// Redis Set of base58 wallet addresses this scanner should track — the
+/// union, across every currently-running bot with copy-trading enabled, of
+/// that user's `copy_trading_targets`. Maintained by apps/api (see
+/// `apps/api/src/lib/tracked-wallets.ts`): written to on bot start/settings
+/// update, cleared on stop. This scanner only ever reads it — it never
+/// writes to this key itself, so a stale/incorrectly-maintained set is an
+/// apps/api bug, not a scanner bug.
+const TRACKED_WALLETS_KEY: &str = "scanner:tracked-wallets";
+
+/// Reads the current tracked-wallet set fresh from Redis. Called once per
+/// (re)connect attempt in `run_rpc_websocket`'s loop, and periodically
+/// during an established connection (`watch_tracked_wallets`'s
+/// `WALLET_LIST_POLL_INTERVAL`) so a wallet added or removed from any
+/// user's settings takes effect within one poll interval — no scanner
+/// restart required. Returns an empty `Vec` (not an error) on a Redis
+/// failure or an empty set; the caller treats both the same way ("nothing
+/// to track right now").
+async fn fetch_tracked_wallets(redis_conn: &RedisConn) -> Vec<String> {
+    let mut conn = redis_conn.lock().await;
+    let result: redis::RedisResult<Vec<String>> = conn.smembers(TRACKED_WALLETS_KEY).await;
+    match result {
+        Ok(mut wallets) => {
+            wallets.sort();
+            wallets
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                key = TRACKED_WALLETS_KEY,
+                "scanner: failed to read tracked-wallet set from Redis, treating as empty for \
+                 this attempt"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Rough, padding-adjusted base64-decoded length — good enough for a
@@ -990,7 +1024,7 @@ impl RateLimiter {
     }
 }
 
-/// Runs one `logsSubscribe` per watched program (Solana's reference RPC
+/// Runs one `logsSubscribe` per tracked wallet (Solana's reference RPC
 /// implementation's `mentions` filter only ever reliably supports a single
 /// address per subscription — most providers, Chainstack included, follow
 /// that same reference behavior) plus a bounded pool of `getTransaction`
@@ -1004,12 +1038,27 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 /// backing off from wherever it left off.
 const RECONNECT_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
 
+/// How often an established connection re-reads `scanner:tracked-wallets`
+/// to check whether the set has changed (a user enabled/disabled
+/// copy-trading, added/removed a target, started/stopped their bot). On a
+/// change, `watch_tracked_wallets` deliberately ends its own loop so
+/// `run_rpc_websocket`'s caller reconnects with a fresh subscription set —
+/// simpler and more robust than tearing down/rebuilding individual
+/// subscriptions on a live `select_all` stream, at the cost of every other
+/// tracked wallet's subscription also being briefly recycled. Tracking
+/// activity is inherently low-volume (a handful of wallets, not
+/// mainnet-wide DEX firehose), so this is cheap.
+const WALLET_LIST_POLL_INTERVAL: Duration = Duration::from_secs(20);
+/// How long to wait before checking again when there is currently nothing
+/// to track (`scanner:tracked-wallets` empty) — no point opening a
+/// WebSocket connection with zero subscriptions.
+const EMPTY_WALLET_LIST_RETRY_DELAY: Duration = Duration::from_secs(15);
+
 /// A small pseudo-random offset (no `rand` dependency needed for this) so
-/// the 3 per-program reconnect tasks below don't retry in lockstep —
-/// without it, all 3 start at the same instant and share the exact same
-/// backoff schedule, so every retry cycle re-creates the same "3 requests
-/// in the same instant" burst that (however small) is worth avoiding when
-/// the account is already rate-limited.
+/// this doesn't retry in perfect lockstep with anything else sharing the
+/// same rate-limited account — a fixed backoff schedule is a much easier
+/// way to trip a provider's short-window burst limiter than the same
+/// schedule spread out by even a few tens of milliseconds.
 fn jitter_ms(max_ms: u64) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -1037,21 +1086,31 @@ async fn run_rpc_websocket(
         "scanner: getTransaction dispatch capped at this rate"
     );
 
-    // One WebSocket connection, all 3 watched-program subscriptions
-    // multiplexed over it — `PubsubClient::logs_subscribe` takes `&self`
-    // specifically so multiple subscriptions CAN share one connection; the
-    // previous version of this file missed that and opened one
-    // `PubsubClient` (i.e. one full TCP+TLS+WS handshake) per program,
-    // tripling both the connection count and the number of simultaneous
-    // `logsSubscribe` requests fired at startup for no reason — 3 requests
-    // landing in the same instant is a much easier way to trip a
-    // provider's short-window burst limiter than 3 requests spread out
-    // even by a few tens of milliseconds, and that kind of burst limit
-    // wouldn't show up as a sustained RPS violation on a dashboard at all.
     let mut backoff = RECONNECT_BASE_DELAY;
     loop {
+        let wallets = fetch_tracked_wallets(&redis_conn).await;
+        if wallets.is_empty() {
+            tracing::warn!(
+                key = TRACKED_WALLETS_KEY,
+                retry_secs = EMPTY_WALLET_LIST_RETRY_DELAY.as_secs(),
+                "scanner: no wallets currently configured for tracking — idling, nothing to \
+                 detect. This is a copy-trading wallet tracker, not a DEX-wide sniper: at least \
+                 one user needs an active bot with copy-trading enabled and at least one target \
+                 wallet configured before this scanner has anything to watch."
+            );
+            tokio::time::sleep(EMPTY_WALLET_LIST_RETRY_DELAY).await;
+            continue;
+        }
+        tracing::info!(
+            wallet_count = wallets.len(),
+            wallets = ?wallets,
+            "scanner: tracking {} wallet(s) for copy-trading",
+            wallets.len()
+        );
+
         let attempt_started = tokio::time::Instant::now();
-        if let Err(e) = watch_all_programs(
+        if let Err(e) = watch_tracked_wallets(
+            &wallets,
             &solana_ws_url,
             rpc_client.clone(),
             redis_conn.clone(),
@@ -1078,18 +1137,20 @@ async fn run_rpc_websocket(
 }
 
 /// Opens exactly one `PubsubClient` (one WebSocket connection) and issues
-/// one `logsSubscribe` per watched program on it (Solana's reference RPC
+/// one `logsSubscribe` per tracked wallet on it (Solana's reference RPC
 /// implementation's `mentions` filter only ever reliably supports a single
 /// address per subscription — most providers, Chainstack included, follow
-/// that same reference behavior, so 3 separate subscribe calls are still
-/// required; only the underlying connection is shared). The 3 resulting
+/// that same reference behavior, so one subscribe call per wallet is still
+/// required; only the underlying connection is shared). The resulting
 /// notification streams are merged into one so a single loop handles all
-/// of them. Runs until the connection ends or errors, then returns —
-/// `run_rpc_websocket`'s caller loop reconnects (and resubscribes all 3)
-/// from scratch. Each detected (non-failed) log spawns its own bounded
-/// `getTransaction` + parse + publish task so one slow lookup can't stall
-/// the next log notification from being received.
-async fn watch_all_programs(
+/// of them. Runs until the connection ends/errors, or until
+/// `WALLET_LIST_POLL_INTERVAL` finds the tracked-wallet set has changed —
+/// either way, `run_rpc_websocket`'s caller loop reconnects (re-reading the
+/// wallet set fresh) from scratch. Each detected (non-failed) log spawns
+/// its own bounded `getTransaction` + parse + publish task so one slow
+/// lookup can't stall the next log notification from being received.
+async fn watch_tracked_wallets(
+    wallets: &[String],
     solana_ws_url: &str,
     rpc_client: Arc<RpcClient>,
     redis_conn: RedisConn,
@@ -1126,15 +1187,15 @@ async fn watch_all_programs(
     };
 
     let mut tagged_streams = Vec::new();
-    for program in watched_programs() {
-        // Each of the 3 calls is its own JSON-RPC request over the ONE
+    for wallet in wallets {
+        // Each subscribe call is its own JSON-RPC request over the ONE
         // connection above — still rate-limited individually, since the
-        // provider counts them as 3 requests regardless of the shared
-        // socket.
+        // provider counts them as separate requests regardless of the
+        // shared socket.
         rate_limiter.acquire().await;
         let subscribe_result = pubsub
             .logs_subscribe(
-                RpcTransactionLogsFilter::Mentions(vec![program.clone()]),
+                RpcTransactionLogsFilter::Mentions(vec![wallet.clone()]),
                 RpcTransactionLogsConfig {
                     commitment: Some(CommitmentConfig::processed()),
                 },
@@ -1142,167 +1203,246 @@ async fn watch_all_programs(
             .await;
         match subscribe_result {
             Ok((stream, _unsubscribe)) => {
-                let tagged = stream.map(move |update| (program.clone(), update));
+                let wallet = wallet.clone();
+                let tagged = stream.map(move |update| (wallet.clone(), update));
                 tagged_streams.push(tagged.boxed());
             }
             Err(e) => {
                 tracing::error!(
                     url = %solana_ws_url,
-                    program = %program,
+                    wallet = %wallet,
                     error_display = %e,
                     error_debug = ?e,
                     "scanner: logs_subscribe failed — see error_debug for the real cause"
                 );
-                anyhow::bail!("logs_subscribe failed for {program}: {e}");
+                anyhow::bail!("logs_subscribe failed for wallet {wallet}: {e}");
             }
         }
     }
 
     let mut merged = select_all(tagged_streams);
+    let mut wallet_check_interval = tokio::time::interval(WALLET_LIST_POLL_INTERVAL);
+    wallet_check_interval.tick().await; // interval fires immediately on the first tick; consume it
 
-    while let Some((program, update)) = merged.next().await {
-        tracing::debug!(
-            program = %program,
-            signature = %update.value.signature,
-            err = ?update.value.err,
-            "scanner: logsNotification received"
-        );
-
-        if update.value.err.is_some() {
-            tracing::debug!(
-                program = %program,
-                signature = %update.value.signature,
-                "scanner: REJECTED — transaction failed on-chain (err present in the \
-                 notification), never worth a getTransaction lookup"
-            );
-            continue; // never worth spending part of the RPS budget on a doomed lookup
-        }
-        tracing::debug!(
-            program = %program,
-            raw_signature = %update.value.signature,
-            "scanner: raw signature received from WebSocket, about to validate/convert"
-        );
-        let Ok(signature) = Signature::from_str(&update.value.signature) else {
-            tracing::warn!(
-                program = %program,
-                raw_signature = %update.value.signature,
-                "scanner: REJECTED — logsNotification signature failed to parse as a Signature"
-            );
-            continue;
-        };
-        // "1111111111111111111111111111111111111111111111111111111111111111"
-        // (64 base58 '1's = 64 zero bytes) is `Signature::default()` — a
-        // syntactically valid Signature that `Signature::from_str` above
-        // happily parses, but no real Solana transaction is ever signed
-        // with an all-zero signature. Confirmed by inspection that nothing
-        // in this file ever constructs one (no `Signature::default()` /
-        // `Pubkey::default()` / `unwrap_or`-style fallback anywhere on
-        // this path) — when this fires, `raw_signature` above already
-        // proved the RPC node itself sent this value in the
-        // logsNotification's `value.signature` field, not something
-        // introduced here. getTransaction would only ever reject it with
-        // "Invalid params: signature is not a valid transaction signature"
-        // (-32602), so skip the doomed lookup instead of spending part of
-        // the RPS budget on it.
-        if signature == Signature::default() {
-            tracing::warn!(
-                program = %program,
-                raw_signature = %update.value.signature,
-                "scanner: REJECTED — signature is the all-zero placeholder (Signature::default()), \
-                 not a real transaction; sent by the RPC node itself in this logsNotification, \
-                 skipping the getTransaction lookup"
-            );
-            continue;
-        }
-
-        // See MAX_PENDING_LOOKUPS's doc comment: PumpFun/PumpSwap/Raydium
-        // Launchpad's combined mainnet volume routinely exceeds the public
-        // RPC's forced dispatch rate by an order of magnitude, so without
-        // this check every notification still queues a task waiting on
-        // `rate_limiter`, FIFO, forever — the backlog never catches up and
-        // every lookup that does eventually run is for an ancient
-        // signature. Dropping the newest notification once already at
-        // capacity bounds staleness instead of leaving it unbounded.
-        if pending_lookups.load(Ordering::Relaxed) >= MAX_PENDING_LOOKUPS {
-            tracing::warn!(
-                program = %program,
-                %signature,
-                max_pending_lookups = MAX_PENDING_LOOKUPS,
-                "scanner: REJECTED — lookup backlog is full, dropping this signature rather \
-                 than queuing it behind an already-stale backlog (see MAX_PENDING_LOOKUPS's doc \
-                 comment); this is expected on the free public RPC under real mainnet volume, \
-                 raise SCANNER_MAX_RPC_RPS if/when this deployment moves to a paid provider"
-            );
-            continue;
-        }
-        pending_lookups.fetch_add(1, Ordering::Relaxed);
-
-        tracing::debug!(
-            program = %program,
-            %signature,
-            pending_lookups = pending_lookups.load(Ordering::Relaxed),
-            "scanner: signature accepted, dispatching getTransaction lookup"
-        );
-
-        let rpc_client = rpc_client.clone();
-        let redis_conn = redis_conn.clone();
-        let lookup_limiter = lookup_limiter.clone();
-        let rate_limiter = rate_limiter.clone();
-        let pending_lookups_guard = PendingLookupGuard(pending_lookups.clone());
-        let lookup_handle = tokio::spawn(async move {
-            let _pending_lookups_guard = pending_lookups_guard;
-            let Ok(_permit) = lookup_limiter.acquire().await else {
-                tracing::warn!(
-                    %signature,
-                    "scanner: lookup_limiter semaphore was closed, dropping this signature \
-                     without a getTransaction attempt"
+    loop {
+        tokio::select! {
+            maybe_update = merged.next() => {
+                let Some((wallet, update)) = maybe_update else {
+                    anyhow::bail!("logs_subscribe stream(s) closed");
+                };
+                handle_wallet_notification(
+                    &wallet,
+                    update,
+                    &rpc_client,
+                    &redis_conn,
+                    &lookup_limiter,
+                    &rate_limiter,
+                    &pending_lookups,
                 );
-                return;
-            };
-            match fetch_and_detect(&rpc_client, signature, &rate_limiter).await {
-                Some(tick) => publish_tick(&redis_conn, tick).await,
-                None => {
-                    tracing::debug!(
-                        %signature,
-                        "scanner: fetch_and_detect produced no tick — see its own REJECTED log \
-                         above for the exact reason; nothing to publish for this signature"
+            }
+            _ = wallet_check_interval.tick() => {
+                let current = fetch_tracked_wallets(&redis_conn).await;
+                if current != wallets {
+                    tracing::info!(
+                        previous_wallet_count = wallets.len(),
+                        current_wallet_count = current.len(),
+                        "scanner: tracked-wallet list changed, reconnecting to resubscribe with \
+                         the fresh set"
                     );
+                    anyhow::bail!("tracked-wallet list changed");
                 }
             }
-        });
-        // A spawned task's panic is otherwise completely silent — nobody
-        // ever inspects `lookup_handle`'s result, so tokio just drops it.
-        // That's indistinguishable from this exact symptom report ("we see
-        // 'dispatching getTransaction lookup' and then literally nothing
-        // else, ever, ever again for this signature"): if anything in
-        // fetch_and_detect/detect_trade/publish_tick — including the
-        // untouched engine's own parse_transaction_data — ever panics
-        // (an unwrap, an out-of-bounds index, ...) instead of returning
-        // an error, this is the only way it would ever surface at all.
-        // Spawning a second, tiny task to await the first one's handle
-        // keeps this from blocking the notification loop above.
-        tokio::spawn(async move {
-            if let Err(join_error) = lookup_handle.await {
-                if join_error.is_panic() {
-                    tracing::error!(
-                        %signature,
-                        panic = %join_error,
-                        "scanner: PANIC in the getTransaction/parse/publish task for this \
-                         signature — this is why nothing was logged after \"dispatching \
-                         getTransaction lookup\"; the panic itself was otherwise silent"
-                    );
-                } else {
-                    tracing::error!(
-                        %signature,
-                        error = %join_error,
-                        "scanner: getTransaction/parse/publish task ended abnormally (cancelled?)"
-                    );
-                }
-            }
-        });
+        }
+    }
+}
+
+/// One `logsNotification` from a tracked wallet's subscription: filters
+/// obviously-doomed lookups (failed tx, unparseable/all-zero signature,
+/// backlog already full), then dispatches the bounded getTransaction +
+/// parse + publish task. Split out of `watch_tracked_wallets`'s loop only
+/// so that loop reads as "select between a notification and the periodic
+/// wallet-list check" — no behavior change from having this inline.
+fn handle_wallet_notification(
+    wallet: &str,
+    update: solana_client::rpc_response::Response<solana_client::rpc_response::RpcLogsResponse>,
+    rpc_client: &Arc<RpcClient>,
+    redis_conn: &RedisConn,
+    lookup_limiter: &Arc<Semaphore>,
+    rate_limiter: &Arc<RateLimiter>,
+    pending_lookups: &Arc<AtomicUsize>,
+) {
+    tracing::debug!(
+        wallet = %wallet,
+        signature = %update.value.signature,
+        err = ?update.value.err,
+        "scanner: logsNotification received"
+    );
+
+    if update.value.err.is_some() {
+        tracing::debug!(
+            wallet = %wallet,
+            signature = %update.value.signature,
+            "scanner: REJECTED — transaction failed on-chain (err present in the \
+             notification), never worth a getTransaction lookup"
+        );
+        return; // never worth spending part of the RPS budget on a doomed lookup
+    }
+    tracing::debug!(
+        wallet = %wallet,
+        raw_signature = %update.value.signature,
+        "scanner: raw signature received from WebSocket, about to validate/convert"
+    );
+    let Ok(signature) = Signature::from_str(&update.value.signature) else {
+        tracing::warn!(
+            wallet = %wallet,
+            raw_signature = %update.value.signature,
+            "scanner: REJECTED — logsNotification signature failed to parse as a Signature"
+        );
+        return;
+    };
+    // "1111111111111111111111111111111111111111111111111111111111111111"
+    // (64 base58 '1's = 64 zero bytes) is `Signature::default()` — a
+    // syntactically valid Signature that `Signature::from_str` above
+    // happily parses, but no real Solana transaction is ever signed
+    // with an all-zero signature. Confirmed by inspection that nothing
+    // in this file ever constructs one (no `Signature::default()` /
+    // `Pubkey::default()` / `unwrap_or`-style fallback anywhere on
+    // this path) — when this fires, `raw_signature` above already
+    // proved the RPC node itself sent this value in the
+    // logsNotification's `value.signature` field, not something
+    // introduced here. getTransaction would only ever reject it with
+    // "Invalid params: signature is not a valid transaction signature"
+    // (-32602), so skip the doomed lookup instead of spending part of
+    // the RPS budget on it.
+    if signature == Signature::default() {
+        tracing::warn!(
+            wallet = %wallet,
+            raw_signature = %update.value.signature,
+            "scanner: REJECTED — signature is the all-zero placeholder (Signature::default()), \
+             not a real transaction; sent by the RPC node itself in this logsNotification, \
+             skipping the getTransaction lookup"
+        );
+        return;
     }
 
-    anyhow::bail!("logs_subscribe stream(s) closed")
+    // See MAX_PENDING_LOOKUPS's doc comment. Tracking a handful of wallets
+    // is inherently low-volume compared to the DEX-wide firehose this used
+    // to watch, so this should rarely if ever actually fill up now — kept
+    // as a safety net, not removed, since it costs nothing when unused.
+    if pending_lookups.load(Ordering::Relaxed) >= MAX_PENDING_LOOKUPS {
+        tracing::warn!(
+            wallet = %wallet,
+            %signature,
+            max_pending_lookups = MAX_PENDING_LOOKUPS,
+            "scanner: REJECTED — lookup backlog is full, dropping this signature rather \
+             than queuing it behind an already-stale backlog (see MAX_PENDING_LOOKUPS's doc \
+             comment)"
+        );
+        return;
+    }
+    pending_lookups.fetch_add(1, Ordering::Relaxed);
+
+    tracing::debug!(
+        wallet = %wallet,
+        %signature,
+        pending_lookups = pending_lookups.load(Ordering::Relaxed),
+        "scanner: signature accepted, dispatching getTransaction lookup"
+    );
+
+    let wallet = wallet.to_string();
+    let rpc_client = rpc_client.clone();
+    let redis_conn = redis_conn.clone();
+    let lookup_limiter = lookup_limiter.clone();
+    let rate_limiter = rate_limiter.clone();
+    let pending_lookups_guard = PendingLookupGuard(pending_lookups.clone());
+    let lookup_handle = tokio::spawn(async move {
+        let _pending_lookups_guard = pending_lookups_guard;
+        let Ok(_permit) = lookup_limiter.acquire().await else {
+            tracing::warn!(
+                %signature,
+                "scanner: lookup_limiter semaphore was closed, dropping this signature \
+                 without a getTransaction attempt"
+            );
+            return;
+        };
+        match fetch_and_detect(&rpc_client, signature, &rate_limiter).await {
+            Some(tick) => {
+                // `Mentions` matches ANY transaction where `wallet` appears
+                // anywhere in the account list — as a token account
+                // owner, a counterparty, a passive recipient — not only
+                // ones it actually signed. `tick.trader` is the real fee
+                // payer/signer extracted straight from the decoded
+                // transaction (see `extract_trader_from_transaction`), so
+                // this is the actual "did the tracked wallet perform this
+                // trade" check; everything before it only proves the
+                // wallet was mentioned somewhere in the transaction.
+                if tick.trader.as_deref() == Some(wallet.as_str()) {
+                    tracing::info!(
+                        wallet = %wallet,
+                        mint = %tick.mint,
+                        dex = %tick.dex_type,
+                        is_buy = tick.is_buy,
+                        price = tick.price,
+                        sol_change = tick.sol_change,
+                        token_change = tick.token_change,
+                        signature = %tick.signature,
+                        "scanner: TRACKED WALLET {} — wallet={} mint={} dex={}",
+                        if tick.is_buy { "BUY" } else { "SELL" },
+                        wallet,
+                        tick.mint,
+                        tick.dex_type
+                    );
+                    publish_tick(&redis_conn, tick).await;
+                } else {
+                    tracing::debug!(
+                        wallet = %wallet,
+                        actual_trader = ?tick.trader,
+                        %signature,
+                        "scanner: REJECTED — tracked wallet was mentioned in this transaction \
+                         but did not sign it (actual trader differs or is unknown); not a trade \
+                         BY the tracked wallet, not publishing"
+                    );
+                }
+            }
+            None => {
+                tracing::debug!(
+                    %signature,
+                    "scanner: fetch_and_detect produced no tick — see its own REJECTED log \
+                     above for the exact reason; nothing to publish for this signature"
+                );
+            }
+        }
+    });
+    // A spawned task's panic is otherwise completely silent — nobody
+    // ever inspects `lookup_handle`'s result, so tokio just drops it.
+    // That's indistinguishable from this exact symptom report ("we see
+    // 'dispatching getTransaction lookup' and then literally nothing
+    // else, ever, ever again for this signature"): if anything in
+    // fetch_and_detect/detect_trade/publish_tick — including the
+    // untouched engine's own parse_transaction_data — ever panics
+    // (an unwrap, an out-of-bounds index, ...) instead of returning
+    // an error, this is the only way it would ever surface at all.
+    // Spawning a second, tiny task to await the first one's handle
+    // keeps this from blocking the notification loop above.
+    tokio::spawn(async move {
+        if let Err(join_error) = lookup_handle.await {
+            if join_error.is_panic() {
+                tracing::error!(
+                    %signature,
+                    panic = %join_error,
+                    "scanner: PANIC in the getTransaction/parse/publish task for this \
+                     signature — this is why nothing was logged after \"dispatching \
+                     getTransaction lookup\"; the panic itself was otherwise silent"
+                );
+            } else {
+                tracing::error!(
+                    %signature,
+                    error = %join_error,
+                    "scanner: getTransaction/parse/publish task ended abnormally (cancelled?)"
+                );
+            }
+        }
+    });
 }
 
 /// Describes an `OptionSerializer`-wrapped list field's exact state —
