@@ -246,6 +246,7 @@ fn to_scanner_tick(parsed: &TradeInfoFromToken, trader: Option<String>) -> Scann
 
 async fn publish_tick(redis_conn: &RedisConn, tick: ScannerTick) {
     let Ok(payload) = serde_json::to_string(&tick) else {
+        tracing::warn!(signature = %tick.signature, "scanner: failed to serialize tick, dropping");
         return;
     };
     let mut conn = redis_conn.lock().await;
@@ -257,8 +258,18 @@ async fn publish_tick(redis_conn: &RedisConn, tick: ScannerTick) {
             &[("data", payload)],
         )
         .await;
-    if let Err(e) = result {
-        tracing::warn!(error = %e, "scanner: failed to publish tick");
+    match result {
+        Ok(stream_id) => {
+            tracing::debug!(
+                signature = %tick.signature,
+                mint = %tick.mint,
+                stream_id = %stream_id,
+                "scanner: EMITTED — tick published to Redis stream for engine-bridge/executor"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, signature = %tick.signature, "scanner: failed to publish tick");
+        }
     }
 }
 
@@ -266,15 +277,62 @@ async fn publish_tick(redis_conn: &RedisConn, tick: ScannerTick) {
 /// untouched engine's own parser. `None` for anything that isn't a
 /// recognized trade (no matching CPI log, wrapped-SOL mint, etc.) — the
 /// same filtering both modes already applied inline before this was
-/// extracted out of `main()`.
-fn detect_trade(txn: &SubscribeUpdateTransaction) -> Option<ScannerTick> {
-    let data = extract_cpi_log_data(txn)?;
-    let parsed = parse_transaction_data(txn, &data)?;
+/// extracted out of `main()`. `log_signature` is diagnostic-only (a
+/// display string identifying which transaction this call is for, so the
+/// rejection-reason logs below can be correlated with the rest of the
+/// pipeline's per-signature logs even when several are in flight
+/// concurrently) — it plays no role in the detection logic itself.
+fn detect_trade(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option<ScannerTick> {
+    let Some(data) = extract_cpi_log_data(txn) else {
+        tracing::debug!(
+            signature = %log_signature,
+            "scanner: REJECTED — no inner instruction with a recognized CPI-log data length \
+             (368/266/270/146/170/138 bytes). Either this transaction doesn't actually touch \
+             PumpFun/PumpSwap/Raydium Launchpad in a way that emits one of those instructions, \
+             or the instruction shape doesn't match what this scanner recognizes."
+        );
+        return None;
+    };
+
+    let Some(parsed) = parse_transaction_data(txn, &data) else {
+        tracing::debug!(
+            signature = %log_signature,
+            cpi_data_len = data.len(),
+            "scanner: REJECTED — a recognized CPI-log length was found, but the engine's \
+             parse_transaction_data() returned None for it (couldn't extract trade data from \
+             this instruction)."
+        );
+        return None;
+    };
+
     if parsed.mint == "So11111111111111111111111111111111111111112" {
+        tracing::debug!(
+            signature = %log_signature,
+            "scanner: REJECTED — parsed mint is wrapped SOL, filtered out (not a real token trade)."
+        );
         return None;
     }
+
     let trader = extract_trader_from_transaction(txn);
-    Some(to_scanner_tick(&parsed, trader))
+    if trader.is_none() {
+        tracing::debug!(
+            signature = %log_signature,
+            "scanner: trader (fee payer) could not be extracted from this transaction — the \
+             tick will still publish and be visible to the generic sniper heuristic, but it \
+             cannot match any copy-trading target since there's no wallet to compare against."
+        );
+    }
+
+    let tick = to_scanner_tick(&parsed, trader);
+    tracing::debug!(
+        signature = %log_signature,
+        mint = %tick.mint,
+        dex = %tick.dex_type,
+        is_buy = tick.is_buy,
+        trader = ?tick.trader,
+        "scanner: ACCEPTED — trade detected"
+    );
+    Some(tick)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -360,7 +418,14 @@ async fn run_yellowstone(
             continue;
         };
 
-        let Some(tick) = detect_trade(txn) else {
+        let log_signature = txn
+            .transaction
+            .as_ref()
+            .map(|t| bs58::encode(&t.signature).into_string())
+            .unwrap_or_default();
+        tracing::debug!(signature = %log_signature, "scanner: transaction update received (Yellowstone)");
+
+        let Some(tick) = detect_trade(txn, &log_signature) else {
             continue;
         };
 
@@ -594,12 +659,35 @@ async fn watch_program_logs(
     };
 
     while let Some(update) = stream.next().await {
+        tracing::debug!(
+            program = %program,
+            signature = %update.value.signature,
+            err = ?update.value.err,
+            "scanner: logsNotification received"
+        );
+
         if update.value.err.is_some() {
+            tracing::debug!(
+                program = %program,
+                signature = %update.value.signature,
+                "scanner: REJECTED — transaction failed on-chain (err present in the \
+                 notification), never worth a getTransaction lookup"
+            );
             continue; // matches the Yellowstone filter's `failed: Some(false)`
         }
         let Ok(signature) = Signature::from_str(&update.value.signature) else {
+            tracing::warn!(
+                program = %program,
+                raw_signature = %update.value.signature,
+                "scanner: REJECTED — logsNotification signature failed to parse as a Signature"
+            );
             continue;
         };
+        tracing::debug!(
+            program = %program,
+            %signature,
+            "scanner: signature accepted, dispatching getTransaction lookup"
+        );
 
         let rpc_client = rpc_client.clone();
         let redis_conn = redis_conn.clone();
@@ -637,11 +725,13 @@ async fn fetch_and_detect(
             max_supported_transaction_version: Some(0),
         };
         rate_limiter.acquire().await;
+        tracing::debug!(%signature, attempt, "scanner: calling getTransaction");
         match rpc_client
             .get_transaction_with_config(&signature, config)
             .await
         {
             Ok(tx) => {
+                tracing::debug!(%signature, attempt, slot = tx.slot, "scanner: getTransaction succeeded");
                 confirmed = Some(tx);
                 break;
             }
@@ -655,8 +745,26 @@ async fn fetch_and_detect(
         }
     }
 
-    let txn = to_synthetic_subscribe_update(confirmed?)?;
-    detect_trade(&txn)
+    let Some(confirmed) = confirmed else {
+        tracing::debug!(
+            %signature,
+            "scanner: REJECTED — getTransaction never succeeded after {GET_TRANSACTION_RETRIES} \
+             attempts"
+        );
+        return None;
+    };
+
+    let signature_str = signature.to_string();
+    let Some(txn) = to_synthetic_subscribe_update(confirmed, &signature_str) else {
+        tracing::debug!(
+            %signature,
+            "scanner: REJECTED — to_synthetic_subscribe_update returned None (the confirmed \
+             transaction had no meta at all, an unusual/malformed RPC response)"
+        );
+        return None;
+    };
+
+    detect_trade(&txn, &signature_str)
 }
 
 /// Hand-assembles a Yellowstone-shaped `SubscribeUpdateTransaction` from a
@@ -668,6 +776,7 @@ async fn fetch_and_detect(
 /// reads it, so it never needs to be right.
 fn to_synthetic_subscribe_update(
     confirmed: EncodedConfirmedTransactionWithStatusMeta,
+    log_signature: &str,
 ) -> Option<SubscribeUpdateTransaction> {
     // The only reason this decodes the full transaction (rather than only
     // reading `meta`, like the rest of this function) is to recover the fee
@@ -675,10 +784,13 @@ fn to_synthetic_subscribe_update(
     // rejects anything that doesn't pass `VersionedTransaction::sanitize()`,
     // so a `None` here (malformed/unexpected encoding) just means this tick
     // won't match any copy-trading target; it never blocks detection itself.
-    let fee_payer_account_keys: Vec<Vec<u8>> = confirmed
-        .transaction
-        .transaction
-        .decode()
+    let decoded = confirmed.transaction.transaction.decode();
+    tracing::debug!(
+        signature = %log_signature,
+        decoded = decoded.is_some(),
+        "scanner: transaction decode (for fee-payer extraction) result"
+    );
+    let fee_payer_account_keys: Vec<Vec<u8>> = decoded
         .and_then(|versioned_tx| {
             versioned_tx
                 .message
