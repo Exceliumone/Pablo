@@ -800,6 +800,11 @@ async fn watch_all_programs(
             );
             continue; // matches the Yellowstone filter's `failed: Some(false)`
         }
+        tracing::debug!(
+            program = %program,
+            raw_signature = %update.value.signature,
+            "scanner: raw signature received from WebSocket, about to validate/convert"
+        );
         let Ok(signature) = Signature::from_str(&update.value.signature) else {
             tracing::warn!(
                 program = %program,
@@ -808,6 +813,30 @@ async fn watch_all_programs(
             );
             continue;
         };
+        // "1111111111111111111111111111111111111111111111111111111111111111"
+        // (64 base58 '1's = 64 zero bytes) is `Signature::default()` — a
+        // syntactically valid Signature that `Signature::from_str` above
+        // happily parses, but no real Solana transaction is ever signed
+        // with an all-zero signature. Confirmed by inspection that nothing
+        // in this file ever constructs one (no `Signature::default()` /
+        // `Pubkey::default()` / `unwrap_or`-style fallback anywhere on
+        // this path) — when this fires, `raw_signature` above already
+        // proved the RPC node itself sent this value in the
+        // logsNotification's `value.signature` field, not something
+        // introduced here. getTransaction would only ever reject it with
+        // "Invalid params: signature is not a valid transaction signature"
+        // (-32602), so skip the doomed lookup instead of spending part of
+        // the RPS budget on it.
+        if signature == Signature::default() {
+            tracing::warn!(
+                program = %program,
+                raw_signature = %update.value.signature,
+                "scanner: REJECTED — signature is the all-zero placeholder (Signature::default()), \
+                 not a real transaction; sent by the RPC node itself in this logsNotification, \
+                 skipping the getTransaction lookup"
+            );
+            continue;
+        }
         tracing::debug!(
             program = %program,
             %signature,
