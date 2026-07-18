@@ -3,6 +3,43 @@ import BigNumber from "bignumber.js";
 import { env } from "../config/env.js";
 import { redis } from "./redis.js";
 
+/**
+ * Logs enough of `RPC_HTTP` (scheme, host, whether a path segment is
+ * present — the shape a provider-embedded API key would take, e.g.
+ * Chainstack's `https://<network>.core.chainstack.com/<key>`) to make
+ * "which RPC provider is this process actually configured against" a
+ * one-line, no-guessing answer in production logs — without ever printing
+ * the URL/key itself. This is the *only* `Connection` this whole API
+ * process ever constructs (see `connection` below); every route that
+ * touches Solana (wallet, billing, holder checks) shares it, so this one
+ * log line is authoritative for all of them. Mirrors the same
+ * redacted-URL logging pattern already used by the scanner/executor
+ * (`apps/engine-bridge/src/bin/scanner.rs`'s `log_redacted_ws_url`) for
+ * exactly the same reason: a deployment's `.env` can drift to point at a
+ * different (or exhausted-quota) provider with zero code change, and
+ * that's otherwise invisible until something fails downstream.
+ */
+function logRedactedRpcUrl(url: string): void {
+  let shape: { scheme: string; host: string; hasPathSegment: boolean } | { parseError: true };
+  try {
+    const parsed = new URL(url);
+    shape = {
+      scheme: parsed.protocol.replace(/:$/, ""),
+      host: parsed.host,
+      hasPathSegment: parsed.pathname.replace(/^\/+/, "").length > 0,
+    };
+  } catch {
+    shape = { parseError: true };
+  }
+  console.log(
+    JSON.stringify({
+      msg: "api: RPC_HTTP shape (redacted — no key/token logged)",
+      ...shape,
+    }),
+  );
+}
+
+logRedactedRpcUrl(env.RPC_HTTP);
 export const connection = new Connection(env.RPC_HTTP, "confirmed");
 
 const SOL_PRICE_CACHE_KEY = "price:sol-usd";
