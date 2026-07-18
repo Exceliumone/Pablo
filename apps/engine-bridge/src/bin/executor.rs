@@ -36,7 +36,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anchor_client::solana_sdk::signature::{Keypair, Signer};
 use engine_bridge::contract::{
@@ -53,6 +53,42 @@ use solana_vntr_sniper::library::blockhash_processor::BlockhashProcessor;
 use solana_vntr_sniper::processor::selling_strategy::{SellingConfig, SellingEngine};
 use solana_vntr_sniper::processor::swap::{SwapDirection, SwapInType, SwapProtocol};
 use solana_vntr_sniper::processor::transaction_parser::{DexType, TradeInfoFromToken};
+
+/// Logs enough of `redis_url` (scheme, host, port, logical DB index,
+/// whether credentials are present) to let the *same-looking* but
+/// different-Redis-instance bug be diagnosed from logs alone, without ever
+/// logging a password. This executor's `redis_url` comes from
+/// `apps/api`'s own `REDIS_URL` env var (relayed through
+/// `ExecutorStartPayload`) — a completely separate `.env` file from the
+/// one `apps/engine-bridge`'s `scanner`/orchestrator binaries read their
+/// own `REDIS_URL` from. Both `redis::Client::open` calls succeed and
+/// this process reports `RUNNING` either way, so if the two `.env` files
+/// ever drift (different host, port, or logical DB index — `redis://
+/// host:6379/0` vs `/1` is enough), the scanner and this executor connect
+/// to two different Redis keyspaces: `XADD scanner:ticks` in one is
+/// simply invisible to `XREAD` in the other, with no error anywhere. Log
+/// this line from both processes and diff them.
+fn log_redacted_redis_url(url: &str) {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("<no-scheme>", url));
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let has_credentials = authority.contains('@');
+    let db_index = if path.is_empty() { "0 (default)" } else { path };
+
+    tracing::info!(
+        scheme = %scheme,
+        host_port = %host_port,
+        has_credentials,
+        db_index = %db_index,
+        "executor: REDIS_URL shape (redacted — no password logged). Compare this exact line \
+         against the scanner process's own \"scanner: REDIS_URL shape\" log (if present) or \
+         directly against apps/engine-bridge/.env's REDIS_URL — this executor's redis_url comes \
+         from apps/api's REDIS_URL instead (relayed via ExecutorStartPayload), a different .env \
+         file. Any difference in host_port or db_index here means this executor is reading a \
+         different Redis keyspace than the scanner writes to — it will look perfectly healthy \
+         (RUNNING, no errors) while never seeing a single tick."
+    );
+}
 
 fn dex_type_from_str(s: &str) -> DexType {
     match s {
@@ -107,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
     let payload: ExecutorStartPayload = serde_json::from_str(&payload_json)?;
     let user_id = payload.user_id.clone();
 
+    log_redacted_redis_url(&payload.redis_url);
     let redis_client = redis::Client::open(payload.redis_url.clone())?;
     let mut event_conn = redis_client.get_multiplexed_async_connection().await?;
     let mut stream_conn = redis_client.get_multiplexed_async_connection().await?;
@@ -249,6 +286,19 @@ async fn main() -> anyhow::Result<()> {
     let mut last_id = "$".to_string();
     let read_opts = StreamReadOptions::default().block(5000).count(100);
 
+    // Silent-forever-block watchdog: `xread_options` returning an empty
+    // `reply.keys` (nothing new within the 5s block window) is completely
+    // normal moment-to-moment — but if it stays empty for a long time
+    // straight, that's indistinguishable from this executor being
+    // connected to a *different* Redis keyspace than the scanner writes
+    // `scanner:ticks` into (see `log_redacted_redis_url`'s doc comment):
+    // no error, `RUNNING` status, just permanent silence. Logged once per
+    // idle window rather than on every empty poll, which would otherwise
+    // fire every 5s forever whenever there's genuinely nothing to trade.
+    let mut last_tick_at = Instant::now();
+    let mut idle_warning_logged = false;
+    const IDLE_WARNING_THRESHOLD: Duration = Duration::from_secs(120);
+
     loop {
         let reply: redis::RedisResult<StreamReadReply> = stream_conn
             .xread_options(&[SCANNER_TICKS_STREAM], &[last_id.as_str()], &read_opts)
@@ -263,9 +313,29 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+        if reply.keys.is_empty() {
+            if !idle_warning_logged && last_tick_at.elapsed() > IDLE_WARNING_THRESHOLD {
+                tracing::warn!(
+                    idle_secs = last_tick_at.elapsed().as_secs(),
+                    stream = SCANNER_TICKS_STREAM,
+                    "executor: no new scanner ticks received in over {}s. If the scanner is \
+                     confirmed to be publishing (its own logs show \"EMITTED\"), this almost \
+                     certainly means this executor's REDIS_URL points to a different Redis \
+                     instance/DB than the scanner's — see this process's \"executor: REDIS_URL \
+                     shape\" log line near startup and compare it against the scanner's \
+                     \"scanner: REDIS_URL shape\" line.",
+                    IDLE_WARNING_THRESHOLD.as_secs()
+                );
+                idle_warning_logged = true;
+            }
+            continue;
+        }
+
         for stream_key in reply.keys {
             for entry in stream_key.ids {
                 last_id = entry.id.clone();
+                last_tick_at = Instant::now();
+                idle_warning_logged = false;
 
                 let Some(raw) = entry.map.get("data") else {
                     continue;

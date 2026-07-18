@@ -103,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let redis_url = env("REDIS_URL");
+    log_redacted_redis_url(&redis_url);
     let redis_client = redis::Client::open(redis_url)?;
     acquire_singleton_lock_or_exit(&redis_client).await;
     let redis_conn: RedisConn = Arc::new(Mutex::new(
@@ -241,6 +242,32 @@ async fn acquire_singleton_lock_or_exit(redis_client: &redis::Client) {
 /// (a separate, less common cause `PubsubClient::new()` truly cannot
 /// support — see `watch_program_logs`'s error-logging comment for what to
 /// check if `path_segment_count` here is already correct).
+/// Same redaction/shape logic as `log_redacted_ws_url` below, applied to
+/// `REDIS_URL` — this scanner writes `scanner:ticks` to whatever this
+/// resolves to, read from apps/engine-bridge/.env. `executor` (a separate
+/// binary, apps/engine-bridge/src/bin/executor.rs) connects to Redis using
+/// a *different* `.env` file's `REDIS_URL` (apps/api's, relayed through
+/// `ExecutorStartPayload`) — if the two ever drift (different host, port,
+/// or logical DB index), both processes report perfectly healthy while
+/// the executor never sees a single tick this scanner publishes. Compare
+/// this log line against the executor's own "executor: REDIS_URL shape"
+/// log to catch that.
+fn log_redacted_redis_url(url: &str) {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("<no-scheme>", url));
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let has_credentials = authority.contains('@');
+    let db_index = if path.is_empty() { "0 (default)" } else { path };
+
+    tracing::info!(
+        scheme = %scheme,
+        host_port = %host_port,
+        has_credentials,
+        db_index = %db_index,
+        "scanner: REDIS_URL shape (redacted — no password logged)."
+    );
+}
+
 fn log_redacted_ws_url(url: &str) {
     let (scheme, rest) = url.split_once("://").unwrap_or(("<no-scheme>", url));
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
