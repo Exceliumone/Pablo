@@ -44,6 +44,7 @@
 //! doesn't require touching `engine/` at all.
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -990,6 +991,41 @@ async fn run_yellowstone(
 /// comment) for never tripping either ceiling.
 const MAX_CONCURRENT_LOOKUPS: usize = 2;
 
+/// Bounds how many `getTransaction` lookups can be *queued* waiting for
+/// `RateLimiter::acquire` at once — independent of `MAX_CONCURRENT_LOOKUPS`
+/// (bounds lookups actually *in flight*) and `SCANNER_MAX_RPC_RPS` (bounds
+/// *dispatch rate*). Without this, PumpFun/PumpSwap/Raydium Launchpad's
+/// combined mainnet-wide `logsSubscribe` volume (routinely tens of
+/// notifications/sec — confirmed in production logs as dozens of
+/// "logsNotification received" firing within the same millisecond) vastly
+/// exceeds the public RPC's forced ~2 req/sec dispatch rate, so every
+/// notification still spawned its own task waiting on the rate limiter's
+/// semaphore, which is FIFO: the queue only ever grew, never caught up,
+/// and every lookup that did eventually run was for a signature that was
+/// by then minutes-to-hours stale. That's functionally indistinguishable
+/// from "nothing is ever detected" — a free public RPC has limited
+/// retention, so an old-enough signature just isn't found at all, and even
+/// when it still is, it's ancient by the time it's acted on. Capping
+/// backlog depth bounds worst-case staleness instead of leaving it
+/// unbounded (`MAX_PENDING_LOOKUPS / SCANNER_MAX_RPC_RPS` seconds); the
+/// tradeoff is dropping the newest notification when already full, which
+/// is the right call for a live trading signal — a detection that lands
+/// minutes late is as useless as one that never lands, and this is
+/// dev/staging-tier infra by design (see this file's module doc comment).
+const MAX_PENDING_LOOKUPS: usize = 20;
+
+/// Decrements the shared pending-lookup counter on drop — covers every
+/// exit path of the spawned lookup task below (success, early return via
+/// `?`/`else`, even a panic unwinding through it) without having to
+/// remember to decrement at each one individually.
+struct PendingLookupGuard(Arc<AtomicUsize>);
+
+impl Drop for PendingLookupGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// getTransaction only serves `confirmed`/`finalized` commitment (Solana's
 /// JSON-RPC does not support `processed` for this method) — unlike
 /// Yellowstone's `processed`-level push, a transaction just seen via
@@ -1102,8 +1138,10 @@ async fn run_rpc_websocket(
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_RPC_RPS);
     let rate_limiter = RateLimiter::new(max_rpc_rps);
+    let pending_lookups = Arc::new(AtomicUsize::new(0));
     tracing::info!(
         max_rpc_rps,
+        max_pending_lookups = MAX_PENDING_LOOKUPS,
         "scanner: getTransaction dispatch capped at this rate"
     );
 
@@ -1127,6 +1165,7 @@ async fn run_rpc_websocket(
             redis_conn.clone(),
             lookup_limiter.clone(),
             rate_limiter.clone(),
+            pending_lookups.clone(),
         )
         .await
         {
@@ -1164,6 +1203,7 @@ async fn watch_all_programs(
     redis_conn: RedisConn,
     lookup_limiter: Arc<Semaphore>,
     rate_limiter: Arc<RateLimiter>,
+    pending_lookups: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     // PubsubClientError's ConnectionError/WsError variants wrap the real
     // tokio-tungstenite error (DNS, TLS, a non-101 HTTP response i.e.
@@ -1282,9 +1322,33 @@ async fn watch_all_programs(
             );
             continue;
         }
+
+        // See MAX_PENDING_LOOKUPS's doc comment: PumpFun/PumpSwap/Raydium
+        // Launchpad's combined mainnet volume routinely exceeds the public
+        // RPC's forced dispatch rate by an order of magnitude, so without
+        // this check every notification still queues a task waiting on
+        // `rate_limiter`, FIFO, forever — the backlog never catches up and
+        // every lookup that does eventually run is for an ancient
+        // signature. Dropping the newest notification once already at
+        // capacity bounds staleness instead of leaving it unbounded.
+        if pending_lookups.load(Ordering::Relaxed) >= MAX_PENDING_LOOKUPS {
+            tracing::warn!(
+                program = %program,
+                %signature,
+                max_pending_lookups = MAX_PENDING_LOOKUPS,
+                "scanner: REJECTED — lookup backlog is full, dropping this signature rather \
+                 than queuing it behind an already-stale backlog (see MAX_PENDING_LOOKUPS's doc \
+                 comment); this is expected on the free public RPC under real mainnet volume, \
+                 raise SCANNER_MAX_RPC_RPS if/when this deployment moves to a paid provider"
+            );
+            continue;
+        }
+        pending_lookups.fetch_add(1, Ordering::Relaxed);
+
         tracing::debug!(
             program = %program,
             %signature,
+            pending_lookups = pending_lookups.load(Ordering::Relaxed),
             "scanner: signature accepted, dispatching getTransaction lookup"
         );
 
@@ -1292,7 +1356,9 @@ async fn watch_all_programs(
         let redis_conn = redis_conn.clone();
         let lookup_limiter = lookup_limiter.clone();
         let rate_limiter = rate_limiter.clone();
+        let pending_lookups_guard = PendingLookupGuard(pending_lookups.clone());
         let lookup_handle = tokio::spawn(async move {
+            let _pending_lookups_guard = pending_lookups_guard;
             let Ok(_permit) = lookup_limiter.acquire().await else {
                 tracing::warn!(
                     %signature,
