@@ -67,7 +67,7 @@ use solana_vntr_sniper::dex::pump_fun::PUMP_FUN_PROGRAM;
 use solana_vntr_sniper::dex::pump_swap::PUMP_SWAP_PROGRAM;
 use solana_vntr_sniper::dex::raydium_launchpad::RAYDIUM_LAUNCHPAD_PROGRAM;
 use solana_vntr_sniper::processor::transaction_parser::{
-    parse_transaction_data, TradeInfoFromToken,
+    parse_transaction_data, DexType, TradeInfoFromToken,
 };
 use tokio::sync::{Mutex, Semaphore};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
@@ -280,6 +280,35 @@ fn approx_base64_decoded_len(s: &str) -> usize {
     (trimmed.len() / 4) * 3 - padding.min(3)
 }
 
+/// Identifies which program was "active" (innermost currently-invoked) at
+/// a given line in `log_messages`, by replaying Solana's own log
+/// convention: "Program <id> invoke [<depth>]" pushes, "Program <id>
+/// success"/"Program <id> failed: ..." pops. This is how a `Program data:`
+/// (sol_log_data) line's emitting program is identified — unlike
+/// inner-instruction call data, a log-based CPI event has no
+/// `program_id_index` of its own to resolve.
+fn emitting_program_at(log_messages: &[String], target_line: usize) -> Option<String> {
+    let mut stack: Vec<&str> = Vec::new();
+    for line in log_messages.iter().take(target_line + 1) {
+        let mut words = line.split_whitespace();
+        if words.next() != Some("Program") {
+            continue;
+        }
+        let Some(id) = words.next() else { continue };
+        match words.next() {
+            Some("invoke") => stack.push(id),
+            Some("success") => {
+                stack.pop();
+            }
+            Some(w) if w.starts_with("failed") => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    stack.last().map(|s| s.to_string())
+}
+
 /// Same extraction pattern as the engine's own process_message_for_dex_monitoring:
 /// the CPI log carrying the trade payload is the inner instruction whose data
 /// length matches one of these known instruction encodings. Shared by both
@@ -346,9 +375,10 @@ fn extract_cpi_log_data(txn: &SubscribeUpdateTransaction, log_signature: &str) -
                     .unwrap_or_else(|| {
                         format!(
                             "<unresolvable: program_id_index {} but this transaction's message \
-                             only carries {} account key(s) — dev mode's synthetic message only \
-                             ever populates the fee payer at index 0, see \
-                             to_synthetic_subscribe_update>",
+                             only carries {} account key(s) — see to_synthetic_subscribe_update's \
+                             static_account_keys()/loaded_addresses assembly; an index still past \
+                             that combined range means this is genuinely out of bounds, not a \
+                             known truncation>",
                             ix.program_id_index,
                             account_keys.len()
                         )
@@ -398,10 +428,13 @@ fn extract_cpi_log_data(txn: &SubscribeUpdateTransaction, log_signature: &str) -
                     log_line_index = line_index,
                     cpi_log_present = true,
                     cpi_log_decoded_len_approx = decoded_len,
+                    emitting_program = ?emitting_program_at(&log_messages, *line_index),
                     raw_log = %log_messages[*line_index],
                     "scanner: \"Program data:\" (sol_log_data) log present — not currently read \
-                     by this scanner; its approximate decoded length is logged in case this is \
-                     where the trade data actually lives now"
+                     by this scanner; emitting_program identifies which program logged it (by \
+                     replaying the invoke/success nesting up to this line), and its approximate \
+                     decoded length is logged in case this is where the trade data actually \
+                     lives now"
                 );
             }
         }
@@ -485,41 +518,21 @@ async fn publish_tick(redis_conn: &RedisConn, tick: ScannerTick) {
     }
 }
 
-/// Turns one detected transaction into a trade tick using exactly the
-/// untouched engine's own parser. `None` for anything that isn't a
-/// recognized trade (no matching CPI log, wrapped-SOL mint, etc.) — the
-/// same filtering both modes already applied inline before this was
-/// extracted out of `main()`. `log_signature` is diagnostic-only (a
-/// display string identifying which transaction this call is for, so the
-/// rejection-reason logs below can be correlated with the rest of the
-/// pipeline's per-signature logs even when several are in flight
-/// concurrently) — it plays no role in the detection logic itself.
-fn detect_trade(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option<ScannerTick> {
-    let Some(data) = extract_cpi_log_data(txn, log_signature) else {
-        tracing::debug!(
-            signature = %log_signature,
-            "scanner: REJECTED — no inner instruction with a recognized CPI-log data length \
-             (368/266/270/146/170/138 bytes). Either this transaction doesn't actually touch \
-             PumpFun/PumpSwap/Raydium Launchpad in a way that emits one of those instructions, \
-             or the instruction shape doesn't match what this scanner recognizes."
-        );
-        return None;
-    };
-
-    let Some(parsed) = parse_transaction_data(txn, &data) else {
-        tracing::debug!(
-            signature = %log_signature,
-            cpi_data_len = data.len(),
-            "scanner: REJECTED — a recognized CPI-log length was found, but the engine's \
-             parse_transaction_data() returned None for it (couldn't extract trade data from \
-             this instruction)."
-        );
-        return None;
-    };
-
+/// Shared tail for both detection paths below: WSOL filter, trader
+/// extraction, `ScannerTick` conversion, ACCEPTED log. `detection_method`
+/// is diagnostic-only, distinguishing which path produced this tick in the
+/// logs (useful while both the old inner-instruction path and the newer
+/// PumpSwap log-event path are live side by side).
+fn finalize_detected_trade(
+    parsed: &TradeInfoFromToken,
+    txn: &SubscribeUpdateTransaction,
+    log_signature: &str,
+    detection_method: &str,
+) -> Option<ScannerTick> {
     if parsed.mint == "So11111111111111111111111111111111111111112" {
         tracing::debug!(
             signature = %log_signature,
+            detection_method,
             "scanner: REJECTED — parsed mint is wrapped SOL, filtered out (not a real token trade)."
         );
         return None;
@@ -529,22 +542,327 @@ fn detect_trade(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option
     if trader.is_none() {
         tracing::debug!(
             signature = %log_signature,
+            detection_method,
             "scanner: trader (fee payer) could not be extracted from this transaction — the \
              tick will still publish and be visible to the generic sniper heuristic, but it \
              cannot match any copy-trading target since there's no wallet to compare against."
         );
     }
 
-    let tick = to_scanner_tick(&parsed, trader);
+    let tick = to_scanner_tick(parsed, trader);
     tracing::debug!(
         signature = %log_signature,
         mint = %tick.mint,
         dex = %tick.dex_type,
         is_buy = tick.is_buy,
         trader = ?tick.trader,
+        detection_method,
         "scanner: ACCEPTED — trade detected"
     );
     Some(tick)
+}
+
+/// Mirrors the engine's own (private, inside `parse_transaction_data`'s
+/// 368-byte branch) `extract_token_info`: same index-based (0 -> 1 -> 2)
+/// WSOL-skip fallback and the same hardcoded default mint, so a PumpSwap
+/// trade detected via the log-event path below resolves to the same mint
+/// the engine would have picked had this same trade arrived as an
+/// inner-instruction CPI log instead.
+fn mint_from_post_token_balances(txn: &SubscribeUpdateTransaction) -> String {
+    let post_token_balances = txn
+        .transaction
+        .as_ref()
+        .and_then(|t| t.meta.as_ref())
+        .map(|m| m.post_token_balances.clone())
+        .unwrap_or_default();
+
+    let mut mint = String::new();
+    if !post_token_balances.is_empty() {
+        mint = post_token_balances[0].mint.clone();
+        if mint == "So11111111111111111111111111111111111111112" && post_token_balances.len() > 1 {
+            mint = post_token_balances[1].mint.clone();
+            if mint == "So11111111111111111111111111111111111111112"
+                && post_token_balances.len() > 2
+            {
+                mint = post_token_balances[2].mint.clone();
+            }
+        }
+    }
+
+    if mint.is_empty() {
+        mint = "2ivzYvjnKqA4X3dVvPKr7bctGpbxwrXbbxm44TJCpump".to_string();
+    }
+
+    mint
+}
+
+fn pumpswap_event_u64(payload: &[u8], offset: usize) -> Option<u64> {
+    let bytes: [u8; 8] = payload.get(offset..offset + 8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+fn pumpswap_event_pubkey(payload: &[u8], offset: usize) -> Option<String> {
+    let bytes = payload.get(offset..offset + 32)?;
+    Some(bs58::encode(bytes).into_string())
+}
+
+// Anchor event discriminators: first 8 bytes of sha256("event:<Name>"),
+// computed and verified against PumpSwap's own published IDL
+// (pump-fun/pump-public-docs, idl/pump_amm.json) — not guessed.
+const PUMPSWAP_SELL_EVENT_DISCRIMINATOR: [u8; 8] = [0x3e, 0x2f, 0x37, 0x0a, 0xa5, 0x03, 0xdc, 0x2a];
+const PUMPSWAP_BUY_EVENT_DISCRIMINATOR: [u8; 8] = [0x67, 0xf4, 0x52, 0x1f, 0x2c, 0xf5, 0x77, 0x77];
+
+// `SellEvent` and `BuyEvent` (pump_amm.json) declare identical field
+// types/order up through `coin_creator` (verified field-by-field against
+// the IDL) — only the field *names* differ (e.g. `base_amount_in` vs
+// `base_amount_out`, `quote_amount_out` vs `quote_amount_in`), and only
+// after `coin_creator` do the two events diverge (`BuyEvent` continues
+// with more fixed fields, then a trailing variable-length `ix_name`;
+// `SellEvent` ends). This lets both be decoded through the same offsets.
+// `SellEvent` is entirely fixed-size: 409 borsh bytes + 8-byte
+// discriminator = 417 total, an exact match to the length observed in
+// production for the transactions this scanner had been rejecting.
+const PUMPSWAP_EVENT_MIN_PAYLOAD_LEN: usize = 336; // through coin_creator (offset 304 + 32 bytes)
+
+/// Reads the `SellEvent`/`BuyEvent` fields this scanner actually needs.
+/// `is_buy_event` says which discriminator matched (true = BuyEvent, false
+/// = SellEvent); `payload` is the event body with the 8-byte discriminator
+/// already stripped. Replicates the engine's own 368-byte-branch
+/// price/reverse/sign formulas (see
+/// engine/src/processor/transaction_parser.rs) rather than calling them —
+/// they're private to that match arm, not a reusable fn — so this stays a
+/// pure addition that touches nothing in `engine/`.
+fn build_pumpswap_trade_info(
+    txn: &SubscribeUpdateTransaction,
+    log_signature: &str,
+    is_buy_event: bool,
+    payload: &[u8],
+) -> Option<TradeInfoFromToken> {
+    if payload.len() < PUMPSWAP_EVENT_MIN_PAYLOAD_LEN {
+        return None;
+    }
+
+    let timestamp = pumpswap_event_u64(payload, 0)?;
+    // `base_amount_in` (SellEvent) / `base_amount_out` (BuyEvent) — same
+    // offset in both, same generic role as the inner-instruction CPI log's
+    // `base_amount_in_or_base_amount_out`.
+    let base_amount = pumpswap_event_u64(payload, 8)?;
+    let pool_base_token_reserves = pumpswap_event_u64(payload, 40)?;
+    let pool_quote_token_reserves = pumpswap_event_u64(payload, 48)?;
+    // `quote_amount_out` (SellEvent) / `quote_amount_in` (BuyEvent) — same offset.
+    let quote_amount = pumpswap_event_u64(payload, 56)?;
+    let pool_id = pumpswap_event_pubkey(payload, 112)?;
+    let coin_creator = pumpswap_event_pubkey(payload, 304)?;
+
+    let mint = mint_from_post_token_balances(txn);
+
+    let (price, is_reverse_when_pump_swap) =
+        if pool_base_token_reserves > 0 && pool_quote_token_reserves > 0 {
+            let temp_price = pool_base_token_reserves.saturating_mul(1_000_000_000)
+                / pool_quote_token_reserves.max(1);
+            if temp_price < 1 {
+                (temp_price, true)
+            } else {
+                let normal_price = pool_quote_token_reserves.saturating_mul(1_000_000_000)
+                    / pool_base_token_reserves.max(1);
+                (normal_price, false)
+            }
+        } else {
+            (0, false)
+        };
+
+    // Mirrors the engine's `is_buy = is_reverse_when_pump_swap ?
+    // has_sell_instruction(...) : has_buy_instruction(...)` — here the raw
+    // instruction kind is already known directly from which event
+    // discriminator matched, instead of grepping log lines for it.
+    let is_buy = is_reverse_when_pump_swap != is_buy_event;
+
+    let (sol_change, token_change) = if is_reverse_when_pump_swap {
+        if is_buy {
+            (
+                -(base_amount as f64) / 1_000_000_000.0,
+                quote_amount as f64 / 1_000_000_000.0,
+            )
+        } else {
+            (
+                base_amount as f64 / 1_000_000_000.0,
+                -(quote_amount as f64) / 1_000_000_000.0,
+            )
+        }
+    } else if is_buy {
+        (
+            -(quote_amount as f64) / 1_000_000_000.0,
+            base_amount as f64 / 1_000_000_000.0,
+        )
+    } else {
+        (
+            quote_amount as f64 / 1_000_000_000.0,
+            -(base_amount as f64) / 1_000_000_000.0,
+        )
+    };
+
+    let liquidity = if !is_reverse_when_pump_swap {
+        pool_quote_token_reserves as f64 / 1_000_000_000.0
+    } else {
+        pool_base_token_reserves as f64 / 1_000_000_000.0
+    };
+
+    tracing::debug!(
+        signature = %log_signature,
+        mint = %mint,
+        pool_id = %pool_id,
+        is_buy,
+        is_reverse_when_pump_swap,
+        price,
+        "scanner: PumpSwap Anchor log event decoded into a trade"
+    );
+
+    Some(TradeInfoFromToken {
+        dex_type: DexType::PumpSwap,
+        slot: 0,
+        signature: String::new(),
+        pool_id,
+        mint,
+        timestamp,
+        is_buy,
+        price,
+        is_reverse_when_pump_swap,
+        coin_creator: Some(coin_creator),
+        sol_change,
+        token_change,
+        liquidity,
+        virtual_sol_reserves: pool_quote_token_reserves,
+        virtual_token_reserves: pool_base_token_reserves,
+    })
+}
+
+/// PumpSwap's newer trade-event emission path: rather than (or in addition
+/// to) a fixed-length inner-instruction CPI log, some transactions carry
+/// the same trade data as an ordinary Anchor `sol_log_data` event —
+/// surfaced in `log_messages` as a `"Program data: <base64>"` line, a
+/// completely separate mechanism from inner-instruction call data (see
+/// `emitting_program_at`'s doc comment above). Tries every such line in
+/// order and returns the first one whose discriminator matches
+/// `SellEvent`/`BuyEvent`; a discriminator match that then fails to decode
+/// (payload too short) is logged and skipped rather than treated as fatal,
+/// in case more than one "Program data:" line is present for unrelated
+/// reasons.
+fn detect_pumpswap_log_event(
+    txn: &SubscribeUpdateTransaction,
+    log_signature: &str,
+) -> Option<TradeInfoFromToken> {
+    let log_messages = txn
+        .transaction
+        .as_ref()
+        .and_then(|t| t.meta.as_ref())
+        .map(|m| m.log_messages.clone())
+        .unwrap_or_default();
+
+    for (line_index, line) in log_messages.iter().enumerate() {
+        let Some(b64) = line.strip_prefix("Program data: ") else {
+            continue;
+        };
+        let Ok(payload) = base64::decode(b64) else {
+            tracing::debug!(
+                signature = %log_signature,
+                log_line_index = line_index,
+                "scanner: \"Program data:\" log line failed base64 decode, skipping"
+            );
+            continue;
+        };
+        if payload.len() < 8 {
+            continue;
+        }
+        let discriminator: [u8; 8] = payload[0..8].try_into().expect("checked len >= 8 above");
+        let is_buy_event = if discriminator == PUMPSWAP_BUY_EVENT_DISCRIMINATOR {
+            true
+        } else if discriminator == PUMPSWAP_SELL_EVENT_DISCRIMINATOR {
+            false
+        } else {
+            continue;
+        };
+
+        tracing::debug!(
+            signature = %log_signature,
+            log_line_index = line_index,
+            event = if is_buy_event { "BuyEvent" } else { "SellEvent" },
+            payload_len = payload.len(),
+            "scanner: recognized PumpSwap Anchor log event discriminator"
+        );
+
+        match build_pumpswap_trade_info(txn, log_signature, is_buy_event, &payload[8..]) {
+            Some(parsed) => return Some(parsed),
+            None => {
+                tracing::debug!(
+                    signature = %log_signature,
+                    log_line_index = line_index,
+                    "scanner: PumpSwap log event discriminator matched but field decoding \
+                     failed (payload too short for the fields this scanner reads) — skipping \
+                     this log line"
+                );
+                continue;
+            }
+        }
+    }
+
+    None
+}
+
+/// Turns one detected transaction into a trade tick. Tries the untouched
+/// engine's own parser against a recognized inner-instruction CPI log
+/// first (`extract_cpi_log_data` + `parse_transaction_data`, unchanged
+/// behavior from before this file had a second path); if that finds
+/// nothing, falls back to decoding a PumpSwap Anchor `"Program data:"` log
+/// event (`detect_pumpswap_log_event`) before giving up. `None` for
+/// anything neither path recognizes (wrapped-SOL mint, no matching CPI log
+/// or log event, etc.). `log_signature` is diagnostic-only (a display
+/// string identifying which transaction this call is for, so the
+/// rejection-reason logs below can be correlated with the rest of the
+/// pipeline's per-signature logs even when several are in flight
+/// concurrently) — it plays no role in the detection logic itself.
+fn detect_trade(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option<ScannerTick> {
+    if let Some(data) = extract_cpi_log_data(txn, log_signature) {
+        match parse_transaction_data(txn, &data) {
+            Some(parsed) => {
+                return finalize_detected_trade(
+                    &parsed,
+                    txn,
+                    log_signature,
+                    "inner_instruction_cpi_log",
+                );
+            }
+            None => {
+                tracing::debug!(
+                    signature = %log_signature,
+                    cpi_data_len = data.len(),
+                    "scanner: a recognized CPI-log length was found, but the engine's \
+                     parse_transaction_data() returned None for it — falling back to PumpSwap \
+                     Anchor \"Program data:\" log-event decoding before giving up."
+                );
+            }
+        }
+    } else {
+        tracing::debug!(
+            signature = %log_signature,
+            "scanner: no recognized inner-instruction CPI-log length found — falling back to \
+             PumpSwap Anchor \"Program data:\" log-event decoding (SellEvent/BuyEvent) before \
+             giving up."
+        );
+    }
+
+    if let Some(parsed) = detect_pumpswap_log_event(txn, log_signature) {
+        return finalize_detected_trade(&parsed, txn, log_signature, "pumpswap_log_event");
+    }
+
+    tracing::debug!(
+        signature = %log_signature,
+        "scanner: REJECTED — no inner instruction with a recognized CPI-log data length \
+         (368/266/270/146/170/138 bytes), and no recognized PumpSwap Anchor log event \
+         (SellEvent/BuyEvent) either. Either this transaction doesn't actually touch \
+         PumpFun/PumpSwap/Raydium Launchpad in a way this scanner recognizes, or its emission \
+         format has changed again."
+    );
+    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1197,19 +1515,49 @@ fn to_synthetic_subscribe_update(
     tracing::debug!(
         signature = %log_signature,
         decoded = decoded.is_some(),
-        "scanner: transaction decode (for fee-payer extraction) result"
+        "scanner: transaction decode (for account-key extraction) result"
     );
-    let fee_payer_account_keys: Vec<Vec<u8>> = decoded
-        .and_then(|versioned_tx| {
+    let static_account_keys: Vec<Vec<u8>> = decoded
+        .map(|versioned_tx| {
             versioned_tx
                 .message
                 .static_account_keys()
-                .first()
-                .map(|fee_payer| vec![fee_payer.to_bytes().to_vec()])
+                .iter()
+                .map(|pk| pk.to_bytes().to_vec())
+                .collect()
         })
         .unwrap_or_default();
 
     let meta: UiTransactionStatusMeta = confirmed.transaction.meta?;
+
+    // Inner-instruction `program_id_index`/`accounts` on a v0 (versioned)
+    // transaction can index into addresses loaded from an Address Lookup
+    // Table, not just the message's own static account keys — Solana's
+    // canonical indexing order is: static keys, then ALT-loaded writable
+    // addresses, then ALT-loaded readonly addresses. Previously only the
+    // fee payer (the message's first static key) was ever kept here,
+    // which is exactly why every inner instruction's `program_id_index`
+    // came back unresolvable in production: any CPI instruction pointing
+    // past index 0 — i.e. essentially all of them — had nothing to
+    // resolve against.
+    let loaded_addresses: Vec<Vec<u8>> = match &meta.loaded_addresses {
+        OptionSerializer::Some(loaded) => loaded
+            .writable
+            .iter()
+            .chain(loaded.readonly.iter())
+            .filter_map(|addr| bs58::decode(addr).into_vec().ok())
+            .collect(),
+        OptionSerializer::None | OptionSerializer::Skip => Vec::new(),
+    };
+    let account_keys: Vec<Vec<u8>> = static_account_keys
+        .into_iter()
+        .chain(loaded_addresses)
+        .collect();
+    tracing::debug!(
+        signature = %log_signature,
+        account_key_count = account_keys.len(),
+        "scanner: synthetic transaction account keys assembled (static + ALT-loaded)"
+    );
 
     let log_messages: Vec<String> = Option::from(meta.log_messages).unwrap_or_default();
 
@@ -1269,7 +1617,7 @@ fn to_synthetic_subscribe_update(
             transaction: Some(Transaction {
                 signatures: Vec::new(),
                 message: Some(Message {
-                    account_keys: fee_payer_account_keys,
+                    account_keys,
                     ..Default::default()
                 }),
             }),
