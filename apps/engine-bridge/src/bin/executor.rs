@@ -163,38 +163,74 @@ fn dex_str_from_protocol(protocol: &SwapProtocol) -> &'static str {
 
 /// Executes a manual "close position" — used by both the one-shot
 /// (`EXECUTOR_SELL_ONCE_MINT`, bot not currently running) and in-loop
-/// (`ExecutorCommand::Sell`, bot running) paths below, since both need the
-/// exact same on-chain action: liquidate 100% of whatever this wallet
-/// actually holds for `mint`, unconditionally (`unified_emergency_sell`'s
-/// own balance check queries the chain directly — it doesn't depend on
-/// TOKEN_METRICS or `held_positions` containing the mint, which is exactly
-/// why this works even for a position this specific process never itself
-/// tracked, e.g. after a restart or a stuck/buggy auto-sell).
+/// (`ExecutorCommand::Sell`, bot running) paths below. Goes straight
+/// through Jupiter, exactly like every buy in this file already does (see
+/// the module doc comment) — NOT through `unified_emergency_sell`.
+///
+/// That was the first version of this function, and it was wrong: when
+/// `parsed_data` is `None` (nothing to pass — there's no fresh tick here,
+/// which is the whole point of a *manual* close), `unified_emergency_sell`
+/// falls back to building a `TradeInfoFromToken` from this process's own
+/// `TOKEN_METRICS`, and fails outright ("No metrics found for token ...")
+/// if that entry doesn't exist — exactly the case this button exists for
+/// (a position from before this process started, after a restart, or one
+/// its own auto-sell logic got stuck on). Even when metrics DO exist, the
+/// protocol it falls back to for the DEX-specific sell dispatch defaults
+/// to PumpFun when unknown — the same wrong-DEX-default risk already
+/// fixed on the buy side. Querying the real on-chain SPL balance directly
+/// (via `resolve_wallet_ata`'s Token-2022-aware derivation, same as
+/// `unified_emergency_sell`'s own balance check) and selling through
+/// Jupiter sidesteps both problems: no cached state needed, no DEX to
+/// guess.
 ///
 /// Reports the SOL actually received by diffing the wallet's native
-/// balance immediately before/after the sell, rather than the
-/// `amount_token * last_known_price` estimate the tick-driven sell paths
-/// above use — there's no fresh tick price available here, and this is
-/// more accurate anyway. Returns `Ok(None)` when there was nothing to
-/// sell (zero on-chain balance).
+/// balance immediately before/after the sell, since Jupiter's client
+/// (like the engine's own DEX-specific sell paths) doesn't return fill
+/// data either. Returns `Ok(None)` when there was nothing to sell (zero
+/// on-chain balance).
 async fn execute_manual_sell(
     mint: &str,
-    selling_engine: &SellingEngine,
     app_state: &Arc<AppState>,
-) -> anyhow::Result<Option<(String, f64)>> {
+) -> anyhow::Result<Option<(String, f64, f64)>> {
     let wallet_pubkey = app_state.wallet.try_pubkey()?;
+    let mint_pubkey = mint.parse()?;
+    let ata = solana_vntr_sniper::processor::selling_strategy::resolve_wallet_ata(
+        app_state.rpc_nonblocking_client.clone(),
+        &wallet_pubkey,
+        &mint_pubkey,
+    )
+    .await?;
+
+    let (raw_amount, decimals) = match app_state
+        .rpc_nonblocking_client
+        .get_token_account(&ata)
+        .await
+    {
+        Ok(Some(account)) => (
+            account.token_amount.amount.parse::<u64>().unwrap_or(0),
+            account.token_amount.decimals,
+        ),
+        _ => (0, 0),
+    };
+    if raw_amount == 0 {
+        return Ok(None);
+    }
+    let token_amount = raw_amount as f64 / 10f64.powi(decimals as i32);
+
     let sol_before = app_state
         .rpc_nonblocking_client
         .get_balance(&wallet_pubkey)
         .await
         .unwrap_or(0);
 
-    let signature = selling_engine
-        .unified_emergency_sell(mint, true, None, None)
+    let jupiter_client = JupiterClient::new(app_state.rpc_nonblocking_client.clone());
+    // 10% slippage — this is an emergency/manual liquidation, not a normal
+    // buy, so prioritizing "it actually goes through" over price matches
+    // unified_emergency_sell's own emergency slippage (10-15%, see
+    // selling_strategy.rs's execute_emergency_sell_internal).
+    let signature = jupiter_client
+        .sell_token_with_jupiter(mint, raw_amount, 1000, &app_state.wallet)
         .await?;
-    if signature == "no_tokens_to_sell" {
-        return Ok(None);
-    }
 
     let sol_after = app_state
         .rpc_nonblocking_client
@@ -203,26 +239,18 @@ async fn execute_manual_sell(
         .unwrap_or(sol_before);
     let sol_received = sol_after.saturating_sub(sol_before) as f64 / 1_000_000_000.0;
 
-    Ok(Some((signature, sol_received)))
+    Ok(Some((signature, sol_received, token_amount)))
 }
 
-/// Best-effort token amount + dex label for the manual-sell Trade event —
-/// `held_positions` (this process's own buy-time estimate) when available,
-/// else the engine's own TOKEN_METRICS (populated by `update_metrics` on
-/// every tick for a held position), else zero/Unknown. Purely cosmetic:
-/// `execute_manual_sell` above already gets the real SOL amount from an
-/// actual on-chain balance diff regardless of what this returns.
-fn manual_sell_display_info(
-    mint: &str,
-    held_positions: &std::collections::HashMap<String, f64>,
-) -> (f64, &'static str) {
-    if let Some(metrics) = TOKEN_METRICS.get(mint) {
-        return (
-            metrics.amount_held,
-            dex_str_from_protocol(&metrics.protocol),
-        );
-    }
-    (held_positions.get(mint).copied().unwrap_or(0.0), "Unknown")
+/// Best-effort dex label for the manual-sell Trade event, from the
+/// engine's own TOKEN_METRICS (populated by `update_metrics` on every
+/// tick for a held position) when available, else "Unknown" — purely
+/// cosmetic, doesn't affect how the sell itself is executed.
+fn manual_sell_dex_label(mint: &str) -> &'static str {
+    TOKEN_METRICS
+        .get(mint)
+        .map(|metrics| dex_str_from_protocol(&metrics.protocol))
+        .unwrap_or("Unknown")
 }
 
 #[tokio::main]
@@ -363,12 +391,10 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(mint) = sell_once_mint {
         tracing::info!(%user_id, %mint, "executor: manual close-position (one-shot mode, bot was not running)");
-        let (display_amount_token, dex) =
-            manual_sell_display_info(&mint, &std::collections::HashMap::new());
-        match execute_manual_sell(&mint, &selling_engine, &app_state).await {
-            Ok(Some((signature, sol_received))) => {
-                let price_sol = if display_amount_token > 0.0 {
-                    sol_received / display_amount_token
+        match execute_manual_sell(&mint, &app_state).await {
+            Ok(Some((signature, sol_received, amount_token))) => {
+                let price_sol = if amount_token > 0.0 {
+                    sol_received / amount_token
                 } else {
                     0.0
                 };
@@ -378,10 +404,10 @@ async fn main() -> anyhow::Result<()> {
                         user_id: user_id.clone(),
                         side: TradeSide::Sell,
                         mint: mint.clone(),
-                        dex: dex.to_string(),
+                        dex: manual_sell_dex_label(&mint).to_string(),
                         price_sol,
                         amount_sol: sol_received,
-                        amount_token: display_amount_token,
+                        amount_token,
                         tx_signature: Some(signature),
                         reason: Some("manual_close".into()),
                         at: now_iso(),
@@ -531,13 +557,11 @@ async fn main() -> anyhow::Result<()> {
                     match command {
                         ExecutorCommand::Sell { mint } => {
                             tracing::info!(%user_id, %mint, "executor: manual close-position command received");
-                            let (display_amount_token, dex) =
-                                manual_sell_display_info(&mint, &held_positions);
-                            match execute_manual_sell(&mint, &selling_engine, &app_state).await {
-                                Ok(Some((signature, sol_received))) => {
+                            match execute_manual_sell(&mint, &app_state).await {
+                                Ok(Some((signature, sol_received, amount_token))) => {
                                     held_positions.remove(&mint);
-                                    let price_sol = if display_amount_token > 0.0 {
-                                        sol_received / display_amount_token
+                                    let price_sol = if amount_token > 0.0 {
+                                        sol_received / amount_token
                                     } else {
                                         0.0
                                     };
@@ -547,10 +571,10 @@ async fn main() -> anyhow::Result<()> {
                                             user_id: user_id.clone(),
                                             side: TradeSide::Sell,
                                             mint: mint.clone(),
-                                            dex: dex.to_string(),
+                                            dex: manual_sell_dex_label(&mint).to_string(),
                                             price_sol,
                                             amount_sol: sol_received,
-                                            amount_token: display_amount_token,
+                                            amount_token,
                                             tx_signature: Some(signature),
                                             reason: Some("manual_close".into()),
                                             at: now_iso(),

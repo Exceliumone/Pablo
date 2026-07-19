@@ -50,7 +50,10 @@ impl From<SwapProtocol> for DexType {
 /// on the buy side for PumpSwap (see `block_engine::token::
 /// get_mint_token_program`'s doc comment) — this is that same helper,
 /// applied to the balance-check/emergency-sell call sites in this file.
-async fn resolve_wallet_ata(
+/// `pub` so apps/engine-bridge's executor.rs can reuse it directly for its
+/// manual "Close Position" balance check, instead of re-deriving the same
+/// wrong-address bug independently.
+pub async fn resolve_wallet_ata(
     client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
     wallet: &Pubkey,
     mint: &Pubkey,
