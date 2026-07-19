@@ -1980,11 +1980,22 @@ impl SellingEngine {
                 match pump.build_swap_from_parsed_data(&emergency_trade_info, emergency_config).await {
                     Ok((keypair, instructions, price)) => {
                         // Get recent blockhash from the processor
-                        let recent_blockhash = match crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                            Some(hash) => hash,
-                            None => {
-                                self.logger.log("Failed to get recent blockhash".red().to_string());
-                                return Err(anyhow!("Failed to get recent blockhash"));
+                        // get_blockhash_or_fallback (already used on the buy
+                        // path — see sniper_bot.rs) tries the process-wide
+                        // 300ms-refreshed cache first, and falls back to a
+                        // direct RPC fetch instead of giving up outright if
+                        // that cache happens to be momentarily empty/stale
+                        // (e.g. a transient hiccup on the shared free public
+                        // RPC) — a bare BlockhashProcessor::get_latest_blockhash()
+                        // call, which is all this used before, has no such
+                        // fallback and fails the whole sell over what's
+                        // often just a few hundred milliseconds of bad
+                        // timing.
+                        let recent_blockhash = match crate::processor::sniper_bot::get_blockhash_or_fallback(&self.app_state, &self.logger).await {
+                            Ok(hash) => hash,
+                            Err(e) => {
+                                self.logger.log(format!("Failed to get recent blockhash: {}", e).red().to_string());
+                                return Err(anyhow!("Failed to get recent blockhash: {}", e));
                             }
                         };
                         self.logger.log(format!("Generated emergency PumpFun sell instruction at price: {}", price));
@@ -2043,11 +2054,22 @@ impl SellingEngine {
                 match pump_swap.build_swap_from_parsed_data(&emergency_trade_info, emergency_config).await {
                     Ok((keypair, instructions, price)) => {
                         // Get recent blockhash from the processor
-                        let recent_blockhash = match crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                            Some(hash) => hash,
-                            None => {
-                                self.logger.log("Failed to get recent blockhash".red().to_string());
-                                return Err(anyhow!("Failed to get recent blockhash"));
+                        // get_blockhash_or_fallback (already used on the buy
+                        // path — see sniper_bot.rs) tries the process-wide
+                        // 300ms-refreshed cache first, and falls back to a
+                        // direct RPC fetch instead of giving up outright if
+                        // that cache happens to be momentarily empty/stale
+                        // (e.g. a transient hiccup on the shared free public
+                        // RPC) — a bare BlockhashProcessor::get_latest_blockhash()
+                        // call, which is all this used before, has no such
+                        // fallback and fails the whole sell over what's
+                        // often just a few hundred milliseconds of bad
+                        // timing.
+                        let recent_blockhash = match crate::processor::sniper_bot::get_blockhash_or_fallback(&self.app_state, &self.logger).await {
+                            Ok(hash) => hash,
+                            Err(e) => {
+                                self.logger.log(format!("Failed to get recent blockhash: {}", e).red().to_string());
+                                return Err(anyhow!("Failed to get recent blockhash: {}", e));
                             }
                         };
                         self.logger.log(format!("Generated emergency PumpSwap sell instruction at price: {}", price));
@@ -2106,11 +2128,22 @@ impl SellingEngine {
                 match raydium.build_swap_from_parsed_data(&emergency_trade_info, emergency_config).await {
                     Ok((keypair, instructions, price)) => {
                         // Get recent blockhash from the processor
-                        let recent_blockhash = match crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                            Some(hash) => hash,
-                            None => {
-                                self.logger.log("Failed to get recent blockhash".red().to_string());
-                                return Err(anyhow!("Failed to get recent blockhash"));
+                        // get_blockhash_or_fallback (already used on the buy
+                        // path — see sniper_bot.rs) tries the process-wide
+                        // 300ms-refreshed cache first, and falls back to a
+                        // direct RPC fetch instead of giving up outright if
+                        // that cache happens to be momentarily empty/stale
+                        // (e.g. a transient hiccup on the shared free public
+                        // RPC) — a bare BlockhashProcessor::get_latest_blockhash()
+                        // call, which is all this used before, has no such
+                        // fallback and fails the whole sell over what's
+                        // often just a few hundred milliseconds of bad
+                        // timing.
+                        let recent_blockhash = match crate::processor::sniper_bot::get_blockhash_or_fallback(&self.app_state, &self.logger).await {
+                            Ok(hash) => hash,
+                            Err(e) => {
+                                self.logger.log(format!("Failed to get recent blockhash: {}", e).red().to_string());
+                                return Err(anyhow!("Failed to get recent blockhash: {}", e));
                             }
                         };
                         self.logger.log(format!("Generated emergency Raydium sell instruction at price: {}", price));
@@ -2168,11 +2201,22 @@ impl SellingEngine {
                 
                 match pump.build_swap_from_parsed_data(&emergency_trade_info, emergency_config).await {
                     Ok((keypair, instructions, price)) => {
-                        let recent_blockhash = match crate::library::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                            Some(hash) => hash,
-                            None => {
-                                self.logger.log("Failed to get recent blockhash".red().to_string());
-                                return Err(anyhow!("Failed to get recent blockhash"));
+                        // get_blockhash_or_fallback (already used on the buy
+                        // path — see sniper_bot.rs) tries the process-wide
+                        // 300ms-refreshed cache first, and falls back to a
+                        // direct RPC fetch instead of giving up outright if
+                        // that cache happens to be momentarily empty/stale
+                        // (e.g. a transient hiccup on the shared free public
+                        // RPC) — a bare BlockhashProcessor::get_latest_blockhash()
+                        // call, which is all this used before, has no such
+                        // fallback and fails the whole sell over what's
+                        // often just a few hundred milliseconds of bad
+                        // timing.
+                        let recent_blockhash = match crate::processor::sniper_bot::get_blockhash_or_fallback(&self.app_state, &self.logger).await {
+                            Ok(hash) => hash,
+                            Err(e) => {
+                                self.logger.log(format!("Failed to get recent blockhash: {}", e).red().to_string());
+                                return Err(anyhow!("Failed to get recent blockhash: {}", e));
                             }
                         };
                         self.logger.log(format!("Generated emergency PumpFun sell instruction at price: {}", price));

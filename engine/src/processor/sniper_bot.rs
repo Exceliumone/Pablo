@@ -715,7 +715,7 @@ async fn verify_transaction(
 /// first (cheap, no I/O); if it's empty or older than
 /// BLOCKHASH_STALENESS_THRESHOLD, falls back to fetching one directly via
 /// `app_state.rpc_client` before giving up.
-async fn get_blockhash_or_fallback(
+pub(crate) async fn get_blockhash_or_fallback(
     app_state: &Arc<AppState>,
     logger: &Logger,
 ) -> Result<solana_sdk::hash::Hash, String> {
