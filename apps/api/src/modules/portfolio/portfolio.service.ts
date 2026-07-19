@@ -1,5 +1,15 @@
 import type { PortfolioDto, PositionDto } from "@pablo/shared-types";
 import { prisma } from "../../lib/prisma.js";
+import { closePositionManually } from "../bot/bot.service.js";
+
+export class PortfolioError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: number,
+  ) {
+    super(message);
+  }
+}
 
 function toPositionDto(p: {
   id: string;
@@ -61,4 +71,27 @@ export async function getPortfolio(userId: string): Promise<PortfolioDto> {
       totalRealizedPnlSol: closedAgg._sum.realizedPnlSol ?? 0,
     },
   };
+}
+
+/**
+ * Manual "Close Position" — lets a user force-sell a stuck position (e.g.
+ * the bot's own auto-sell logic hit a bug and won't liquidate it) without
+ * waiting on take-profit/stop-loss. Only accepts an id that's actually
+ * this user's own OPEN position — this is what confirms both ownership
+ * and that there's genuinely still something to close, since a raw mint
+ * address alone would let a user "close" a position they don't hold or
+ * one already closed. The actual sell happens asynchronously (the
+ * executor picks up the command and executes on-chain); this only
+ * confirms the request was accepted — the position row itself flips to
+ * CLOSED once event-persister.ts processes the resulting Trade event, not
+ * immediately when this returns.
+ */
+export async function closePosition(userId: string, positionId: string): Promise<void> {
+  const position = await prisma.position.findFirst({
+    where: { id: positionId, userId, status: "OPEN" },
+  });
+  if (!position) {
+    throw new PortfolioError("Position introuvable ou déjà clôturée.", 404);
+  }
+  await closePositionManually(userId, position.tokenMint);
 }

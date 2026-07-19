@@ -16,6 +16,50 @@ pub fn executor_events_channel(user_id: &str) -> String {
     format!("executor:events:{user_id}")
 }
 
+/// Per-user command stream, orchestrator -> a specific running executor
+/// (the reverse direction of everything else here — every other
+/// stream/channel in this file is executor -> orchestrator/apps/api). Used
+/// for the "Close Position" manual-sell button: apps/api ->
+/// POST /internal/executors/:userId/sell -> orchestrator XADDs an
+/// `ExecutorCommand` here -> that user's already-running executor process
+/// (it XREADs this alongside `SCANNER_TICKS_STREAM` — see executor.rs)
+/// picks it up and sells immediately. When no executor is currently
+/// running for that user, the orchestrator takes a different path instead
+/// (a one-shot spawn, see main.rs's spawn_sell_once) since nothing would
+/// ever read this stream in that case.
+pub fn executor_commands_stream(user_id: &str) -> String {
+    format!("executor:commands:{user_id}")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ExecutorCommand {
+    /// Force-sell 100% of whatever this wallet actually holds for `mint`,
+    /// regardless of this executor's own in-memory position tracking —
+    /// see executor.rs's `execute_manual_sell` doc comment for why that's
+    /// safe/correct even for a position this process never itself bought.
+    Sell { mint: String },
+}
+
+/// Body of `POST /internal/executors/:userId/sell`. `fallback_payload` is
+/// only used when no executor is currently running for this user (the
+/// orchestrator then does a one-shot spawn instead of publishing onto
+/// `executor_commands_stream`, since nothing would be reading it) — apps/api
+/// always includes it anyway (same freshly-decrypted-wallet payload it
+/// already builds for `/start`), so this endpoint never has to depend on
+/// the orchestrator's registry having retained a wallet secret from an
+/// earlier request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SellPositionRequest {
+    pub mint: String,
+    pub fallback_payload: ExecutorStartPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SellPositionAck {
+    pub accepted: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum BotStatus {

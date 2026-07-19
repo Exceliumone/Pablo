@@ -1,6 +1,8 @@
 "use client";
 
+import { Loader2 } from "lucide-react";
 import type { PositionDto } from "@pablo/shared-types";
+import { Button } from "@/components/ui/button";
 import { EntityLink } from "@/components/ui/entity-link";
 import { cn } from "@/lib/utils";
 
@@ -8,7 +10,18 @@ function formatSol(n: number, digits = 4): string {
   return n.toFixed(digits);
 }
 
-export function PositionsTable({ positions }: { positions: PositionDto[] }) {
+/** `onClosePosition` is optional so this table can still be reused
+ * read-only elsewhere without wiring up the mutation — when omitted, no
+ * action column is rendered at all rather than a disabled/no-op button. */
+export function PositionsTable({
+  positions,
+  onClosePosition,
+  closingPositionId,
+}: {
+  positions: PositionDto[];
+  onClosePosition?: (position: PositionDto) => void;
+  closingPositionId?: string | null;
+}) {
   if (positions.length === 0) {
     return (
       <div className="glass rounded-xl p-10 text-center text-sm text-muted-foreground">
@@ -29,6 +42,7 @@ export function PositionsTable({ positions }: { positions: PositionDto[] }) {
             <th className="px-5 py-3 font-medium">Coût (SOL)</th>
             <th className="px-5 py-3 font-medium">PnL réalisé</th>
             <th className="px-5 py-3 font-medium">Ouverte</th>
+            {onClosePosition && <th className="px-5 py-3 font-medium" />}
           </tr>
         </thead>
         <tbody>
@@ -71,6 +85,25 @@ export function PositionsTable({ positions }: { positions: PositionDto[] }) {
               <td className="text-tabular px-5 py-3 text-xs text-muted-foreground">
                 {new Date(p.openedAt).toLocaleDateString("fr-FR")}
               </td>
+              {onClosePosition && (
+                <td className="px-5 py-3 text-right">
+                  {p.status === "OPEN" && (
+                    <Button
+                      variant="glass"
+                      size="sm"
+                      onClick={() => onClosePosition(p)}
+                      disabled={closingPositionId === p.id}
+                      className="border-danger/30 text-danger hover:border-danger/50 hover:bg-danger/10"
+                    >
+                      {closingPositionId === p.id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        "Clôturer"
+                      )}
+                    </Button>
+                  )}
+                </td>
+              )}
             </tr>
           ))}
         </tbody>

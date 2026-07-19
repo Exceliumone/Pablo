@@ -13,9 +13,13 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dashmap::DashMap;
-use engine_bridge::contract::{BotEvent, BotStatus, ExecutorStartPayload, ExecutorStatusView};
+use engine_bridge::contract::{
+    executor_commands_stream, BotEvent, BotStatus, ExecutorCommand, ExecutorStartPayload,
+    ExecutorStatusView, SellPositionRequest,
+};
 use engine_bridge::events::{now_iso, publish_event};
 use futures_util::StreamExt;
+use redis::AsyncCommands;
 use serde::Serialize;
 
 #[derive(Clone)]
@@ -288,6 +292,119 @@ fn spawn_executor(
     Ok(())
 }
 
+/// One-shot variant of `spawn_executor` for the "Close Position" button
+/// when no executor is currently running for this user — reuses the same
+/// binary and payload shape (wallet/RPC config), but sets
+/// `EXECUTOR_SELL_ONCE_MINT` so the process sells `mint` once and exits
+/// instead of entering its normal scanner-tick loop (see executor.rs's
+/// `main`). Deliberately does NOT touch `ctx.registry`: this isn't the
+/// user's persistent bot process, so it must never be tracked, restarted
+/// on crash, or interfere with a later `/start` — it stands entirely on
+/// its own and is left to exit on its own.
+fn spawn_sell_once(
+    ctx: &Arc<AppCtx>,
+    user_id: &str,
+    payload: ExecutorStartPayload,
+    mint: &str,
+) -> Result<(), StatusCode> {
+    let payload_json = serde_json::to_string(&payload).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let mut child = tokio::process::Command::new(&ctx.executor_bin_path)
+        .env("EXECUTOR_CONFIG_JSON", payload_json)
+        .env("EXECUTOR_SELL_ONCE_MINT", mint)
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            tracing::error!(error = %e, %user_id, "failed to spawn sell-once executor");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if let Some(stdout) = child.stdout.take() {
+        let user_id = user_id.to_string();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::info!(%user_id, executor_log = %line, mode = "sell_once");
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let user_id = user_id.to_string();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(%user_id, executor_log = %line, mode = "sell_once");
+            }
+        });
+    }
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+
+    Ok(())
+}
+
+/// "Close Position" — routes into whichever channel actually reaches this
+/// user's wallet right now. If their executor is already running, publish
+/// onto its command stream (it's already `XREAD`ing this alongside scanner
+/// ticks — see executor.rs's main loop) so the sell happens inside that
+/// same long-lived process, consistent with the "one OS process per user"
+/// rule. If it's not running (stopped, crashed, never started), spawning a
+/// second process for that wallet while an existing one might still be up
+/// would violate that same rule — but we already just checked it isn't —
+/// so a one-shot process is spawned instead, purely to perform this one
+/// sell and exit.
+async fn sell_position(
+    State(ctx): State<Arc<AppCtx>>,
+    Path(user_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SellPositionRequest>,
+) -> Result<Json<engine_bridge::contract::SellPositionAck>, StatusCode> {
+    check_auth(&ctx, &headers)?;
+
+    let is_running = ctx
+        .registry
+        .get(&user_id)
+        .map(|s| matches!(s.status, BotStatus::Running | BotStatus::Starting))
+        .unwrap_or(false);
+
+    if is_running {
+        let mut conn = ctx
+            .redis_client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, %user_id, "sell_position: redis connect failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let command = ExecutorCommand::Sell { mint: body.mint };
+        let command_json =
+            serde_json::to_string(&command).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let _: String = conn
+            .xadd(
+                executor_commands_stream(&user_id),
+                "*",
+                &[("data", command_json)],
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, %user_id, "sell_position: failed to publish command");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    } else {
+        spawn_sell_once(&ctx, &user_id, body.fallback_payload, &body.mint)?;
+    }
+
+    Ok(Json(engine_bridge::contract::SellPositionAck {
+        accepted: true,
+    }))
+}
+
 async fn start_executor(
     State(ctx): State<Arc<AppCtx>>,
     Path(user_id): Path<String>,
@@ -477,6 +594,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/internal/executors", get(list_executors))
         .route("/internal/executors/:userId/start", post(start_executor))
         .route("/internal/executors/:userId/stop", post(stop_executor))
+        .route("/internal/executors/:userId/sell", post(sell_position))
         .route("/internal/executors/:userId", get(get_status))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(ctx);

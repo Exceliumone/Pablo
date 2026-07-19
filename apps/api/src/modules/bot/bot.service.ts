@@ -1,7 +1,12 @@
 import type { BotSettingsDto } from "@pablo/shared-types";
 import { prisma } from "../../lib/prisma.js";
 import { env } from "../../config/env.js";
-import { startExecutor, stopExecutor, getExecutorStatus } from "../../lib/engine-bridge-client.js";
+import {
+  startExecutor,
+  stopExecutor,
+  getExecutorStatus,
+  sellPosition,
+} from "../../lib/engine-bridge-client.js";
 import { decryptTradingWalletSecret, getOrCreateTradingWallet } from "../wallet/wallet.service.js";
 import { trackWalletsForUser, untrackWalletsForUser } from "../../lib/tracked-wallets.js";
 
@@ -94,6 +99,49 @@ async function requireActiveSubscription(userId: string) {
   }
 }
 
+/** Shared by startBot and closePositionManually — both need the exact same
+ * wallet+RPC+settings shape the executor expects, freshly built (never
+ * cached/reused across requests) since it carries a decrypted wallet
+ * secret. */
+async function buildExecutorPayload(userId: string, settings: BotSettingsRow) {
+  const secretKeyB58 = await decryptTradingWalletSecret(userId);
+  return {
+    user_id: userId,
+    wallet_secret_key_b58: secretKeyB58,
+    rpc_http: env.RPC_HTTP,
+    zero_slot_url: env.ZERO_SLOT_URL,
+    redis_url: env.REDIS_URL,
+    settings: {
+      amount_per_buy_sol: settings.amountPerBuySol,
+      take_profit_pct: settings.takeProfitPct,
+      stop_loss_pct: settings.stopLossPct,
+      trailing_stop_pct: settings.trailingStopPct,
+      priority_fee_lamports: Number(settings.priorityFeeLamports),
+      slippage_bps: settings.slippageBps,
+      auto_sell: settings.autoSell,
+      copy_trading_enabled: settings.copyTradingEnabled,
+      copy_trading_targets: settings.copyTradingTargets,
+      protocol_preference: settings.protocolPreference,
+    },
+  };
+}
+
+/** "Close Position" — force-sells 100% of whatever this wallet actually
+ * holds for `mint` right now, via engine-bridge's /sell endpoint, which
+ * routes into the already-running executor if there is one, or spawns a
+ * one-shot process otherwise. Doesn't require an active subscription
+ * (unlike startBot) — a user shouldn't be locked out of recovering a stuck
+ * position just because their Premium lapsed. */
+export async function closePositionManually(userId: string, mint: string) {
+  const settings = await prisma.botSettings.upsert({
+    where: { userId },
+    create: { userId },
+    update: {},
+  });
+  const payload = await buildExecutorPayload(userId, settings);
+  await sellPosition(userId, mint, payload);
+}
+
 export async function startBot(userId: string) {
   await requireActiveSubscription(userId);
 
@@ -101,7 +149,7 @@ export async function startBot(userId: string) {
     prisma.botSettings.upsert({ where: { userId }, create: { userId }, update: {} }),
     getOrCreateTradingWallet(userId),
   ]);
-  const secretKeyB58 = await decryptTradingWalletSecret(userId);
+  const payload = await buildExecutorPayload(userId, settings);
 
   await prisma.botSettings.update({ where: { userId }, data: { isActive: true } });
 
@@ -120,25 +168,7 @@ export async function startBot(userId: string) {
     settings.copyTradingEnabled ? settings.copyTradingTargets : [],
   );
 
-  const status = await startExecutor({
-    user_id: userId,
-    wallet_secret_key_b58: secretKeyB58,
-    rpc_http: env.RPC_HTTP,
-    zero_slot_url: env.ZERO_SLOT_URL,
-    redis_url: env.REDIS_URL,
-    settings: {
-      amount_per_buy_sol: settings.amountPerBuySol,
-      take_profit_pct: settings.takeProfitPct,
-      stop_loss_pct: settings.stopLossPct,
-      trailing_stop_pct: settings.trailingStopPct,
-      priority_fee_lamports: Number(settings.priorityFeeLamports),
-      slippage_bps: settings.slippageBps,
-      auto_sell: settings.autoSell,
-      copy_trading_enabled: settings.copyTradingEnabled,
-      copy_trading_targets: settings.copyTradingTargets,
-      protocol_preference: settings.protocolPreference,
-    },
-  });
+  const status = await startExecutor(payload);
 
   return { status, walletPublicKey: wallet.publicKey };
 }

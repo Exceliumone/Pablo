@@ -60,7 +60,8 @@ use std::time::{Duration, Instant};
 
 use anchor_client::solana_sdk::signature::{Keypair, Signer};
 use engine_bridge::contract::{
-    BotEvent, BotStatus, ExecutorStartPayload, ScannerTick, TradeSide, SCANNER_TICKS_STREAM,
+    executor_commands_stream, BotEvent, BotStatus, ExecutorCommand, ExecutorStartPayload,
+    ScannerTick, TradeSide, SCANNER_TICKS_STREAM,
 };
 use engine_bridge::events::{now_iso, publish_event};
 use redis::streams::{StreamReadOptions, StreamReadReply};
@@ -71,7 +72,9 @@ use solana_vntr_sniper::common::config::{
 };
 use solana_vntr_sniper::library::blockhash_processor::BlockhashProcessor;
 use solana_vntr_sniper::library::jupiter_api::JupiterClient;
-use solana_vntr_sniper::processor::selling_strategy::{SellingConfig, SellingEngine};
+use solana_vntr_sniper::processor::selling_strategy::{
+    SellingConfig, SellingEngine, TOKEN_METRICS,
+};
 use solana_vntr_sniper::processor::swap::{SwapDirection, SwapInType, SwapProtocol};
 use solana_vntr_sniper::processor::transaction_parser::{DexType, TradeInfoFromToken};
 
@@ -149,6 +152,79 @@ fn tick_to_trade_info(tick: &ScannerTick) -> TradeInfoFromToken {
     }
 }
 
+fn dex_str_from_protocol(protocol: &SwapProtocol) -> &'static str {
+    match protocol {
+        SwapProtocol::PumpFun => "PumpFun",
+        SwapProtocol::PumpSwap => "PumpSwap",
+        SwapProtocol::RaydiumLaunchpad => "RaydiumLaunchpad",
+        SwapProtocol::Auto | SwapProtocol::Unknown => "Unknown",
+    }
+}
+
+/// Executes a manual "close position" — used by both the one-shot
+/// (`EXECUTOR_SELL_ONCE_MINT`, bot not currently running) and in-loop
+/// (`ExecutorCommand::Sell`, bot running) paths below, since both need the
+/// exact same on-chain action: liquidate 100% of whatever this wallet
+/// actually holds for `mint`, unconditionally (`unified_emergency_sell`'s
+/// own balance check queries the chain directly — it doesn't depend on
+/// TOKEN_METRICS or `held_positions` containing the mint, which is exactly
+/// why this works even for a position this specific process never itself
+/// tracked, e.g. after a restart or a stuck/buggy auto-sell).
+///
+/// Reports the SOL actually received by diffing the wallet's native
+/// balance immediately before/after the sell, rather than the
+/// `amount_token * last_known_price` estimate the tick-driven sell paths
+/// above use — there's no fresh tick price available here, and this is
+/// more accurate anyway. Returns `Ok(None)` when there was nothing to
+/// sell (zero on-chain balance).
+async fn execute_manual_sell(
+    mint: &str,
+    selling_engine: &SellingEngine,
+    app_state: &Arc<AppState>,
+) -> anyhow::Result<Option<(String, f64)>> {
+    let wallet_pubkey = app_state.wallet.try_pubkey()?;
+    let sol_before = app_state
+        .rpc_nonblocking_client
+        .get_balance(&wallet_pubkey)
+        .await
+        .unwrap_or(0);
+
+    let signature = selling_engine
+        .unified_emergency_sell(mint, true, None, None)
+        .await?;
+    if signature == "no_tokens_to_sell" {
+        return Ok(None);
+    }
+
+    let sol_after = app_state
+        .rpc_nonblocking_client
+        .get_balance(&wallet_pubkey)
+        .await
+        .unwrap_or(sol_before);
+    let sol_received = sol_after.saturating_sub(sol_before) as f64 / 1_000_000_000.0;
+
+    Ok(Some((signature, sol_received)))
+}
+
+/// Best-effort token amount + dex label for the manual-sell Trade event —
+/// `held_positions` (this process's own buy-time estimate) when available,
+/// else the engine's own TOKEN_METRICS (populated by `update_metrics` on
+/// every tick for a held position), else zero/Unknown. Purely cosmetic:
+/// `execute_manual_sell` above already gets the real SOL amount from an
+/// actual on-chain balance diff regardless of what this returns.
+fn manual_sell_display_info(
+    mint: &str,
+    held_positions: &std::collections::HashMap<String, f64>,
+) -> (f64, &'static str) {
+    if let Some(metrics) = TOKEN_METRICS.get(mint) {
+        return (
+            metrics.amount_held,
+            dex_str_from_protocol(&metrics.protocol),
+        );
+    }
+    (held_positions.get(mint).copied().unwrap_or(0.0), "Unknown")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -164,20 +240,32 @@ async fn main() -> anyhow::Result<()> {
     let payload: ExecutorStartPayload = serde_json::from_str(&payload_json)?;
     let user_id = payload.user_id.clone();
 
+    // Set by the orchestrator's one-shot spawn path (main.rs's
+    // spawn_sell_once) when a user clicks "Close Position" while their bot
+    // isn't currently running — reuses this same binary/init path instead
+    // of duplicating wallet/RPC/blockhash setup in a second binary, but
+    // skips the Starting/Running status publishes below (a few-second
+    // flicker to "running" for a bot the user just confirmed is stopped
+    // would be confusing) and exits after the one sell instead of entering
+    // the main loop.
+    let sell_once_mint = std::env::var("EXECUTOR_SELL_ONCE_MINT").ok();
+
     log_redacted_redis_url(&payload.redis_url);
     let redis_client = redis::Client::open(payload.redis_url.clone())?;
     let mut event_conn = redis_client.get_multiplexed_async_connection().await?;
     let mut stream_conn = redis_client.get_multiplexed_async_connection().await?;
 
-    publish_event(
-        &mut event_conn,
-        &BotEvent::Status {
-            user_id: user_id.clone(),
-            status: BotStatus::Starting,
-            at: now_iso(),
-        },
-    )
-    .await;
+    if sell_once_mint.is_none() {
+        publish_event(
+            &mut event_conn,
+            &BotEvent::Status {
+                user_id: user_id.clone(),
+                status: BotStatus::Starting,
+                at: now_iso(),
+            },
+        )
+        .await;
+    }
 
     // Feed the engine's own env-driven client constructors a per-process
     // environment instead of a shared .env — this is the only "config
@@ -273,6 +361,60 @@ async fn main() -> anyhow::Result<()> {
 
     let selling_engine = SellingEngine::new(app_state.clone(), swap_config.clone(), selling_config);
 
+    if let Some(mint) = sell_once_mint {
+        tracing::info!(%user_id, %mint, "executor: manual close-position (one-shot mode, bot was not running)");
+        let (display_amount_token, dex) =
+            manual_sell_display_info(&mint, &std::collections::HashMap::new());
+        match execute_manual_sell(&mint, &selling_engine, &app_state).await {
+            Ok(Some((signature, sol_received))) => {
+                let price_sol = if display_amount_token > 0.0 {
+                    sol_received / display_amount_token
+                } else {
+                    0.0
+                };
+                publish_event(
+                    &mut event_conn,
+                    &BotEvent::Trade {
+                        user_id: user_id.clone(),
+                        side: TradeSide::Sell,
+                        mint: mint.clone(),
+                        dex: dex.to_string(),
+                        price_sol,
+                        amount_sol: sol_received,
+                        amount_token: display_amount_token,
+                        tx_signature: Some(signature),
+                        reason: Some("manual_close".into()),
+                        at: now_iso(),
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {
+                publish_event(
+                    &mut event_conn,
+                    &BotEvent::Error {
+                        user_id: user_id.clone(),
+                        message: format!("Aucune position à clôturer pour {mint} (solde nul)"),
+                        at: now_iso(),
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                publish_event(
+                    &mut event_conn,
+                    &BotEvent::Error {
+                        user_id: user_id.clone(),
+                        message: format!("Échec de la clôture manuelle pour {mint}: {e}"),
+                        at: now_iso(),
+                    },
+                )
+                .await;
+            }
+        }
+        return Ok(());
+    }
+
     publish_event(
         &mut event_conn,
         &BotEvent::Status {
@@ -312,6 +454,14 @@ async fn main() -> anyhow::Result<()> {
     let mut held_positions: std::collections::HashMap<String, f64> =
         std::collections::HashMap::new();
     let mut last_id = "$".to_string();
+    // Manual "Close Position" commands from the web dashboard (relayed via
+    // apps/api -> engine-bridge's orchestrator -> XADD onto this stream —
+    // see main.rs's sell_position handler) while this executor is running.
+    // Read in the same XREAD call as the scanner ticks stream below rather
+    // than a second connection/task, since both are just "block up to 5s
+    // waiting on any of these streams" — no separate polling loop needed.
+    let commands_stream = executor_commands_stream(&user_id);
+    let mut last_cmd_id = "$".to_string();
     let read_opts = StreamReadOptions::default().block(5000).count(100);
 
     // Silent-forever-block watchdog: `xread_options` returning an empty
@@ -329,7 +479,11 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         let reply: redis::RedisResult<StreamReadReply> = stream_conn
-            .xread_options(&[SCANNER_TICKS_STREAM], &[last_id.as_str()], &read_opts)
+            .xread_options(
+                &[SCANNER_TICKS_STREAM, commands_stream.as_str()],
+                &[last_id.as_str(), last_cmd_id.as_str()],
+                &read_opts,
+            )
             .await;
 
         let reply = match reply {
@@ -360,6 +514,83 @@ async fn main() -> anyhow::Result<()> {
         }
 
         for stream_key in reply.keys {
+            if stream_key.key == commands_stream {
+                for entry in stream_key.ids {
+                    last_cmd_id = entry.id.clone();
+
+                    let Some(raw) = entry.map.get("data") else {
+                        continue;
+                    };
+                    let Ok(json) = redis::from_redis_value::<String>(raw) else {
+                        continue;
+                    };
+                    let Ok(command) = serde_json::from_str::<ExecutorCommand>(&json) else {
+                        continue;
+                    };
+
+                    match command {
+                        ExecutorCommand::Sell { mint } => {
+                            tracing::info!(%user_id, %mint, "executor: manual close-position command received");
+                            let (display_amount_token, dex) =
+                                manual_sell_display_info(&mint, &held_positions);
+                            match execute_manual_sell(&mint, &selling_engine, &app_state).await {
+                                Ok(Some((signature, sol_received))) => {
+                                    held_positions.remove(&mint);
+                                    let price_sol = if display_amount_token > 0.0 {
+                                        sol_received / display_amount_token
+                                    } else {
+                                        0.0
+                                    };
+                                    publish_event(
+                                        &mut event_conn,
+                                        &BotEvent::Trade {
+                                            user_id: user_id.clone(),
+                                            side: TradeSide::Sell,
+                                            mint: mint.clone(),
+                                            dex: dex.to_string(),
+                                            price_sol,
+                                            amount_sol: sol_received,
+                                            amount_token: display_amount_token,
+                                            tx_signature: Some(signature),
+                                            reason: Some("manual_close".into()),
+                                            at: now_iso(),
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Ok(None) => {
+                                    publish_event(
+                                        &mut event_conn,
+                                        &BotEvent::Error {
+                                            user_id: user_id.clone(),
+                                            message: format!(
+                                                "Aucune position à clôturer pour {mint} (solde nul)"
+                                            ),
+                                            at: now_iso(),
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    publish_event(
+                                        &mut event_conn,
+                                        &BotEvent::Error {
+                                            user_id: user_id.clone(),
+                                            message: format!(
+                                                "Échec de la clôture manuelle pour {mint}: {e}"
+                                            ),
+                                            at: now_iso(),
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
             for entry in stream_key.ids {
                 last_id = entry.id.clone();
                 last_tick_at = Instant::now();

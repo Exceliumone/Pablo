@@ -102,6 +102,26 @@ export async function getExecutorStatus(userId: string): Promise<BotStatusDto> {
   return toBotStatusDto(view);
 }
 
+/**
+ * "Close Position" — force-sells 100% of whatever this wallet actually
+ * holds for `mint`, right now, regardless of what the bot's own
+ * take-profit/stop-loss logic thinks. `fallbackPayload` is only used by
+ * the orchestrator when this user's executor isn't currently running (see
+ * contract.rs's SellPositionRequest doc comment) — always built the same
+ * way `startExecutor`'s payload is, from a freshly-decrypted wallet
+ * secret, since we can't know here whether it'll actually be needed.
+ */
+export async function sellPosition(
+  userId: string,
+  mint: string,
+  fallbackPayload: ExecutorStartPayload,
+): Promise<void> {
+  await request<{ accepted: boolean }>(`/internal/executors/${userId}/sell`, {
+    method: "POST",
+    body: JSON.stringify({ mint, fallback_payload: fallbackPayload }),
+  });
+}
+
 /** Admin monitoring only — every executor the orchestrator currently knows
  * about, across all users. */
 export async function listExecutors(): Promise<(BotStatusDto & { userId: string })[]> {

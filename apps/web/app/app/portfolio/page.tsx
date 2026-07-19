@@ -1,11 +1,21 @@
 "use client";
 
+import { useState } from "react";
 import { Loader2, RefreshCcw } from "lucide-react";
+import type { PositionDto } from "@pablo/shared-types";
 import { Button } from "@/components/ui/button";
 import { PositionsTable } from "@/components/portfolio/positions-table";
 import { useAuth } from "@/components/providers/auth-provider";
 import { usePortfolio } from "@/lib/use-portfolio";
+import { apiFetch, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
+
+// The sell itself happens asynchronously in the executor (or a one-shot
+// process it spawns) after this call returns "accepted" — this just gives
+// that a moment to land and event-persister.ts a moment to flip the
+// Position row to CLOSED before re-fetching, so the table doesn't refresh
+// too early and still show it as open.
+const CLOSE_POSITION_SETTLE_MS = 4000;
 
 function StatCard({ label, value, tone }: { label: string; value: string; tone?: "success" | "danger" }) {
   return (
@@ -26,7 +36,33 @@ function StatCard({ label, value, tone }: { label: string; value: string; tone?:
 
 export default function PortfolioPage() {
   const { accessToken } = useAuth();
-  const { portfolio, loading, error } = usePortfolio(accessToken);
+  const { portfolio, loading, error, refresh } = usePortfolio(accessToken);
+  const [closingPositionId, setClosingPositionId] = useState<string | null>(null);
+  const [closeError, setCloseError] = useState<string | null>(null);
+
+  async function handleClosePosition(position: PositionDto) {
+    if (!accessToken || closingPositionId) return;
+    const label = position.tokenSymbol ?? `${position.tokenMint.slice(0, 6)}…`;
+    const confirmed = window.confirm(
+      `Clôturer la position ${label} maintenant ? Le bot va vendre immédiatement 100% du solde on-chain, indépendamment du take-profit/stop-loss configuré.`,
+    );
+    if (!confirmed) return;
+
+    setCloseError(null);
+    setClosingPositionId(position.id);
+    try {
+      await apiFetch(`/portfolio/positions/${position.id}/close`, {
+        method: "POST",
+        accessToken,
+      });
+      await new Promise((resolve) => setTimeout(resolve, CLOSE_POSITION_SETTLE_MS));
+      await refresh();
+    } catch (err) {
+      setCloseError(err instanceof ApiError ? err.message : "Échec de la clôture de la position.");
+    } finally {
+      setClosingPositionId(null);
+    }
+  }
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
@@ -75,7 +111,15 @@ export default function PortfolioPage() {
             />
           </div>
 
-          <PositionsTable positions={portfolio.positions} />
+          {closeError && (
+            <div className="glass rounded-xl p-4 text-center text-sm text-danger">{closeError}</div>
+          )}
+
+          <PositionsTable
+            positions={portfolio.positions}
+            onClosePosition={handleClosePosition}
+            closingPositionId={closingPositionId}
+          />
         </>
       )}
     </div>
