@@ -31,6 +31,47 @@ use crate::{
 };
 use dotenv::dotenv;
 
+/// Formats `err`'s full source chain — every `Error::source()` cascade
+/// link, numbered — and, for any link that's a Solana RPC client error
+/// carrying a preflight-simulation failure, appends the on-chain program
+/// logs and structured transaction error explicitly. Callers that must
+/// eventually collapse an `anyhow::Error` into a `String` (see
+/// `execute_buy`'s `Result<(), String>`) should call this instead of a
+/// bare `{}`/`{:#}` format: a plain Display only shows the outermost
+/// context line, and the simulation `logs` (e.g. "Program log: Error:
+/// IncorrectProgramId") only exist one level deeper, inside the RPC
+/// error's structured response data — invisible unless explicitly walked.
+pub fn format_error_chain(err: &anyhow::Error) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (i, cause) in err.chain().enumerate() {
+        lines.push(format!("[{}] {}", i, cause));
+
+        if let Some(client_err) = cause.downcast_ref::<solana_client::client_error::ClientError>() {
+            if let solana_client::client_error::ClientErrorKind::RpcError(
+                solana_client::rpc_request::RpcError::RpcResponseError { code, message, data },
+            ) = client_err.kind()
+            {
+                lines.push(format!("    rpc_error_code={} rpc_message={}", code, message));
+                if let solana_client::rpc_request::RpcResponseErrorData::SendTransactionPreflightFailure(sim) = data {
+                    if let Some(tx_err) = &sim.err {
+                        lines.push(format!("    simulation_err={:?}", tx_err));
+                    }
+                    if let Some(units) = sim.units_consumed {
+                        lines.push(format!("    units_consumed={}", units));
+                    }
+                    if let Some(logs) = &sim.logs {
+                        lines.push(format!("    simulation_logs ({} line(s)):", logs.len()));
+                        for log in logs {
+                            lines.push(format!("      {}", log));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
 // prioritization fee = UNIT_PRICE * UNIT_LIMIT
 fn get_unit_price() -> u64 {
     env::var("UNIT_PRICE")
@@ -147,7 +188,13 @@ pub async fn new_signed_and_send_zeroslot(
                 "STEP 7/8: Transaction submission FAILED — full error: {:?} (payer={}, blockhash={}, instruction_count={}, tip_account={})",
                 e, keypair.pubkey(), recent_blockhash, instructions.len(), tip_account
             ).red().to_string());
-            return Err(anyhow::anyhow!("zeroslot send_transaction failed: {e:?}"));
+            // crate::error::ClientError isn't Send+Sync (its
+            // UploadMetadataError variant boxes a plain `dyn Error`), so it
+            // can't be wrapped as an anyhow source directly like the normal
+            // RPC path below — its Display already carries the full detail
+            // (including the raw ZeroSlot JSON error body for ClientError::
+            // Solana) so nothing is lost, just not walkable via .chain().
+            return Err(anyhow::anyhow!("zeroslot send_transaction failed: {e}"));
         }
     };
 
@@ -251,7 +298,17 @@ pub async fn new_signed_and_send_normal(
             );
             Ok(vec![signature.to_string()])
         }
-        Err(e) => Err(anyhow!("Failed to send normal transaction: {}", e))
+        Err(e) => {
+            logger.log(format!(
+                "STEP 7/8: Transaction submission FAILED — full error: {:?} (payer={}, blockhash={}, instruction_count={})",
+                e, keypair.pubkey(), recent_blockhash, instructions.len()
+            ).red().to_string());
+            // anyhow::Error::new(e) (not anyhow!("...: {e}")) keeps `e` as a
+            // real .source() so format_error_chain can walk into the RPC
+            // client error's structured simulation data (logs, error code)
+            // instead of only seeing a single collapsed summary line.
+            Err(anyhow::Error::new(e).context("Failed to send normal transaction"))
+        }
     }
 }
 

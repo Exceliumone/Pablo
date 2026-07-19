@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 
-use crate::common::cache::{TOKEN_ACCOUNT_CACHE, TOKEN_MINT_CACHE};
+use crate::common::cache::{TOKEN_ACCOUNT_CACHE, TOKEN_MINT_CACHE, TOKEN_PROGRAM_CACHE};
 
 pub fn get_token_address(
     client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
@@ -60,7 +60,7 @@ pub async fn get_account_info(
             // ));
         })?;
 
-    if account_data.owner != spl_token::ID {
+    if account_data.owner != spl_token::ID && account_data.owner != spl_token_2022::ID {
         return Err(TokenError::AccountInvalidOwner);
     }
     let account_info = StateWithExtensionsOwned::<Account>::unpack(account_data.data)?;
@@ -72,6 +72,38 @@ pub async fn get_account_info(
     TOKEN_ACCOUNT_CACHE.insert(account, account_info.clone(), None);
 
     Ok(account_info)
+}
+
+/// Returns whichever SPL Token program actually owns `mint` — legacy
+/// `spl_token::ID` ("Tokenkeg...") or `spl_token_2022::ID` ("Tokenz...") —
+/// by reading the mint account's on-chain `owner` field. PumpSwap (and any
+/// other DEX supporting both programs) can have a Token-2022 base mint
+/// paired with a legacy-Token quote (SOL is always legacy), so ATA
+/// derivation and CreateIdempotent/close_account instructions must use
+/// whichever program actually owns each mint — assuming legacy
+/// unconditionally derives the wrong ATA address and gets rejected
+/// on-chain with `IncorrectProgramId`.
+pub async fn get_mint_token_program(
+    client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
+    mint: &Pubkey,
+) -> Result<Pubkey, anyhow::Error> {
+    if let Some(program) = TOKEN_PROGRAM_CACHE.get(mint) {
+        return Ok(program);
+    }
+
+    let account = client
+        .get_account(mint)
+        .await
+        .map_err(|e| anyhow!("Failed to fetch mint account {} to determine its token program: {}", mint, e))?;
+
+    let program = if account.owner == spl_token_2022::id() {
+        spl_token_2022::id()
+    } else {
+        spl_token::id()
+    };
+
+    TOKEN_PROGRAM_CACHE.insert(*mint, program, None);
+    Ok(program)
 }
 
 pub async fn get_mint_info(
@@ -96,7 +128,7 @@ pub async fn get_mint_info(
         .ok_or(TokenError::AccountNotFound)
         .inspect_err(|err| println!("{} {}: mint {}", address, err, address))?;
 
-    if account.owner != spl_token::ID {
+    if account.owner != spl_token::ID && account.owner != spl_token_2022::ID {
         return Err(TokenError::AccountInvalidOwner);
     }
 
@@ -131,8 +163,8 @@ pub async fn account_exists(
         Ok(response) => {
             match response.value {
                 Some(acc) => {
-                    // Check if the account is owned by the token program
-                    if acc.owner == spl_token::ID {
+                    // Check if the account is owned by either SPL Token program
+                    if acc.owner == spl_token::ID || acc.owner == spl_token_2022::ID {
                         // Try to parse the account to cache it for future use
                         if let Ok(token_account) = StateWithExtensionsOwned::<Account>::unpack(acc.data.clone()) {
                             TOKEN_ACCOUNT_CACHE.insert(*account, token_account, None);
@@ -195,7 +227,7 @@ pub async fn get_multiple_token_accounts(
         
         for (i, maybe_account) in fetched_accounts.iter().enumerate() {
             if let Some(account_data) = maybe_account {
-                if account_data.owner == spl_token::ID {
+                if account_data.owner == spl_token::ID || account_data.owner == spl_token_2022::ID {
                     if let Ok(token_account) = StateWithExtensionsOwned::<Account>::unpack(account_data.data.clone()) {
                         // Cache the account
                         TOKEN_ACCOUNT_CACHE.insert(accounts_to_fetch[i], token_account.clone(), None);

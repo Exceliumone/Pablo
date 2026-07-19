@@ -118,6 +118,41 @@ impl TokenMintCache {
     }
 }
 
+/// Caches which SPL Token program (legacy `spl_token` or `spl_token_2022`)
+/// actually owns a given mint — determined once from the mint account's
+/// on-chain `owner` field (see `block_engine::token::get_mint_token_program`)
+/// so ATA derivation and CreateIdempotent/close_account instructions use
+/// the program that actually owns the mint instead of assuming legacy.
+pub struct TokenProgramCache {
+    programs: RwLock<HashMap<Pubkey, CacheEntry<Pubkey>>>,
+    default_ttl: u64,
+}
+
+impl TokenProgramCache {
+    pub fn new(default_ttl: u64) -> Self {
+        Self {
+            programs: RwLock::new(HashMap::new()),
+            default_ttl,
+        }
+    }
+
+    pub fn get(&self, key: &Pubkey) -> Option<Pubkey> {
+        let programs = self.programs.read().unwrap();
+        if let Some(entry) = programs.get(key) {
+            if !entry.is_expired() {
+                return Some(entry.value);
+            }
+        }
+        None
+    }
+
+    pub fn insert(&self, key: Pubkey, value: Pubkey, ttl: Option<u64>) {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+        let mut programs = self.programs.write().unwrap();
+        programs.insert(key, CacheEntry::new(value, ttl));
+    }
+}
+
 /// Simple wallet token account tracker
 pub struct WalletTokenAccounts {
     accounts: RwLock<HashSet<Pubkey>>,
@@ -165,5 +200,6 @@ impl WalletTokenAccounts {
 lazy_static! {
     pub static ref TOKEN_ACCOUNT_CACHE: TokenAccountCache = TokenAccountCache::new(60); // 60 seconds TTL
     pub static ref TOKEN_MINT_CACHE: TokenMintCache = TokenMintCache::new(300); // 5 minutes TTL
+    pub static ref TOKEN_PROGRAM_CACHE: TokenProgramCache = TokenProgramCache::new(3600); // 1 hour TTL — a mint's owning program never changes
     pub static ref WALLET_TOKEN_ACCOUNTS: WalletTokenAccounts = WalletTokenAccounts::new();
 } 

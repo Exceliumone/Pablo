@@ -115,14 +115,23 @@ pub struct ScannerTick {
     pub trader: Option<String>,
 }
 
+// Field names are camelCase (not just the `type` tag) to match
+// packages/shared-types' botEventDto (userId, priceSol, txSignature, ...) —
+// apps/web's WS gateway relays this JSON straight through with no key
+// translation (see apps/api/src/ws/gateway.ts), so a mismatch here silently
+// leaves the corresponding TS field `undefined` at runtime with no error
+// anywhere (e.g. this is why the "tx" link never used to render in the live
+// activity feed: the wire key was `tx_signature`, TS read `.txSignature`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum BotEvent {
+    #[serde(rename_all = "camelCase")]
     Status {
         user_id: String,
         status: BotStatus,
         at: String,
     },
+    #[serde(rename_all = "camelCase")]
     Opportunity {
         user_id: String,
         mint: String,
@@ -131,6 +140,7 @@ pub enum BotEvent {
         liquidity_sol: f64,
         at: String,
     },
+    #[serde(rename_all = "camelCase")]
     Trade {
         user_id: String,
         side: TradeSide,
@@ -150,6 +160,7 @@ pub enum BotEvent {
         reason: Option<String>,
         at: String,
     },
+    #[serde(rename_all = "camelCase")]
     Error {
         user_id: String,
         message: String,

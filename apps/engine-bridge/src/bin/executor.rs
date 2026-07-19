@@ -579,8 +579,21 @@ async fn main() -> anyhow::Result<()> {
                             .try_pubkey()
                             .map(|pk| pk.to_string())
                             .unwrap_or_else(|_| "<unavailable>".to_string());
+                        // `e` is engine::execute_buy's flattened Result<(),
+                        // String> error — since sniper_bot.rs now builds it
+                        // via block_engine::tx::format_error_chain, it's no
+                        // longer a single generic line ("Transaction
+                        // simulation failed") but the full Error::source()
+                        // cascade, plus — for a Solana RPC preflight
+                        // rejection — the on-chain program logs and
+                        // structured simulation error one level below the
+                        // client's own summary (e.g. the exact "Program
+                        // log: Error: IncorrectProgramId" line). Logging it
+                        // in full (not truncated) is what actually makes
+                        // this diagnosable from PM2 output alone.
                         tracing::warn!(
                             error = %e,
+                            error_line_count = e.lines().count(),
                             mint = %tick.mint,
                             protocol = ?protocol,
                             wallet = %wallet_pubkey,
@@ -593,9 +606,15 @@ async fn main() -> anyhow::Result<()> {
                             &mut event_conn,
                             &BotEvent::Error {
                                 user_id: user_id.clone(),
+                                // First line is a human-readable summary;
+                                // everything from the second line on is
+                                // `e`'s full detail — apps/web renders line
+                                // one always, with the rest behind a
+                                // click-to-expand toggle (see
+                                // components/bot/bot-event-feed.tsx).
                                 message: format!(
-                                    "buy failed for {} (protocol={:?}, wallet={}, amount_sol={}): {e}",
-                                    tick.mint, protocol, wallet_pubkey, swap_config.amount_in
+                                    "Buy failed for {} (protocol={:?}, wallet={}, amount_sol={})\n{}",
+                                    tick.mint, protocol, wallet_pubkey, swap_config.amount_in, e
                                 ),
                                 at: now_iso(),
                             },

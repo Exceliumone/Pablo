@@ -900,7 +900,7 @@ pub async fn execute_buy(
                             }
                         },
                         Err(e) => {
-                            Err(format!("Transaction error: {}", e))
+                            Err(crate::block_engine::tx::format_error_chain(&e))
                         },
                     }
                 },
@@ -1020,7 +1020,7 @@ pub async fn execute_buy(
                                 recent_blockhash,
                                 instruction_count
                             ).red().to_string());
-                            Err(format!("Transaction error: {:#}", e))
+                            Err(crate::block_engine::tx::format_error_chain(&e))
                         },
                     }
                 },
@@ -1124,7 +1124,7 @@ pub async fn execute_buy(
                             }
                         },
                         Err(e) => {
-                            Err(format!("Transaction error: {}", e))
+                            Err(crate::block_engine::tx::format_error_chain(&e))
                         },
                     }
                 },
@@ -1226,7 +1226,7 @@ pub async fn execute_buy(
                             }
                         },
                         Err(e) => {
-                            Err(format!("Transaction error: {}", e))
+                            Err(crate::block_engine::tx::format_error_chain(&e))
                         },
                     }
                 },

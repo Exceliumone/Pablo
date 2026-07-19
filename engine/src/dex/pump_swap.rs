@@ -15,6 +15,7 @@ use anchor_client::solana_sdk::{
 use crate::processor::transaction_parser::DexType;
 use spl_associated_token_account::{
     get_associated_token_address,
+    get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent
 };
 use spl_token::ui_amount_to_amount;
@@ -245,33 +246,42 @@ impl PumpSwap {
         );
         
         let max_quote_amount_in = max_amount_with_slippage(amount_specified, slippage_bps);
-        let out_ata = get_associated_token_address(&owner, &mint);
-        
+
+        // The mint's *actual* owning program (legacy spl_token vs.
+        // spl_token_2022) determines both the ATA's derived address and
+        // which program the CreateIdempotent/swap instructions must name —
+        // assuming legacy unconditionally derives the wrong ATA and gets
+        // rejected on-chain with IncorrectProgramId once the instruction
+        // reaches a mint that's actually Token-2022 owned. Quote (SOL) is
+        // always legacy, so only the base mint needs this lookup.
+        let base_token_program = self.mint_token_program(&mint).await;
+        let out_ata = get_associated_token_address_with_program_id(&owner, &mint, &base_token_program);
+
         // Check token account existence and create if needed
         if !self.check_token_account_cache(out_ata).await {
             let logger = Logger::new("[PUMPSWAP-ATA-CREATE] => ".yellow().to_string());
-            logger.log(format!("Creating ATA for mint {} at address {}", mint, out_ata));
-            
+            logger.log(format!("Creating ATA for mint {} at address {} (token_program={})", mint, out_ata, base_token_program));
+
             instructions.push(create_associated_token_account_idempotent(
                 &owner,
                 &owner,
                 &mint,
-                &TOKEN_PROGRAM,
+                &base_token_program,
             ));
-            
+
             // Cache the account immediately since we're creating it
             self.cache_token_account(out_ata).await;
             logger.log(format!("ATA creation instruction added for {}", out_ata));
         }
-        
+
         // Create accounts using parsed pool_id and coin_creator
-        let pool_base_account = get_associated_token_address(&pool_id, &mint);
+        let pool_base_account = get_associated_token_address_with_program_id(&pool_id, &mint, &base_token_program);
         let pool_quote_account = get_associated_token_address(&pool_id, &SOL_MINT);
-        
+
         // Get volume accumulator PDAs
         let global_volume_accumulator = get_global_volume_accumulator_pda()?;
         let user_volume_accumulator = get_user_volume_accumulator_pda(&owner)?;
-        
+
         let accounts = create_buy_accounts(
             pool_id,
             owner,
@@ -284,8 +294,9 @@ impl PumpSwap {
             coin_creator,
             global_volume_accumulator,
             user_volume_accumulator,
+            base_token_program,
         )?;
-        
+
         // Return token amount out and max SOL amount in for buy orders
         Ok((base_amount_out, max_quote_amount_in, accounts))
     }
@@ -302,15 +313,16 @@ impl PumpSwap {
         slippage_bps: u64,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(u64, u64, Vec<AccountMeta>)> {
-        let in_ata = get_associated_token_address(&owner, &mint);
-        
+        let base_token_program = self.mint_token_program(&mint).await;
+        let in_ata = get_associated_token_address_with_program_id(&owner, &mint, &base_token_program);
+
         // Verify token account exists using cache first
         if !self.check_token_account_cache(in_ata).await {
             let logger = Logger::new("[PUMPSWAP-SELL-ERROR] => ".red().to_string());
             logger.log(format!("Token account {} does not exist for mint {}", in_ata, mint));
             return Err(anyhow!("Token account {} does not exist for mint {}", in_ata, mint));
         }
-        
+
         // Get token info in parallel
         let (account_info, mint_info) = if let Some(client) = &self.rpc_nonblocking_client {
             let account_fut = token::get_account_info(client.clone(), mint, in_ata);
@@ -319,44 +331,58 @@ impl PumpSwap {
         } else {
             return Err(anyhow!("RPC client not available"));
         };
-        
+
         let amount = match in_type {
             SwapInType::Qty => ui_amount_to_amount(amount_in, mint_info.base.decimals),
             SwapInType::Pct => {
                 let pct = amount_in.min(1.0);
                 if pct == 1.0 {
-                    // Close account if selling 100%
-                    instructions.push(spl_token::instruction::close_account(
-                        &TOKEN_PROGRAM,
-                        &in_ata,
-                        &owner,
-                        &owner,
-                        &[&owner],
-                    )?);
+                    // Close account if selling 100% — spl_token's close_account
+                    // rejects any token_program_id other than its own at the
+                    // client-validation stage, so a Token-2022 mint must go
+                    // through spl_token_2022's own close_account instead.
+                    let close_ix = if base_token_program == spl_token_2022::id() {
+                        spl_token_2022::instruction::close_account(
+                            &base_token_program,
+                            &in_ata,
+                            &owner,
+                            &owner,
+                            &[&owner],
+                        )?
+                    } else {
+                        spl_token::instruction::close_account(
+                            &base_token_program,
+                            &in_ata,
+                            &owner,
+                            &owner,
+                            &[&owner],
+                        )?
+                    };
+                    instructions.push(close_ix);
                     account_info.base.amount
                 } else {
                     (pct * account_info.base.amount as f64) as u64
                 }
             }
         };
-        
+
         if amount == 0 {
             return Err(anyhow!("Invalid sell amount"));
         }
-        
+
         // Use virtual reserves for calculation
         let quote_amount_out = Self::calculate_sell_sol_amount(
             amount,
             trade_info.virtual_sol_reserves,
             trade_info.virtual_token_reserves,
         );
-        
+
         let min_quote_amount_out = 0;  // this ensures must sell
-        println!("Sell calculation - Tokens in: {}, Expected SOL out: {}, Virtual SOL: {}, Virtual Tokens: {}", 
+        println!("Sell calculation - Tokens in: {}, Expected SOL out: {}, Virtual SOL: {}, Virtual Tokens: {}",
             amount, quote_amount_out, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves);
 
         // Create accounts using parsed pool_id and coin_creator
-        let pool_base_account = get_associated_token_address(&pool_id, &mint);
+        let pool_base_account = get_associated_token_address_with_program_id(&pool_id, &mint, &base_token_program);
         let pool_quote_account = get_associated_token_address(&pool_id, &SOL_MINT);
 
         // Get volume accumulator PDAs
@@ -375,11 +401,34 @@ impl PumpSwap {
             coin_creator,
             global_volume_accumulator,
             user_volume_accumulator,
+            base_token_program,
         )?;
-        
+
         Ok((amount, min_quote_amount_out, accounts))
     }
     
+    /// Determines the SPL Token program that actually owns `mint` — legacy
+    /// or Token-2022 — via `token::get_mint_token_program`. Falls back to
+    /// the legacy program (the old hardcoded behavior) only if no RPC
+    /// client is available to look it up; every real call path has one.
+    async fn mint_token_program(&self, mint: &Pubkey) -> Pubkey {
+        if let Some(client) = &self.rpc_nonblocking_client {
+            match token::get_mint_token_program(client.clone(), mint).await {
+                Ok(program) => program,
+                Err(e) => {
+                    let logger = Logger::new("[PUMPSWAP-TOKEN-PROGRAM] => ".red().to_string());
+                    logger.log(format!(
+                        "Failed to determine token program for mint {}: {} — defaulting to legacy Token program",
+                        mint, e
+                    ));
+                    TOKEN_PROGRAM
+                }
+            }
+        } else {
+            TOKEN_PROGRAM
+        }
+    }
+
     async fn check_token_account_cache(&self, account: Pubkey) -> bool {
         // First check if it's in our cache
         if WALLET_TOKEN_ACCOUNTS.contains(&account) {
@@ -631,13 +680,14 @@ fn create_buy_accounts(
     coin_creator: Pubkey,
     global_volume_accumulator: Pubkey,
     user_volume_accumulator: Pubkey,
+    base_token_program: Pubkey,
 ) -> Result<Vec<AccountMeta>> {
     let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
         &[b"creator_vault", coin_creator.as_ref()],
         &PUMP_SWAP_PROGRAM,
     );
     let coin_creator_vault_ata = get_associated_token_address(&coin_creator_vault_authority, &quote_mint);
-    
+
     // For buy (normal case): user spends SOL to get tokens
     // User spends from wsol_account and receives to user_base_token_account
     Ok(vec![
@@ -652,7 +702,9 @@ fn create_buy_accounts(
         AccountMeta::new(pool_quote_token_account, false), // Pool accounts remain the same
         AccountMeta::new_readonly(PUMP_SWAP_FEE_RECIPIENT, false),
         AccountMeta::new(get_associated_token_address(&PUMP_SWAP_FEE_RECIPIENT, &quote_mint), false),
-        AccountMeta::new_readonly(TOKEN_PROGRAM, false),
+        // base_token_program: whichever program actually owns base_mint
+        // (legacy or Token-2022). quote is always SOL, always legacy.
+        AccountMeta::new_readonly(base_token_program, false),
         AccountMeta::new_readonly(TOKEN_PROGRAM, false),
         AccountMeta::new_readonly(system_program::id(), false),
         AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
@@ -678,6 +730,7 @@ fn create_sell_accounts(
     coin_creator: Pubkey,
     global_volume_accumulator: Pubkey,
     user_volume_accumulator: Pubkey,
+    base_token_program: Pubkey,
 ) -> Result<Vec<AccountMeta>> {
 
     let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
@@ -700,7 +753,9 @@ fn create_sell_accounts(
         AccountMeta::new(pool_quote_token_account, false), // Pool accounts remain the same
         AccountMeta::new_readonly(PUMP_SWAP_FEE_RECIPIENT, false),
         AccountMeta::new(get_associated_token_address(&PUMP_SWAP_FEE_RECIPIENT, &quote_mint), false),
-        AccountMeta::new_readonly(TOKEN_PROGRAM, false),
+        // base_token_program: whichever program actually owns base_mint
+        // (legacy or Token-2022). quote is always SOL, always legacy.
+        AccountMeta::new_readonly(base_token_program, false),
         AccountMeta::new_readonly(TOKEN_PROGRAM, false),
         AccountMeta::new_readonly(system_program::id(), false),
         AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false),
