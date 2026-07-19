@@ -980,19 +980,159 @@ fn detect_pumpfun_log_event(
     None
 }
 
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Last-resort detection that works with ANY DEX, router, or aggregator —
+/// including ones this scanner has no dedicated parser for at all (Meteora
+/// DLMM, whatever a Bitget/Photon/BullX-style wallet's own on-chain
+/// aggregator happens to route a swap through next, etc.) — by comparing
+/// the tracked wallet's own SOL and SPL token balances before vs after the
+/// transaction instead of parsing a specific program's CPI-log or Anchor
+/// event format. `getTransaction` always returns pre/post balances
+/// regardless of which program(s) ran, so this needs no per-DEX work ever
+/// again — the trade-off is precision: unlike the CPI-log/event paths
+/// above, there's no pool state to read a price or virtual reserves from,
+/// so `TradeInfoFromToken.price`/`virtual_sol_reserves`/
+/// `virtual_token_reserves` all come back zero, and `dex_type` is always
+/// `DexType::Unknown`. executor.rs treats an Unknown-dex tick as
+/// detected-but-not-copyable (see `protocol_from_dex`'s doc comment there)
+/// rather than guessing at a swap-instruction builder for a protocol this
+/// codebase has no real implementation for — so this path exists for
+/// visibility (the live activity feed, diagnostics) more than to drive an
+/// actual copy-buy. By Solana convention the fee payer — the wallet whose
+/// balance this needs — is always account index 0.
+fn detect_trade_by_balance_diff(
+    txn: &SubscribeUpdateTransaction,
+    log_signature: &str,
+) -> Option<TradeInfoFromToken> {
+    let tx_inner = txn.transaction.as_ref()?;
+    let meta = tx_inner.meta.as_ref()?;
+    let account_keys = &tx_inner
+        .transaction
+        .as_ref()?
+        .message
+        .as_ref()?
+        .account_keys;
+
+    let wallet_pubkey = bs58::encode(account_keys.first()?).into_string();
+    let pre_sol = *meta.pre_balances.first()?;
+    let post_sol = *meta.post_balances.first()?;
+    // Signed to avoid underflow — a buy spends SOL (negative delta), a
+    // sell receives it (positive); the network fee is baked into this
+    // delta too, which the is_buy/sol_delta sign check below tolerates.
+    let sol_delta = post_sol as i128 - pre_sol as i128;
+
+    fn token_amount(balance: &TokenBalance) -> i128 {
+        balance
+            .ui_token_amount
+            .as_ref()
+            .and_then(|a| a.amount.parse::<i128>().ok())
+            .unwrap_or(0)
+    }
+
+    // A token this wallet's balance changed for. Tries "still holds it,
+    // amount changed" first (covers both partial buys and partial sells);
+    // falls back to "held it before, doesn't appear at all after" for a
+    // full sell that closed the token account.
+    let token_delta = meta
+        .post_token_balances
+        .iter()
+        .filter(|post| post.owner == wallet_pubkey && post.mint != WSOL_MINT)
+        .find_map(|post| {
+            let pre_amount = meta
+                .pre_token_balances
+                .iter()
+                .find(|pre| pre.owner == wallet_pubkey && pre.mint == post.mint)
+                .map(token_amount)
+                .unwrap_or(0);
+            let delta = token_amount(post) - pre_amount;
+            (delta != 0).then_some((
+                post.mint.clone(),
+                delta,
+                post.ui_token_amount.as_ref()?.decimals,
+            ))
+        })
+        .or_else(|| {
+            meta.pre_token_balances
+                .iter()
+                .filter(|pre| pre.owner == wallet_pubkey && pre.mint != WSOL_MINT)
+                .find_map(|pre| {
+                    let still_present = meta
+                        .post_token_balances
+                        .iter()
+                        .any(|post| post.owner == wallet_pubkey && post.mint == pre.mint);
+                    let pre_amount = token_amount(pre);
+                    (!still_present && pre_amount != 0).then(|| {
+                        (
+                            pre.mint.clone(),
+                            -pre_amount,
+                            pre.ui_token_amount
+                                .as_ref()
+                                .map(|a| a.decimals)
+                                .unwrap_or(0),
+                        )
+                    })
+                })
+        });
+
+    let (mint, token_raw_delta, decimals) = token_delta?;
+    let is_buy = token_raw_delta > 0;
+
+    // A buy must show this wallet's SOL balance going down and a sell
+    // going up — a mismatch means the token-balance change belongs to
+    // something other than this wallet directly trading (e.g. it's an
+    // intermediate/fee/vault account in someone else's transaction that
+    // happens to reuse the same owner check some other way). Don't
+    // publish a tick built on a contradiction.
+    if (is_buy && sol_delta >= 0) || (!is_buy && sol_delta <= 0) {
+        return None;
+    }
+
+    let sol_change = sol_delta as f64 / 1_000_000_000.0;
+    let token_change = token_raw_delta as f64 / 10f64.powi(decimals as i32);
+
+    tracing::debug!(
+        signature = %log_signature,
+        mint = %mint,
+        is_buy,
+        sol_change,
+        token_change,
+        "scanner: generic balance-diff decoded a trade (no CPI-log or Anchor log event \
+         matched any known protocol — this is an unrecognized DEX/router/aggregator)"
+    );
+
+    Some(TradeInfoFromToken {
+        dex_type: DexType::Unknown,
+        slot: 0,
+        signature: String::new(),
+        pool_id: String::new(),
+        mint,
+        timestamp: 0,
+        is_buy,
+        price: 0, // no pool state available from a balance diff alone
+        is_reverse_when_pump_swap: false,
+        coin_creator: None,
+        sol_change,
+        token_change,
+        liquidity: 0.0,
+        virtual_sol_reserves: 0,
+        virtual_token_reserves: 0,
+    })
+}
+
 /// Turns one detected transaction into a trade tick. Tries the untouched
 /// engine's own parser against a recognized inner-instruction CPI log
 /// first (`extract_cpi_log_data` + `parse_transaction_data`, unchanged
 /// behavior from before this file had a second path); if that finds
 /// nothing, falls back to decoding a PumpSwap Anchor `"Program data:"` log
 /// event (`detect_pumpswap_log_event`), then a PumpFun bonding-curve
-/// `TradeEvent` log event (`detect_pumpfun_log_event`) before giving up.
-/// PumpFun bonding-curve trades only ever match this last path — its
-/// self-CPI event-log instruction never lands on one of
-/// `extract_cpi_log_data`'s recognized lengths, only the `"Program data:"`
-/// log line does. `None` for anything no path recognizes (wrapped-SOL
-/// mint, no matching CPI log or log event, etc.). `log_signature` is
-/// diagnostic-only (a display string identifying which transaction this
+/// `TradeEvent` log event (`detect_pumpfun_log_event`), then — as an
+/// absolute last resort — a generic pre/post balance-diff
+/// (`detect_trade_by_balance_diff`) that works regardless of which DEX or
+/// aggregator was actually involved but can't recover pool/price detail.
+/// `None` only if literally nothing changed this wallet's SOL or token
+/// balance (e.g. it was merely mentioned, not the trader). `log_signature`
+/// is diagnostic-only (a display string identifying which transaction this
 /// call is for, so the rejection-reason logs below can be correlated with
 /// the rest of the pipeline's per-signature logs even when several are in
 /// flight concurrently) — it plays no role in the detection logic itself.
@@ -1034,13 +1174,17 @@ fn detect_trade(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option
         return finalize_detected_trade(&parsed, txn, log_signature, "pumpfun_log_event");
     }
 
+    if let Some(parsed) = detect_trade_by_balance_diff(txn, log_signature) {
+        return finalize_detected_trade(&parsed, txn, log_signature, "balance_diff");
+    }
+
     tracing::debug!(
         signature = %log_signature,
         "scanner: REJECTED — no inner instruction with a recognized CPI-log data length \
          (368/266/270/146/170/138 bytes), no recognized PumpSwap Anchor log event \
-         (SellEvent/BuyEvent), and no recognized PumpFun TradeEvent either. Either this \
-         transaction doesn't actually touch PumpFun/PumpSwap/Raydium Launchpad in a way this \
-         scanner recognizes, or its emission format has changed again."
+         (SellEvent/BuyEvent), no recognized PumpFun TradeEvent, and the generic balance-diff \
+         fallback found no net SOL/token balance change for this transaction's fee payer \
+         either — it was mentioned in this transaction but its own balances didn't move."
     );
     None
 }
@@ -1808,22 +1952,26 @@ fn to_synthetic_subscribe_update(
 
     let log_messages: Vec<String> = Option::from(meta.log_messages).unwrap_or_default();
 
+    // Native SOL lamport balances, indexed by account position — always
+    // present in a getTransaction response (not an OptionSerializer field,
+    // unlike log_messages/token_balances/inner_instructions). Needed by
+    // detect_trade_by_balance_diff's generic fallback below; nothing else
+    // in this file reads these.
+    let pre_balances: Vec<u64> = meta.pre_balances;
+    let post_balances: Vec<u64> = meta.post_balances;
+
+    let pre_token_balances: Vec<TokenBalance> =
+        Option::<Vec<UiTransactionTokenBalance>>::from(meta.pre_token_balances)
+            .unwrap_or_default()
+            .into_iter()
+            .map(to_proto_token_balance)
+            .collect();
+
     let post_token_balances: Vec<TokenBalance> =
         Option::<Vec<UiTransactionTokenBalance>>::from(meta.post_token_balances)
             .unwrap_or_default()
             .into_iter()
-            .map(|b: UiTransactionTokenBalance| TokenBalance {
-                account_index: u32::from(b.account_index),
-                mint: b.mint,
-                ui_token_amount: Some(UiTokenAmount {
-                    ui_amount: b.ui_token_amount.ui_amount.unwrap_or_default(),
-                    decimals: u32::from(b.ui_token_amount.decimals),
-                    amount: b.ui_token_amount.amount,
-                    ui_amount_string: b.ui_token_amount.ui_amount_string,
-                }),
-                owner: String::new(),
-                program_id: String::new(),
-            })
+            .map(to_proto_token_balance)
             .collect();
 
     let inner_instructions: Vec<InnerInstructions> =
@@ -1870,6 +2018,9 @@ fn to_synthetic_subscribe_update(
             }),
             meta: Some(TransactionStatusMeta {
                 log_messages,
+                pre_balances,
+                post_balances,
+                pre_token_balances,
                 post_token_balances,
                 inner_instructions,
                 ..Default::default()
@@ -1877,6 +2028,25 @@ fn to_synthetic_subscribe_update(
             index: 0,
         }),
     })
+}
+
+/// Shared by both `pre_token_balances`/`post_token_balances` conversion —
+/// unlike the version this replaced, keeps `owner`/`program_id` (needed by
+/// `detect_trade_by_balance_diff` to find balances that belong to the
+/// tracked wallet specifically, not just any account touched by the tx).
+fn to_proto_token_balance(b: UiTransactionTokenBalance) -> TokenBalance {
+    TokenBalance {
+        account_index: u32::from(b.account_index),
+        mint: b.mint,
+        ui_token_amount: Some(UiTokenAmount {
+            ui_amount: b.ui_token_amount.ui_amount.unwrap_or_default(),
+            decimals: u32::from(b.ui_token_amount.decimals),
+            amount: b.ui_token_amount.amount,
+            ui_amount_string: b.ui_token_amount.ui_amount_string,
+        }),
+        owner: Option::from(b.owner).unwrap_or_default(),
+        program_id: Option::from(b.program_id).unwrap_or_default(),
+    }
 }
 
 #[cfg(test)]
@@ -1918,7 +2088,10 @@ mod pumpfun_trade_event_tests {
         // reserve; this trade's reserves should still be close to that
         // (a lightly-traded token), not some wildly different magnitude
         // that would indicate a field-offset mistake.
-        assert!(parsed.virtual_sol_reserves > 29_000_000_000 && parsed.virtual_sol_reserves < 31_000_000_000);
+        assert!(
+            parsed.virtual_sol_reserves > 29_000_000_000
+                && parsed.virtual_sol_reserves < 31_000_000_000
+        );
         assert_eq!(parsed.virtual_sol_reserves, 30_092_424_674);
         assert_eq!(parsed.virtual_token_reserves, 1_069_704_430_984_589);
         assert_eq!(parsed.sol_change, -982715.0 / 1_000_000_000.0);
@@ -1938,5 +2111,139 @@ mod pumpfun_trade_event_tests {
         let mut payload = base64::decode(REAL_TRADE_EVENT_B64).unwrap();
         payload[0] ^= 0xff; // corrupt the discriminator
         assert_ne!(payload[0..8], PUMPFUN_TRADE_EVENT_DISCRIMINATOR);
+    }
+}
+
+#[cfg(test)]
+mod balance_diff_detection_tests {
+    use super::*;
+
+    fn pk_bytes(seed: u8) -> Vec<u8> {
+        vec![seed; 32]
+    }
+
+    fn token_balance(owner: &[u8], mint: &str, amount: &str, decimals: u32) -> TokenBalance {
+        TokenBalance {
+            account_index: 0,
+            mint: mint.to_string(),
+            ui_token_amount: Some(UiTokenAmount {
+                ui_amount: 0.0,
+                decimals,
+                amount: amount.to_string(),
+                ui_amount_string: String::new(),
+            }),
+            owner: bs58::encode(owner).into_string(),
+            program_id: String::new(),
+        }
+    }
+
+    fn synthetic_txn(
+        pre_balances: Vec<u64>,
+        post_balances: Vec<u64>,
+        pre_token_balances: Vec<TokenBalance>,
+        post_token_balances: Vec<TokenBalance>,
+    ) -> SubscribeUpdateTransaction {
+        let wallet = pk_bytes(1);
+        SubscribeUpdateTransaction {
+            slot: 0,
+            transaction: Some(SubscribeUpdateTransactionInfo {
+                signature: Vec::new(),
+                is_vote: false,
+                transaction: Some(Transaction {
+                    signatures: Vec::new(),
+                    message: Some(Message {
+                        account_keys: vec![wallet, pk_bytes(2), pk_bytes(3)],
+                        ..Default::default()
+                    }),
+                }),
+                meta: Some(TransactionStatusMeta {
+                    pre_balances,
+                    post_balances,
+                    pre_token_balances,
+                    post_token_balances,
+                    ..Default::default()
+                }),
+                index: 0,
+            }),
+        }
+    }
+
+    const MINT: &str = "7NLnWYKHPnHYzzF8ZbZuQpjbZYqZrKrhRGYhtXXRpump";
+
+    #[test]
+    fn detects_a_buy_from_new_token_balance_and_sol_decrease() {
+        let wallet = pk_bytes(1);
+        let txn = synthetic_txn(
+            vec![10_000_000_000, 0, 0],
+            vec![9_000_000_000, 0, 0], // spent 1 SOL
+            vec![],
+            vec![token_balance(&wallet, MINT, "50000000", 6)], // received 50 tokens (6 decimals)
+        );
+
+        let parsed = detect_trade_by_balance_diff(&txn, "test-sig").expect("should detect a buy");
+        assert_eq!(parsed.dex_type, DexType::Unknown);
+        assert_eq!(parsed.mint, MINT);
+        assert!(parsed.is_buy);
+        assert_eq!(parsed.sol_change, -1.0);
+        assert_eq!(parsed.token_change, 50.0);
+    }
+
+    #[test]
+    fn detects_a_full_sell_that_closes_the_token_account() {
+        let wallet = pk_bytes(1);
+        let txn = synthetic_txn(
+            vec![9_000_000_000, 0, 0],
+            vec![9_950_000_000, 0, 0], // received ~0.95 SOL (after fees)
+            vec![token_balance(&wallet, MINT, "50000000", 6)],
+            vec![], // token account closed — no longer present
+        );
+
+        let parsed = detect_trade_by_balance_diff(&txn, "test-sig").expect("should detect a sell");
+        assert!(!parsed.is_buy);
+        assert_eq!(parsed.mint, MINT);
+        assert_eq!(parsed.token_change, -50.0);
+        assert!(parsed.sol_change > 0.0);
+    }
+
+    #[test]
+    fn ignores_wsol_balance_changes() {
+        let wallet = pk_bytes(1);
+        let txn = synthetic_txn(
+            vec![10_000_000_000, 0, 0],
+            vec![9_000_000_000, 0, 0],
+            vec![],
+            vec![token_balance(&wallet, WSOL_MINT, "1000000000", 9)],
+        );
+
+        assert!(detect_trade_by_balance_diff(&txn, "test-sig").is_none());
+    }
+
+    #[test]
+    fn rejects_a_buy_shaped_token_delta_with_no_matching_sol_decrease() {
+        // Token balance increased but SOL balance didn't drop — contradicts
+        // "this wallet paid SOL for this token", so this must not be
+        // treated as a trade this wallet itself made.
+        let wallet = pk_bytes(1);
+        let txn = synthetic_txn(
+            vec![10_000_000_000, 0, 0],
+            vec![10_000_000_000, 0, 0], // unchanged
+            vec![],
+            vec![token_balance(&wallet, MINT, "50000000", 6)],
+        );
+
+        assert!(detect_trade_by_balance_diff(&txn, "test-sig").is_none());
+    }
+
+    #[test]
+    fn ignores_balance_changes_belonging_to_a_different_owner() {
+        let other = pk_bytes(9);
+        let txn = synthetic_txn(
+            vec![10_000_000_000, 0, 0],
+            vec![9_000_000_000, 0, 0],
+            vec![],
+            vec![token_balance(&other, MINT, "50000000", 6)],
+        );
+
+        assert!(detect_trade_by_balance_diff(&txn, "test-sig").is_none());
     }
 }

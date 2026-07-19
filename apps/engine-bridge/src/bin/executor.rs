@@ -506,6 +506,34 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await;
 
+                // The scanner's generic balance-diff fallback (see
+                // scanner.rs's detect_trade_by_balance_diff) can detect a
+                // buy on literally any DEX/router/aggregator — including
+                // ones (Meteora DLMM, whatever a Bitget/Photon/BullX-style
+                // wallet's own aggregator routes through next, ...) this
+                // codebase has no swap-instruction builder for at all. It
+                // tags these DexType::Unknown. Before this check, an
+                // Unknown dex_type fell through to SwapProtocol::Auto,
+                // which execute_buy's Auto/Unknown branch silently
+                // defaults to PumpFun — attempting a PumpFun-specific buy
+                // (bonding-curve PDA derived from the mint) against a
+                // token that most likely has no PumpFun bonding curve at
+                // all. The Opportunity event above already gives the user
+                // visibility that this trade was detected; there's just
+                // nothing this executor can do to copy it yet.
+                if tick.dex_type == "Unknown" {
+                    tracing::info!(
+                        %user_id,
+                        mint = %tick.mint,
+                        source_signature = %tick.signature,
+                        trader = ?tick.trader,
+                        "executor: detected a buy via the generic balance-diff fallback, but \
+                         its DEX/router couldn't be identified — no swap-instruction builder \
+                         exists for it, so this trade is visible but not copyable; skipping"
+                    );
+                    continue;
+                }
+
                 let protocol = protocol_from_dex(&trade_info.dex_type);
                 tracing::info!(
                     %user_id,
