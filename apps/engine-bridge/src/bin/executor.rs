@@ -4,28 +4,36 @@
 //! subscription — it tails the shared scanner's Redis stream and makes its
 //! own buy/sell decisions using that one user's wallet and settings.
 //!
-//! Every trading call here (`JupiterClient::buy_token_with_jupiter`,
-//! `SellingEngine::new`, `update_metrics`, `evaluate_sell_conditions`,
-//! `unified_emergency_sell`) is an unmodified (or, for the Jupiter buy
-//! client, narrowly and additively extended) public function/method from
-//! the engine crate, used exactly as the engine's own top-level monitoring
-//! loop uses them. This process being its own OS process is what makes
-//! that safe: the engine's position-tracking globals (TOKEN_METRICS, ...)
-//! are keyed by mint only, with no user dimension, so they'd corrupt
-//! across users inside a shared process — see docs/ARCHITECTURE.md.
+//! Every trading call here (`sniper_bot::execute_buy`,
+//! `JupiterClient::buy_token_with_jupiter`, `SellingEngine::new`,
+//! `update_metrics`, `evaluate_sell_conditions`, `unified_emergency_sell`)
+//! is an unmodified (or, for the Jupiter buy client, narrowly and
+//! additively extended) public function/method from the engine crate,
+//! used exactly as the engine's own top-level monitoring loop uses them.
+//! This process being its own OS process is what makes that safe: the
+//! engine's position-tracking globals (TOKEN_METRICS, ...) are keyed by
+//! mint only, with no user dimension, so they'd corrupt across users
+//! inside a shared process — see docs/ARCHITECTURE.md.
 //!
-//! Buys go through Jupiter's aggregator (quote + swap, see
-//! `engine::library::jupiter_api::JupiterClient::buy_token_with_jupiter`)
-//! rather than the engine's own PumpFun/PumpSwap/Raydium-Launchpad-specific
-//! instruction builders (`sniper_bot::execute_buy`) — by explicit product
-//! decision, so that a copy-trading target's buy is always copyable no
-//! matter which DEX/router/aggregator they actually used (Jupiter routes
-//! to whichever pool it finds, on any DEX it indexes), not just the three
-//! this codebase has hand-written instruction builders for. This trades
-//! away `execute_buy`'s direct-instruction speed advantage on the DEXs it
-//! *does* support, in exchange for universal coverage. Selling is
-//! unaffected by this — `unified_emergency_sell` already has its own
-//! Jupiter fallback for when a direct DEX-specific sell fails (see
+//! Buys try direct execution first (`sniper_bot::execute_buy`) for a
+//! recognized DEX (PumpFun/PumpSwap/Raydium Launchpad), falling back to
+//! Jupiter's aggregator (`JupiterClient::buy_token_with_jupiter`) only if
+//! that fails, or immediately for anything else (`DexType::Unknown` — an
+//! aggregator/DEX this codebase has no instruction builder for at all,
+//! see scanner.rs's balance-diff-detection module doc). This wasn't the
+//! first version of this: buys went through Jupiter exclusively for a
+//! while, for simplicity and universal DEX/router coverage (Jupiter
+//! routes to whichever pool it finds, on any DEX it indexes) — but a
+//! bonding-curve token that's only seconds old can be genuinely
+//! untradable on Jupiter yet (its own route indexing hasn't caught up;
+//! observed live as a hard `TOKEN_NOT_TRADABLE` quote error, not
+//! something retrying against Jupiter fixes), which defeats sniping a
+//! token that just launched — exactly the case that matters most. Direct
+//! execution has no such indexing dependency and is faster besides, so
+//! it's tried first wherever it's available; Jupiter's universal coverage
+//! remains the fallback/only option for everything else. Selling is
+//! unaffected by any of this — `unified_emergency_sell` already has its
+//! own Jupiter fallback for when a direct DEX-specific sell fails (see
 //! `selling_strategy.rs`'s `try_jupiter_fallback_sell`), and which pool a
 //! position was originally bought through doesn't change how it's sold.
 //!
@@ -786,31 +794,92 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await;
 
+                let protocol = protocol_from_dex(&trade_info.dex_type);
+                // A brand-new pump.fun-style bonding-curve token can be
+                // seconds old — Jupiter's own route indexing hasn't
+                // necessarily caught up yet, and its quote API then
+                // outright refuses with TOKEN_NOT_TRADABLE, which no
+                // amount of Jupiter-side retrying fixes (observed live).
+                // Direct execution against a known protocol's own
+                // instruction builder has no such indexing dependency, so
+                // try that FIRST for PumpFun/PumpSwap/Raydium Launchpad —
+                // faster anyway, and it's what actually makes sniping a
+                // token that just launched possible. Jupiter is the
+                // fallback: for these three, if the direct attempt itself
+                // fails for some other reason; for anything else
+                // (DexType::Unknown — an aggregator/DEX this codebase has
+                // no instruction builder for at all, see the
+                // balance-diff-detection module doc above), it's the only
+                // option and is tried directly.
+                let attempt_direct_first =
+                    !matches!(protocol, SwapProtocol::Auto | SwapProtocol::Unknown);
+
                 tracing::info!(
                     %user_id,
                     mint = %tick.mint,
                     dex = %tick.dex_type,
+                    protocol = ?protocol,
                     price_sol = tick.price as f64 / 1_000_000_000.0,
                     source_signature = %tick.signature,
                     trader = ?tick.trader,
                     amount_sol = swap_config.amount_in,
                     slippage_bps = swap_config.slippage,
-                    "executor: STEP 1: Event received — dispatching buy attempt via Jupiter"
+                    attempt_direct_first,
+                    "executor: STEP 1: Event received — dispatching buy attempt"
                 );
 
-                let jupiter_client = JupiterClient::new(app_state.rpc_nonblocking_client.clone());
                 let sol_amount_lamports = (swap_config.amount_in * 1_000_000_000.0).round() as u64;
+                let jupiter_client = JupiterClient::new(app_state.rpc_nonblocking_client.clone());
 
-                match jupiter_client
-                    .buy_token_with_jupiter(
-                        &tick.mint,
-                        sol_amount_lamports,
-                        swap_config.slippage,
-                        &app_state.wallet,
-                    )
-                    .await
-                {
-                    Ok(signature) => {
+                let buy_outcome: Result<(Option<String>, &'static str), String> =
+                    if attempt_direct_first {
+                        match solana_vntr_sniper::processor::sniper_bot::execute_buy(
+                            trade_info.clone(),
+                            app_state.clone(),
+                            swap_config.clone(),
+                            protocol.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => Ok((None, "direct")),
+                            Err(direct_err) => {
+                                tracing::warn!(
+                                    error = %direct_err,
+                                    mint = %tick.mint,
+                                    protocol = ?protocol,
+                                    "executor: direct buy failed, falling back to Jupiter"
+                                );
+                                match jupiter_client
+                                .buy_token_with_jupiter(
+                                    &tick.mint,
+                                    sol_amount_lamports,
+                                    swap_config.slippage,
+                                    &app_state.wallet,
+                                )
+                                .await
+                            {
+                                Ok(signature) => Ok((Some(signature), "jupiter_fallback")),
+                                Err(jupiter_err) => Err(format!(
+                                    "direct ({protocol:?}): {direct_err}\nJupiter fallback: {jupiter_err}"
+                                )),
+                            }
+                            }
+                        }
+                    } else {
+                        jupiter_client
+                            .buy_token_with_jupiter(
+                                &tick.mint,
+                                sol_amount_lamports,
+                                swap_config.slippage,
+                                &app_state.wallet,
+                            )
+                            .await
+                            .map(|signature| (Some(signature), "jupiter"))
+                            .map_err(|e| e.to_string())
+                    };
+
+                match buy_outcome {
+                    Ok((signature, method)) => {
                         let price_sol = tick.price as f64 / 1_000_000_000.0;
                         let amount_token = if price_sol > 0.0 {
                             swap_config.amount_in / price_sol
@@ -829,8 +898,8 @@ async fn main() -> anyhow::Result<()> {
                                 price_sol,
                                 amount_sol: swap_config.amount_in,
                                 amount_token,
-                                tx_signature: Some(signature),
-                                reason: Some("auto_snipe".into()),
+                                tx_signature: signature,
+                                reason: Some(method.into()),
                                 at: now_iso(),
                             },
                         )
@@ -858,19 +927,20 @@ async fn main() -> anyhow::Result<()> {
                         tracing::warn!(
                             error = %e,
                             mint = %tick.mint,
+                            protocol = ?protocol,
                             wallet = %wallet_pubkey,
                             rpc_http = %payload.rpc_http,
                             amount_sol = swap_config.amount_in,
                             slippage_bps = swap_config.slippage,
-                            "executor: Jupiter buy failed"
+                            "executor: buy failed"
                         );
                         publish_event(
                             &mut event_conn,
                             &BotEvent::Error {
                                 user_id: user_id.clone(),
                                 message: format!(
-                                    "Buy failed for {} via Jupiter (wallet={}, amount_sol={})\n{}",
-                                    tick.mint, wallet_pubkey, swap_config.amount_in, e
+                                    "Buy failed for {} (protocol={:?}, wallet={}, amount_sol={})\n{}",
+                                    tick.mint, protocol, wallet_pubkey, swap_config.amount_in, e
                                 ),
                                 at: now_iso(),
                             },
