@@ -316,6 +316,28 @@ async fn main() -> anyhow::Result<()> {
     std::env::set_var("RPC_HTTP", &payload.rpc_http);
     std::env::set_var("ZERO_SLOT_URL", &payload.zero_slot_url);
 
+    // block_engine::tx::{get_unit_price, get_unit_limit} (consulted by
+    // new_signed_and_send_normal/_zeroslot for every transaction's
+    // ComputeBudget instructions) read these two env vars, not this
+    // payload directly — this is where the user's "Priority Fee" setting
+    // (a single total-lamports figure, see bot-settings-form.tsx) actually
+    // reaches them. Solana's compute budget model is priced per compute
+    // unit (SetComputeUnitPrice, in micro-lamports/CU) × a compute unit
+    // budget (SetComputeUnitLimit) — total fee = price * limit / 1e6 — so
+    // translating a single "total lamports" figure into that requires
+    // assuming a limit; 200_000 CU matches get_unit_limit()'s own
+    // hardcoded default (a typical single-swap instruction's usage), kept
+    // here explicitly rather than left implicit so the two stay in sync on
+    // purpose, not by coincidence.
+    const ASSUMED_COMPUTE_UNIT_BUDGET: u64 = 200_000;
+    let unit_price_micro_lamports = payload
+        .settings
+        .priority_fee_lamports
+        .saturating_mul(1_000_000)
+        / ASSUMED_COMPUTE_UNIT_BUDGET;
+    std::env::set_var("UNIT_LIMIT", ASSUMED_COMPUTE_UNIT_BUDGET.to_string());
+    std::env::set_var("UNIT_PRICE", unit_price_micro_lamports.to_string());
+
     let init = async {
         let wallet = Arc::new(Keypair::from_base58_string(&payload.wallet_secret_key_b58));
         let rpc_client = create_rpc_client()?;

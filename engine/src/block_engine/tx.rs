@@ -270,17 +270,26 @@ pub async fn new_signed_and_send_normal(
     logger: &Logger,
 ) -> Result<Vec<String>> {
     let start_time = Instant::now();
-    
-    // Add compute budget instructions for priority fee
-    // let unit_limit = 200000;
-    // let unit_price = 20000;
-    // let modify_compute_units =
-    //     solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(unit_limit);
-    // let add_priority_fee =
-    //     solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(unit_price);
-    // instructions.insert(0, modify_compute_units);
-    // instructions.insert(1, add_priority_fee);
-    
+
+    // This is the only send path PABLO's deployment actually exercises
+    // (ZeroSlot is normally unconfigured, so new_signed_and_send_zeroslot
+    // just delegates straight here) — but until now it never added a
+    // compute-budget/priority-fee instruction at all (this block was
+    // commented out), so every transaction went out at the network's
+    // default priority regardless of the user's own configured
+    // "Priority Fee" setting (apps/engine-bridge sets UNIT_PRICE/UNIT_LIMIT
+    // env vars from it — see executor.rs). get_unit_price/get_unit_limit
+    // are the same helpers new_signed_and_send_zeroslot's own configured
+    // path already uses, so both send paths now agree.
+    let unit_limit = get_unit_limit();
+    let unit_price = get_unit_price();
+    let modify_compute_units =
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(unit_limit);
+    let add_priority_fee =
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(unit_price);
+    instructions.insert(0, modify_compute_units);
+    instructions.insert(1, add_priority_fee);
+
     // Create and send transaction
     let txn = Transaction::new_signed_with_payer(
         &instructions,

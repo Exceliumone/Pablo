@@ -333,7 +333,13 @@ impl Pump {
         let (token_amount, sol_amount_threshold, input_accounts) = match swap_config.swap_direction {
             SwapDirection::Buy => {
                 let amount_specified = ui_amount_to_amount(swap_config.amount_in, spl_token::native_mint::DECIMALS);
-                let max_sol_cost = max_amount_with_slippage(amount_specified, 20000);
+                // Was hardcoded to 20000 (20%) regardless of the user's own
+                // configured slippage tolerance (`slippage_bps`, computed
+                // above from swap_config.slippage but never actually used
+                // anywhere in this function) — meaning a direct PumpFun buy
+                // could execute at up to 20% worse than expected even when
+                // the user asked for a much tighter tolerance.
+                let max_sol_cost = max_amount_with_slippage(amount_specified, slippage_bps);
                 
                 // Use virtual reserves from trade_info for accurate calculation
                 let tokens_out = Self::calculate_buy_token_amount(
