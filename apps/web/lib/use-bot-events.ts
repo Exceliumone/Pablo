@@ -1,7 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { BotEventDto, TradeDto, TradesPageDto } from "@pablo/shared-types";
+import type {
+  BotEventDto,
+  NotificationDto,
+  NotificationsPageDto,
+  TradeDto,
+  TradesPageDto,
+} from "@pablo/shared-types";
 import { apiFetch } from "./api";
 
 const MAX_EVENTS = 100;
@@ -15,9 +21,11 @@ function wsUrl(accessToken: string): string {
 /** Redis pub/sub (what the WS gateway relays live) has no history —
  * opportunity/status events really are gone once missed, by design (see
  * event-persister.ts's doc comment: "high-frequency and disposable, not
- * history"). Trades ARE durably persisted, though, so a page refresh
- * doesn't have to lose those: reconstruct synthetic trade events from
- * GET /trades to reseed the feed on mount. */
+ * history"). Trades and buy/sell errors ARE durably persisted, though (the
+ * latter as `Notification`s with type ERROR — see event-persister.ts and
+ * apps/api/src/modules/notifications), so a page refresh doesn't have to
+ * lose those: reconstruct synthetic events from GET /trades and
+ * GET /notifications?type=ERROR to reseed the feed on mount. */
 function tradeToBotEvent(t: TradeDto): Extract<BotEventDto, { type: "trade" }> {
   return {
     type: "trade",
@@ -31,6 +39,15 @@ function tradeToBotEvent(t: TradeDto): Extract<BotEventDto, { type: "trade" }> {
     txSignature: t.txSignature,
     reason: t.reason,
     at: t.createdAt,
+  };
+}
+
+function notificationToBotEvent(n: NotificationDto): Extract<BotEventDto, { type: "error" }> {
+  return {
+    type: "error",
+    userId: "",
+    message: n.body,
+    at: n.createdAt,
   };
 }
 
@@ -56,9 +73,17 @@ export function useBotEvents(accessToken: string | null, active = true) {
 
     void (async () => {
       try {
-        const page = await apiFetch<TradesPageDto>(`/trades?limit=${MAX_EVENTS}`, { accessToken });
+        const [tradesPage, errorsPage] = await Promise.all([
+          apiFetch<TradesPageDto>(`/trades?limit=${MAX_EVENTS}`, { accessToken }),
+          apiFetch<NotificationsPageDto>(`/notifications?type=ERROR&limit=${MAX_EVENTS}`, {
+            accessToken,
+          }).catch(() => ({ notifications: [], nextCursor: null }) as NotificationsPageDto),
+        ]);
         if (cancelled) return;
-        const seeded = page.trades.map(tradeToBotEvent);
+        const seeded = [
+          ...tradesPage.trades.map(tradeToBotEvent),
+          ...errorsPage.notifications.map(notificationToBotEvent),
+        ].sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
         setEvents((prev) => {
           // Anything already live (arrived while this fetch was in flight)
           // takes priority over its own persisted copy.
@@ -68,8 +93,19 @@ export function useBotEvents(accessToken: string | null, active = true) {
               .map((e) => e.txSignature)
               .filter((sig): sig is string => sig !== null),
           );
-          const rest = seeded.filter((e) => !e.txSignature || !seenSignatures.has(e.txSignature));
-          return [...prev, ...rest].slice(0, MAX_EVENTS);
+          const seenErrorKeys = new Set(
+            prev
+              .filter((e): e is Extract<BotEventDto, { type: "error" }> => e.type === "error")
+              .map((e) => `${e.at}:${e.message}`),
+          );
+          const rest = seeded.filter((e) =>
+            e.type === "trade"
+              ? !e.txSignature || !seenSignatures.has(e.txSignature)
+              : !seenErrorKeys.has(`${e.at}:${e.message}`),
+          );
+          return [...prev, ...rest]
+            .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
+            .slice(0, MAX_EVENTS);
         });
       } catch {
         // Best-effort seed only — a failed fetch just leaves the feed

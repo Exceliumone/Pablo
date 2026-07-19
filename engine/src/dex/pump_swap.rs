@@ -274,6 +274,29 @@ impl PumpSwap {
             logger.log(format!("ATA creation instruction added for {}", out_ata));
         }
 
+        // PumpSwap's Buy instruction takes `user_quote_token_account` (the
+        // caller's WSOL ATA) as an explicit account, not native SOL — a
+        // wallet that has never held WSOL before doesn't have this account
+        // yet, and the instruction then fails on-chain with an
+        // AnchorError on that account: "AccountNotInitialized" (Error
+        // 3012/0xbc4), since Anchor's account deserialization requires it
+        // to already exist. raydium_launchpad.rs's buy path has the same
+        // idempotent-create step for its own wsol_ata — mirrored here.
+        let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+        if !self.check_token_account_cache(wsol_ata).await {
+            let logger = Logger::new("[PUMPSWAP-WSOL-CREATE] => ".yellow().to_string());
+            logger.log(format!("Creating WSOL ATA at address {}", wsol_ata));
+
+            instructions.push(create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &SOL_MINT,
+                &TOKEN_PROGRAM,
+            ));
+
+            self.cache_token_account(wsol_ata).await;
+        }
+
         // Create accounts using parsed pool_id and coin_creator
         let pool_base_account = get_associated_token_address_with_program_id(&pool_id, &mint, &base_token_program);
         let pool_quote_account = get_associated_token_address(&pool_id, &SOL_MINT);
@@ -288,7 +311,7 @@ impl PumpSwap {
             mint,
             SOL_MINT,
             out_ata,
-            get_associated_token_address(&owner, &SOL_MINT),
+            wsol_ata,
             pool_base_account,
             pool_quote_account,
             coin_creator,
@@ -381,6 +404,25 @@ impl PumpSwap {
         println!("Sell calculation - Tokens in: {}, Expected SOL out: {}, Virtual SOL: {}, Virtual Tokens: {}",
             amount, quote_amount_out, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves);
 
+        // Same AccountNotInitialized risk as the buy path (see
+        // prepare_buy_swap_from_parsed) — the sell instruction's
+        // user_quote_token_account is where the sold SOL lands, and it
+        // needs to exist even if this wallet has never held WSOL.
+        let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+        if !self.check_token_account_cache(wsol_ata).await {
+            let logger = Logger::new("[PUMPSWAP-WSOL-CREATE] => ".yellow().to_string());
+            logger.log(format!("Creating WSOL ATA at address {}", wsol_ata));
+
+            instructions.push(create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &SOL_MINT,
+                &TOKEN_PROGRAM,
+            ));
+
+            self.cache_token_account(wsol_ata).await;
+        }
+
         // Create accounts using parsed pool_id and coin_creator
         let pool_base_account = get_associated_token_address_with_program_id(&pool_id, &mint, &base_token_program);
         let pool_quote_account = get_associated_token_address(&pool_id, &SOL_MINT);
@@ -395,7 +437,7 @@ impl PumpSwap {
             mint,
             SOL_MINT,
             in_ata,
-            get_associated_token_address(&owner, &SOL_MINT),
+            wsol_ata,
             pool_base_account,
             pool_quote_account,
             coin_creator,

@@ -226,6 +226,12 @@ export const notificationDto = z.object({
 });
 export type NotificationDto = z.infer<typeof notificationDto>;
 
+export const notificationsPageDto = z.object({
+  notifications: z.array(notificationDto),
+  nextCursor: z.string().nullable(),
+});
+export type NotificationsPageDto = z.infer<typeof notificationsPageDto>;
+
 export const positionDto = z.object({
   id: z.string(),
   tokenMint: z.string(),

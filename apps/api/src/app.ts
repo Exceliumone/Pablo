@@ -12,6 +12,7 @@ import billingRoutes from "./modules/billing/billing.routes.js";
 import botRoutes from "./modules/bot/bot.routes.js";
 import portfolioRoutes from "./modules/portfolio/portfolio.routes.js";
 import tradesRoutes from "./modules/trades/trades.routes.js";
+import notificationRoutes from "./modules/notifications/notification.routes.js";
 import analyticsRoutes from "./modules/analytics/analytics.routes.js";
 import walletRoutes from "./modules/wallet/wallet.routes.js";
 import wsGateway from "./ws/gateway.js";
@@ -62,6 +63,7 @@ export function buildApp() {
   app.register(botRoutes, { prefix: "/bot" });
   app.register(portfolioRoutes, { prefix: "/portfolio" });
   app.register(tradesRoutes, { prefix: "/trades" });
+  app.register(notificationRoutes, { prefix: "/notifications" });
   app.register(analyticsRoutes, { prefix: "/analytics" });
   app.register(walletRoutes, { prefix: "/wallet" });
   app.register(wsGateway);
