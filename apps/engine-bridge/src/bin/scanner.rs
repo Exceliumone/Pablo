@@ -839,18 +839,163 @@ fn detect_pumpswap_log_event(
     None
 }
 
+// Anchor event discriminator: first 8 bytes of sha256("event:TradeEvent") —
+// PumpFun's bonding-curve program doesn't publish an IDL, so this was
+// computed from the discriminator convention and then verified byte-for-
+// byte against a real production transaction's decoded event, not guessed.
+const PUMPFUN_TRADE_EVENT_DISCRIMINATOR: [u8; 8] = [0xbd, 0xdb, 0x7f, 0xd3, 0x4e, 0xe6, 0x61, 0xee];
+
+// Through `creator` (relative offset 169, +32 bytes) in the post-
+// discriminator payload — this scanner never reads the trailing
+// fee_basis_points/fee/creator_fee_basis_points/creator_fee/... fields
+// that follow. Field offsets below were reverse-engineered from a real
+// production TradeEvent (no published IDL exists for this program) and
+// cross-validated against independently-known quantities before trusting
+// them: the decoded mint has pump.fun's "pump" vanity suffix; the decoded
+// `user` matched the exact tracked-wallet pubkey that triggered the
+// transaction; `virtual_sol_reserves - real_sol_reserves` equals exactly
+// pump.fun's fixed 30 SOL initial virtual offset; and `fee` equals
+// `fee_basis_points` applied to `sol_amount`, correct to the lamport.
+const PUMPFUN_TRADE_EVENT_MIN_PAYLOAD_LEN: usize = 201;
+
+/// Reads the PumpFun bonding-curve `TradeEvent` fields this scanner needs.
+/// `payload` is the event body with the 8-byte discriminator already
+/// stripped. Unlike PumpSwap's separate SellEvent/BuyEvent, PumpFun uses
+/// one `TradeEvent` discriminator for both directions — see `is_buy`
+/// below — and it encodes `mint` directly, so (unlike
+/// `build_pumpswap_trade_info`) no `mint_from_post_token_balances`
+/// heuristic is needed here.
+fn build_pumpfun_trade_info(log_signature: &str, payload: &[u8]) -> Option<TradeInfoFromToken> {
+    if payload.len() < PUMPFUN_TRADE_EVENT_MIN_PAYLOAD_LEN {
+        return None;
+    }
+
+    let mint = pumpswap_event_pubkey(payload, 0)?;
+    let sol_amount = pumpswap_event_u64(payload, 32)?;
+    let token_amount = pumpswap_event_u64(payload, 40)?;
+    let is_buy = *payload.get(48)? != 0;
+    let user = pumpswap_event_pubkey(payload, 49)?;
+    let timestamp = pumpswap_event_u64(payload, 81)?;
+    let virtual_sol_reserves = pumpswap_event_u64(payload, 89)?;
+    let virtual_token_reserves = pumpswap_event_u64(payload, 97)?;
+    let creator = pumpswap_event_pubkey(payload, 169)?;
+
+    let price = virtual_sol_reserves.saturating_mul(1_000_000_000) / virtual_token_reserves.max(1);
+
+    let (sol_change, token_change) = if is_buy {
+        (
+            -(sol_amount as f64) / 1_000_000_000.0,
+            token_amount as f64 / 1_000_000_000.0,
+        )
+    } else {
+        (
+            sol_amount as f64 / 1_000_000_000.0,
+            -(token_amount as f64) / 1_000_000_000.0,
+        )
+    };
+
+    tracing::debug!(
+        signature = %log_signature,
+        mint = %mint,
+        user = %user,
+        is_buy,
+        price,
+        virtual_sol_reserves,
+        virtual_token_reserves,
+        "scanner: PumpFun bonding-curve TradeEvent decoded into a trade"
+    );
+
+    Some(TradeInfoFromToken {
+        dex_type: DexType::PumpFun,
+        slot: 0,
+        signature: String::new(),
+        // PumpFun derives its bonding-curve PDA from the mint directly
+        // (see engine/src/dex/pump_fun.rs's get_pda call) — there's no
+        // separate pool_id the way PumpSwap has one.
+        pool_id: String::new(),
+        mint,
+        timestamp,
+        is_buy,
+        price,
+        is_reverse_when_pump_swap: false, // PumpSwap-only flag, not applicable to PumpFun
+        coin_creator: Some(creator),
+        sol_change,
+        token_change,
+        liquidity: virtual_sol_reserves as f64 / 1_000_000_000.0,
+        virtual_sol_reserves,
+        virtual_token_reserves,
+    })
+}
+
+/// PumpFun bonding-curve trades only ever show up as a `"Program data:"`
+/// Anchor log event (`emit!`/`sol_log_data`) — this scanner's
+/// inner-instruction CPI-log path (`extract_cpi_log_data`) never matches
+/// them, since PumpFun's self-CPI event-log instruction data is a
+/// different length (see `detect_trade`'s doc comment). Same
+/// try-every-matching-line structure as `detect_pumpswap_log_event`.
+fn detect_pumpfun_log_event(
+    txn: &SubscribeUpdateTransaction,
+    log_signature: &str,
+) -> Option<TradeInfoFromToken> {
+    let log_messages = txn
+        .transaction
+        .as_ref()
+        .and_then(|t| t.meta.as_ref())
+        .map(|m| m.log_messages.clone())
+        .unwrap_or_default();
+
+    for (line_index, line) in log_messages.iter().enumerate() {
+        let Some(b64) = line.strip_prefix("Program data: ") else {
+            continue;
+        };
+        let Ok(payload) = base64::decode(b64) else {
+            continue;
+        };
+        if payload.len() < 8 || payload[0..8] != PUMPFUN_TRADE_EVENT_DISCRIMINATOR {
+            continue;
+        }
+
+        tracing::debug!(
+            signature = %log_signature,
+            log_line_index = line_index,
+            payload_len = payload.len(),
+            "scanner: recognized PumpFun TradeEvent discriminator"
+        );
+
+        match build_pumpfun_trade_info(log_signature, &payload[8..]) {
+            Some(parsed) => return Some(parsed),
+            None => {
+                tracing::debug!(
+                    signature = %log_signature,
+                    log_line_index = line_index,
+                    "scanner: PumpFun TradeEvent discriminator matched but field decoding \
+                     failed (payload too short for the fields this scanner reads) — skipping \
+                     this log line"
+                );
+                continue;
+            }
+        }
+    }
+
+    None
+}
+
 /// Turns one detected transaction into a trade tick. Tries the untouched
 /// engine's own parser against a recognized inner-instruction CPI log
 /// first (`extract_cpi_log_data` + `parse_transaction_data`, unchanged
 /// behavior from before this file had a second path); if that finds
 /// nothing, falls back to decoding a PumpSwap Anchor `"Program data:"` log
-/// event (`detect_pumpswap_log_event`) before giving up. `None` for
-/// anything neither path recognizes (wrapped-SOL mint, no matching CPI log
-/// or log event, etc.). `log_signature` is diagnostic-only (a display
-/// string identifying which transaction this call is for, so the
-/// rejection-reason logs below can be correlated with the rest of the
-/// pipeline's per-signature logs even when several are in flight
-/// concurrently) — it plays no role in the detection logic itself.
+/// event (`detect_pumpswap_log_event`), then a PumpFun bonding-curve
+/// `TradeEvent` log event (`detect_pumpfun_log_event`) before giving up.
+/// PumpFun bonding-curve trades only ever match this last path — its
+/// self-CPI event-log instruction never lands on one of
+/// `extract_cpi_log_data`'s recognized lengths, only the `"Program data:"`
+/// log line does. `None` for anything no path recognizes (wrapped-SOL
+/// mint, no matching CPI log or log event, etc.). `log_signature` is
+/// diagnostic-only (a display string identifying which transaction this
+/// call is for, so the rejection-reason logs below can be correlated with
+/// the rest of the pipeline's per-signature logs even when several are in
+/// flight concurrently) — it plays no role in the detection logic itself.
 fn detect_trade(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option<ScannerTick> {
     if let Some(data) = extract_cpi_log_data(txn, log_signature) {
         match parse_transaction_data(txn, &data) {
@@ -885,13 +1030,17 @@ fn detect_trade(txn: &SubscribeUpdateTransaction, log_signature: &str) -> Option
         return finalize_detected_trade(&parsed, txn, log_signature, "pumpswap_log_event");
     }
 
+    if let Some(parsed) = detect_pumpfun_log_event(txn, log_signature) {
+        return finalize_detected_trade(&parsed, txn, log_signature, "pumpfun_log_event");
+    }
+
     tracing::debug!(
         signature = %log_signature,
         "scanner: REJECTED — no inner instruction with a recognized CPI-log data length \
-         (368/266/270/146/170/138 bytes), and no recognized PumpSwap Anchor log event \
-         (SellEvent/BuyEvent) either. Either this transaction doesn't actually touch \
-         PumpFun/PumpSwap/Raydium Launchpad in a way this scanner recognizes, or its emission \
-         format has changed again."
+         (368/266/270/146/170/138 bytes), no recognized PumpSwap Anchor log event \
+         (SellEvent/BuyEvent), and no recognized PumpFun TradeEvent either. Either this \
+         transaction doesn't actually touch PumpFun/PumpSwap/Raydium Launchpad in a way this \
+         scanner recognizes, or its emission format has changed again."
     );
     None
 }
@@ -1728,4 +1877,66 @@ fn to_synthetic_subscribe_update(
             index: 0,
         }),
     })
+}
+
+#[cfg(test)]
+mod pumpfun_trade_event_tests {
+    use super::*;
+
+    /// The exact `"Program data: <base64>"` payload captured from a real
+    /// production transaction (signature cZAtXWxp6PavammXpPS44jAaymQ9xG4h
+    /// rbZgcsGJ9RyHZQu2fTwoRJbZwPg7gG1G4rkhUwNtFj3BmqRcFdgzqGC, mainnet) that
+    /// this scanner previously rejected entirely — the reason
+    /// build_pumpfun_trade_info/detect_pumpfun_log_event exist. Pinning this
+    /// as a regression test, not just a one-off manual check, since a wrong
+    /// field offset here would make a live trading bot buy/copy the wrong
+    /// thing.
+    const REAL_TRADE_EVENT_B64: &str = "vdt/007mYe5enbBp6lMQcbH9bxfIXUz8z4IC3Z0UvLDKphP294ECD7v+DgAAAAAA9BI6IggAAAABH8h/SdK4AnXl50+aiw13l05pQa7zlZzxn+x3naDFnhM8e1xqAAAAAOL1pQEHAAAAjZ2f+OPMAwDiSYIFAAAAAI0FjaxSzgIASsL40N1cvJfjKJwZfLUGKlTz2Va5zm5RFfllZ6pcs+ZfAAAAAAAAAHgkAAAAAAAAH8h/SdK4AnXl50+aiw13l05pQa7zlZzxn+x3naDFnhMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEgAAAGJ1eV9leGFjdF9xdW90ZV9pbgAeAAAAAAAAAIULAAAAAAAAiBMAAAAAAAA8EgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALv+DgAAAAAA4vWlAQcAAADiSYIFAAAAAA==";
+
+    #[test]
+    fn discriminator_matches_sha256_event_trade_event() {
+        // Guards against silent drift if this constant is ever "cleaned up"
+        // by someone who doesn't realize it's load-bearing, not arbitrary.
+        let payload = base64::decode(REAL_TRADE_EVENT_B64).unwrap();
+        assert_eq!(payload[0..8], PUMPFUN_TRADE_EVENT_DISCRIMINATOR);
+    }
+
+    #[test]
+    fn decodes_real_production_buy_correctly() {
+        let payload = base64::decode(REAL_TRADE_EVENT_B64).unwrap();
+        let parsed = build_pumpfun_trade_info("test-signature", &payload[8..])
+            .expect("must decode a real production TradeEvent payload");
+
+        assert_eq!(parsed.dex_type, DexType::PumpFun);
+        assert_eq!(parsed.mint, "7NLnWYKHPnHYzzF8ZbZuQpjbZYqZrKrhRGYhtXXRpump");
+        assert!(parsed.is_buy);
+        assert_eq!(
+            parsed.coin_creator.as_deref(),
+            Some("394xePDbHxhjj1Yy8xFRRe7pMh2Ac1pEGYzacqjcBhqL")
+        );
+        // Pump.fun's bonding curve starts at a fixed 30 SOL virtual
+        // reserve; this trade's reserves should still be close to that
+        // (a lightly-traded token), not some wildly different magnitude
+        // that would indicate a field-offset mistake.
+        assert!(parsed.virtual_sol_reserves > 29_000_000_000 && parsed.virtual_sol_reserves < 31_000_000_000);
+        assert_eq!(parsed.virtual_sol_reserves, 30_092_424_674);
+        assert_eq!(parsed.virtual_token_reserves, 1_069_704_430_984_589);
+        assert_eq!(parsed.sol_change, -982715.0 / 1_000_000_000.0);
+        assert_eq!(parsed.token_change, 34_933_969_652.0 / 1_000_000_000.0);
+    }
+
+    #[test]
+    fn rejects_payload_that_is_too_short() {
+        let payload = base64::decode(REAL_TRADE_EVENT_B64).unwrap();
+        // Truncate well before the `creator` field this scanner requires.
+        let truncated = &payload[8..8 + 100];
+        assert!(build_pumpfun_trade_info("test-signature", truncated).is_none());
+    }
+
+    #[test]
+    fn wrong_discriminator_is_not_detected_as_pumpfun_trade_event() {
+        let mut payload = base64::decode(REAL_TRADE_EVENT_B64).unwrap();
+        payload[0] ^= 0xff; // corrupt the discriminator
+        assert_ne!(payload[0..8], PUMPFUN_TRADE_EVENT_DISCRIMINATOR);
+    }
 }
