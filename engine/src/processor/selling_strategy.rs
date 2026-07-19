@@ -62,6 +62,38 @@ pub async fn resolve_wallet_ata(
     Ok(get_associated_token_address_with_program_id(wallet, mint, &token_program))
 }
 
+/// Reads the raw balance + decimals of `ata` (a Token-2022-aware address
+/// from `resolve_wallet_ata` above), extension-aware. Deriving the right
+/// *address* isn't enough on its own: `RpcClient::get_token_account` (the
+/// std client's convenience wrapper, used everywhere in this file before
+/// this fix) unpacks whatever it fetches with the legacy, fixed-165-byte
+/// `spl_token::state::Account` layout unconditionally — so it still fails
+/// ("Account could not be parsed as token account") the moment the
+/// account actually carries Token-2022 extension data (e.g. a
+/// transfer-fee or transfer-hook mint), even once the address itself is
+/// correct. `block_engine::token::get_account_info` unpacks via
+/// `spl_token_2022`'s `StateWithExtensionsOwned`, which correctly handles
+/// both a bare legacy-shaped account and one with extensions appended.
+/// Returns `Ok(None)` specifically when the account doesn't exist at all
+/// (nothing to sell) — any other failure (RPC error, genuine parse
+/// failure) is a real `Err`, not silently treated as a zero balance.
+pub async fn get_wallet_token_balance(
+    client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
+    keypair: Arc<Keypair>,
+    ata: &Pubkey,
+    mint: &Pubkey,
+) -> Result<Option<(u64, u8)>> {
+    let account_info = match crate::block_engine::token::get_account_info(client.clone(), *mint, *ata).await {
+        Ok(info) => info,
+        Err(spl_token_client::token::TokenError::AccountNotFound) => return Ok(None),
+        Err(e) => return Err(anyhow!("Failed to get token account {}: {}", ata, e)),
+    };
+    let mint_info = crate::block_engine::token::get_mint_info(client, keypair, *mint)
+        .await
+        .map_err(|e| anyhow!("Failed to get mint info for {}: {}", mint, e))?;
+    Ok(Some((account_info.base.amount, mint_info.base.decimals)))
+}
+
 // Global state for token metrics
 lazy_static! {
     pub static ref TOKEN_METRICS: Arc<DashMap<String, TokenMetrics>> = Arc::new(DashMap::new());
@@ -613,27 +645,24 @@ impl TokenManager {
                     return Err(anyhow::anyhow!("Failed to resolve token account for mint: {}", token_mint));
                 };
 
-                match app_state.rpc_nonblocking_client.get_token_account(&ata).await {
-                    Ok(account_result) => {
-                        match account_result {
-                            Some(account) => {
-                                if let Ok(amount_value) = account.token_amount.amount.parse::<f64>() {
-                                    let decimal_amount = amount_value / 10f64.powi(account.token_amount.decimals as i32);
-                                    // Consider it fully sold if balance is very small
-                                    Ok(decimal_amount <= 0.000001)
-                                } else {
-                                    Err(anyhow::anyhow!("Failed to parse token amount"))
-                                }
-                            },
-                            None => {
-                                // Token account doesn't exist - means fully sold
-                                Ok(true)
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        Err(anyhow::anyhow!("Error checking token account: {}", e))
+                match get_wallet_token_balance(
+                    app_state.rpc_nonblocking_client.clone(),
+                    app_state.wallet.clone(),
+                    &ata,
+                    &token_pubkey,
+                )
+                .await
+                {
+                    Ok(Some((raw_amount, decimals))) => {
+                        let decimal_amount = raw_amount as f64 / 10f64.powi(decimals as i32);
+                        // Consider it fully sold if balance is very small
+                        Ok(decimal_amount <= 0.000001)
                     }
+                    Ok(None) => {
+                        // Token account doesn't exist - means fully sold
+                        Ok(true)
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Error checking token account: {}", e)),
                 }
             } else {
                 Err(anyhow::anyhow!("Invalid token mint format"))
@@ -971,12 +1000,15 @@ impl SellingEngine {
         .unwrap_or_else(|_| get_associated_token_address(&wallet_pubkey, &token_pubkey));
 
         // Get current token balance
-        let actual_token_balance = match self.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
-            Ok(Some(account)) => {
-                let amount_value = account.token_amount.amount.parse::<f64>()
-                    .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?;
-                amount_value / 10f64.powi(account.token_amount.decimals as i32)
-            },
+        let actual_token_balance = match get_wallet_token_balance(
+            self.app_state.rpc_nonblocking_client.clone(),
+            self.app_state.wallet.clone(),
+            &ata,
+            &token_pubkey,
+        )
+        .await
+        {
+            Ok(Some((raw_amount, decimals))) => raw_amount as f64 / 10f64.powi(decimals as i32),
             Ok(None) => 0.0,
             Err(_) => 0.0,
         };
@@ -1842,11 +1874,16 @@ impl SellingEngine {
         .map_err(|e| anyhow!("Failed to resolve token account for mint {}: {}", token_mint, e))?;
 
         // Get current token balance
-        let token_amount = match self.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
-            Ok(Some(account)) => {
-                let amount_value = account.token_amount.amount.parse::<f64>()
-                    .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?;
-                let decimal_amount = amount_value / 10f64.powi(account.token_amount.decimals as i32);
+        let token_amount = match get_wallet_token_balance(
+            self.app_state.rpc_nonblocking_client.clone(),
+            self.app_state.wallet.clone(),
+            &ata,
+            &token_pubkey,
+        )
+        .await
+        {
+            Ok(Some((raw_amount, decimals))) => {
+                let decimal_amount = raw_amount as f64 / 10f64.powi(decimals as i32);
                 self.logger.log(format!("Emergency selling {} tokens", decimal_amount).red().to_string());
                 decimal_amount
             },
@@ -2196,11 +2233,15 @@ impl SellingEngine {
         .map_err(|e| anyhow!("Failed to resolve token account for mint {}: {}", token_mint, e))?;
 
         // Get current token balance in raw units for Jupiter
-        let raw_token_amount = match self.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
-            Ok(Some(account)) => {
-                account.token_amount.amount.parse::<u64>()
-                    .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?
-            },
+        let raw_token_amount = match get_wallet_token_balance(
+            self.app_state.rpc_nonblocking_client.clone(),
+            self.app_state.wallet.clone(),
+            &ata,
+            &token_pubkey,
+        )
+        .await
+        {
+            Ok(Some((raw_amount, _decimals))) => raw_amount,
             Ok(None) => {
                 return Err(anyhow!("No token account found for mint: {}", token_mint));
             },

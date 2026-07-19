@@ -13,7 +13,8 @@ use solana_sdk::{
     system_program,
 };
 use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account,
+    get_associated_token_address, get_associated_token_address_with_program_id,
+    instruction::create_associated_token_account,
 };
 use spl_token::{ui_amount_to_amount};
 use tokio::sync::OnceCell;
@@ -96,6 +97,33 @@ impl Pump {
 
     async fn cache_token_account(&self, account: Pubkey) {
         WALLET_TOKEN_ACCOUNTS.insert(account);
+    }
+
+    /// Determines the SPL Token program that actually owns `mint` —
+    /// legacy `spl_token` or `spl_token_2022` — via
+    /// `token::get_mint_token_program`, instead of the hardcoded legacy
+    /// `TOKEN_PROGRAM` this file used unconditionally before. A pump.fun
+    /// bonding-curve mint isn't always legacy SPL Token — some newer
+    /// tokens use Token-2022 (transfer fees, transfer hooks) — and
+    /// assuming legacy derives the wrong ATA address and, even once that's
+    /// fixed, still names the wrong program in the swap instruction's own
+    /// token-program account, which the on-chain program CPIs into for the
+    /// actual transfer (fails there with IncorrectProgramId). Falls back
+    /// to legacy only if the lookup itself fails (a transient RPC error),
+    /// matching the pre-existing hardcoded behavior rather than aborting
+    /// the whole swap over it.
+    async fn mint_token_program(&self, mint: &Pubkey) -> Pubkey {
+        match token::get_mint_token_program(self.rpc_nonblocking_client.clone(), mint).await {
+            Ok(program) => program,
+            Err(e) => {
+                let logger = Logger::new("[PUMPFUN-TOKEN-PROGRAM] => ".red().to_string());
+                logger.log(format!(
+                    "Failed to determine token program for mint {}: {} — defaulting to legacy Token program",
+                    mint, e
+                ));
+                Pubkey::from_str(TOKEN_PROGRAM).expect("TOKEN_PROGRAM is a valid base58 pubkey")
+            }
+        }
     }
 
     // Removed get_token_price method as it requires RPC calls
@@ -184,17 +212,22 @@ impl Pump {
         
         // Extract the essential data
         let mint_str = &trade_info.mint;
+        let mint_pubkey = Pubkey::from_str(mint_str)?;
         let owner = self.keypair.pubkey();
-        let token_program_id = Pubkey::from_str(TOKEN_PROGRAM)?;
         let native_mint = spl_token::native_mint::ID;
         let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM)?;
 
+        // The mint's *actual* owning program (legacy spl_token vs.
+        // spl_token_2022) — see mint_token_program's doc comment. WSOL
+        // (native_mint) is always legacy; only the mint side needs this.
+        let mint_token_program = self.mint_token_program(&mint_pubkey).await;
+
         // Use trade_info data directly - no RPC calls for buying, but need RPC for selling to get actual balance
         _logger.log("Using trade_info data with real balance for selling".to_string());
-        
+
         // Get bonding curve account addresses (calculated, no RPC)
-        let bonding_curve = get_pda(&Pubkey::from_str(mint_str)?, &pump_program)?;
-        let associated_bonding_curve = get_associated_token_address(&bonding_curve, &Pubkey::from_str(mint_str)?);
+        let bonding_curve = get_pda(&mint_pubkey, &pump_program)?;
+        let associated_bonding_curve = get_associated_token_address_with_program_id(&bonding_curve, &mint_pubkey, &mint_token_program);
 
         // Get volume accumulator PDAs
         let global_volume_accumulator = get_global_volume_accumulator_pda(&pump_program)?;
@@ -202,8 +235,8 @@ impl Pump {
 
         // Determine if this is a buy or sell operation
         let (token_in, token_out, pump_method) = match swap_config.swap_direction {
-            SwapDirection::Buy => (native_mint, Pubkey::from_str(mint_str)?, PUMP_BUY_METHOD),
-            SwapDirection::Sell => (Pubkey::from_str(mint_str)?, native_mint, PUMP_SELL_METHOD),
+            SwapDirection::Buy => (native_mint, mint_pubkey, PUMP_BUY_METHOD),
+            SwapDirection::Sell => (mint_pubkey, native_mint, PUMP_SELL_METHOD),
         };
         
         // Calculate price using virtual reserves from trade_info
@@ -221,22 +254,32 @@ impl Pump {
         let mut create_instruction = None;
         let mut close_instruction = None;
         
-        // Handle token accounts based on direction (buy or sell)
-        let in_ata = get_associated_token_address(&owner, &token_in);
-        let out_ata = get_associated_token_address(&owner, &token_out);
-        
+        // Handle token accounts based on direction (buy or sell) — the
+        // mint side (whichever of token_in/token_out isn't native_mint)
+        // must be derived with mint_token_program, not assumed legacy.
+        let in_ata = if token_in == native_mint {
+            get_associated_token_address(&owner, &token_in)
+        } else {
+            get_associated_token_address_with_program_id(&owner, &token_in, &mint_token_program)
+        };
+        let out_ata = if token_out == native_mint {
+            get_associated_token_address(&owner, &token_out)
+        } else {
+            get_associated_token_address_with_program_id(&owner, &token_out, &mint_token_program)
+        };
+
         // Check if accounts exist and create if needed
         if swap_config.swap_direction == SwapDirection::Buy {
             // Check if token account exists and create if needed
             if !self.check_token_account_cache(out_ata).await {
                 let logger = Logger::new("[PUMPFUN-ATA-CREATE] => ".yellow().to_string());
                 logger.log(format!("Creating ATA for mint {} at address {}", token_out, out_ata));
-                
+
                 create_instruction = Some(create_associated_token_account(
                     &owner,
                     &owner,
                     &token_out,
-                    &token_program_id,
+                    &mint_token_program,
                 ));
                 // Cache the new account
                 self.cache_token_account(out_ata).await;
@@ -249,17 +292,31 @@ impl Pump {
                 logger.log(format!("Token account {} does not exist for mint {}", in_ata, token_in));
                 return Err(anyhow!("Token ATA {} does not exist for mint {}, cannot sell", in_ata, token_in));
             }
-            
+
             // For sell transactions, determine if it's a full sell
             if swap_config.in_type == SwapInType::Pct && swap_config.amount_in >= 1.0 {
-                // Close ATA for full sells
-                close_instruction = Some(spl_token::instruction::close_account(
-                    &token_program_id,
-                    &in_ata,
-                    &owner,
-                    &owner,
-                    &[&owner],
-                )?);
+                // Close ATA for full sells — spl_token's close_account
+                // rejects any token_program_id other than its own at the
+                // client-validation stage, so a Token-2022 mint must go
+                // through spl_token_2022's own close_account instead (see
+                // pump_swap.rs's identical dispatch).
+                close_instruction = Some(if mint_token_program == spl_token_2022::id() {
+                    spl_token_2022::instruction::close_account(
+                        &mint_token_program,
+                        &in_ata,
+                        &owner,
+                        &owner,
+                        &[&owner],
+                    )?
+                } else {
+                    spl_token::instruction::close_account(
+                        &mint_token_program,
+                        &in_ata,
+                        &owner,
+                        &owner,
+                        &[&owner],
+                    )?
+                });
             }
         }
         
@@ -300,7 +357,7 @@ impl Pump {
                         AccountMeta::new(out_ata, false),
                         AccountMeta::new(owner, true),
                         AccountMeta::new_readonly(system_program::id(), false),
-                        AccountMeta::new_readonly(token_program_id, false),
+                        AccountMeta::new_readonly(mint_token_program, false),
                         AccountMeta::new(creator_vault, false),
                         AccountMeta::new_readonly(Pubkey::from_str(PUMP_EVENT_AUTHORITY)?, false),
                         AccountMeta::new_readonly(pump_program, false),
@@ -310,30 +367,32 @@ impl Pump {
                 )
             },
             SwapDirection::Sell => {
-                // For selling, get ACTUAL token balance from blockchain instead of estimating
-                let actual_token_amount = match self.rpc_nonblocking_client.get_token_account(&in_ata).await {
-                    Ok(Some(account)) => {
-                        let amount_value = account.token_amount.amount.parse::<u64>()
-                            .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?;
-                        
-                        // Apply percentage or quantity based on swap config
-                        match swap_config.in_type {
-                            SwapInType::Qty => {
-                                // Convert UI amount to raw amount using account decimals
-                                let decimals = account.token_amount.decimals;
-                                ui_amount_to_amount(swap_config.amount_in, decimals)
-                            },
-                            SwapInType::Pct => {
-                                let percentage = swap_config.amount_in.min(1.0);
-                                ((percentage * amount_value as f64) as u64).max(1) // Ensure at least 1 token
-                            }
-                        }
+                // For selling, get ACTUAL token balance from blockchain
+                // instead of estimating — via token::get_account_info
+                // (extension-aware: unpacks with spl_token_2022's
+                // StateWithExtensionsOwned, which handles both a bare
+                // legacy-shaped account and one with Token-2022 extension
+                // data appended). The std RpcClient::get_token_account
+                // convenience wrapper this used to call unpacks with the
+                // legacy, fixed-165-byte layout unconditionally and fails
+                // — "Account could not be parsed as token account" — the
+                // moment the account actually has extensions (e.g. a
+                // transfer-fee or transfer-hook mint), even with the
+                // correct mint_token_program-derived `in_ata` address.
+                let (account_info, mint_info) = tokio::try_join!(
+                    token::get_account_info(self.rpc_nonblocking_client.clone(), mint_pubkey, in_ata),
+                    token::get_mint_info(self.rpc_nonblocking_client.clone(), self.keypair.clone(), mint_pubkey)
+                ).map_err(|e| anyhow!("Failed to get token account balance: {}", e))?;
+
+                let amount_value = account_info.base.amount;
+                let actual_token_amount = match swap_config.in_type {
+                    SwapInType::Qty => {
+                        // Convert UI amount to raw amount using the mint's decimals
+                        ui_amount_to_amount(swap_config.amount_in, mint_info.base.decimals)
                     },
-                    Ok(None) => {
-                        return Err(anyhow!("Token account does not exist for mint {}", mint_str));
-                    },
-                    Err(e) => {
-                        return Err(anyhow!("Failed to get token account balance: {}", e));
+                    SwapInType::Pct => {
+                        let percentage = swap_config.amount_in.min(1.0);
+                        ((percentage * amount_value as f64) as u64).max(1) // Ensure at least 1 token
                     }
                 };
                 
@@ -357,7 +416,7 @@ impl Pump {
                         AccountMeta::new(owner, true),
                         AccountMeta::new_readonly(system_program::id(), false),
                         AccountMeta::new(creator_vault, false),
-                        AccountMeta::new_readonly(token_program_id, false),
+                        AccountMeta::new_readonly(mint_token_program, false),
                         AccountMeta::new_readonly(Pubkey::from_str(PUMP_EVENT_AUTHORITY)?, false),
                         AccountMeta::new_readonly(pump_program, false),
                         AccountMeta::new(global_volume_accumulator, false),

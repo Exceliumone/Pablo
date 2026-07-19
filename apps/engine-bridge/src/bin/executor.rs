@@ -201,17 +201,24 @@ async fn execute_manual_sell(
     )
     .await?;
 
-    let (raw_amount, decimals) = match app_state
-        .rpc_nonblocking_client
-        .get_token_account(&ata)
-        .await
-    {
-        Ok(Some(account)) => (
-            account.token_amount.amount.parse::<u64>().unwrap_or(0),
-            account.token_amount.decimals,
-        ),
-        _ => (0, 0),
-    };
+    // get_wallet_token_balance (not the std RpcClient::get_token_account
+    // convenience wrapper) unpacks extension-aware — the wrapper unpacks
+    // with the legacy, fixed-165-byte layout unconditionally and fails
+    // ("Account could not be parsed as token account") the moment the
+    // account actually carries Token-2022 extension data, even with this
+    // correct Token-2022-aware `ata` address.
+    let (raw_amount, decimals) =
+        match solana_vntr_sniper::processor::selling_strategy::get_wallet_token_balance(
+            app_state.rpc_nonblocking_client.clone(),
+            app_state.wallet.clone(),
+            &ata,
+            &mint_pubkey,
+        )
+        .await?
+        {
+            Some(balance) => balance,
+            None => return Ok(None),
+        };
     if raw_amount == 0 {
         return Ok(None);
     }
