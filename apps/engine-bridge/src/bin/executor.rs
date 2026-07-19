@@ -431,11 +431,40 @@ async fn main() -> anyhow::Result<()> {
                 .await;
             }
             Ok(None) => {
+                // The wallet's on-chain balance for this mint is confirmed
+                // zero — there is genuinely nothing left to sell (a buy
+                // that never actually delivered tokens, or one that was
+                // already fully liquidated some other way without the
+                // matching Position ever being marked CLOSED). Publishing
+                // a zero-amount Trade::Sell — same mechanism a real sell
+                // uses — lets event-persister.ts's existing persistSell
+                // logic close the DB position (booking the full cost basis
+                // as a realized loss, since that SOL is genuinely gone)
+                // instead of leaving it stuck OPEN forever with no way for
+                // the user to ever clear it via this button.
+                publish_event(
+                    &mut event_conn,
+                    &BotEvent::Trade {
+                        user_id: user_id.clone(),
+                        side: TradeSide::Sell,
+                        mint: mint.clone(),
+                        dex: manual_sell_dex_label(&mint).to_string(),
+                        price_sol: 0.0,
+                        amount_sol: 0.0,
+                        amount_token: 0.0,
+                        tx_signature: None,
+                        reason: Some("closed_empty".into()),
+                        at: now_iso(),
+                    },
+                )
+                .await;
                 publish_event(
                     &mut event_conn,
                     &BotEvent::Error {
                         user_id: user_id.clone(),
-                        message: format!("Aucune position à clôturer pour {mint} (solde nul)"),
+                        message: format!(
+                            "Aucune position à clôturer pour {mint} (solde nul) — position marquée comme clôturée"
+                        ),
                         at: now_iso(),
                     },
                 )
@@ -598,12 +627,36 @@ async fn main() -> anyhow::Result<()> {
                                     .await;
                                 }
                                 Ok(None) => {
+                                    // See the one-shot branch's identical
+                                    // comment above (main()) — confirmed
+                                    // zero on-chain balance means there's
+                                    // nothing to sell, so close the DB
+                                    // position via the same zero-amount
+                                    // Trade::Sell mechanism rather than
+                                    // leaving it stuck OPEN forever.
+                                    held_positions.remove(&mint);
+                                    publish_event(
+                                        &mut event_conn,
+                                        &BotEvent::Trade {
+                                            user_id: user_id.clone(),
+                                            side: TradeSide::Sell,
+                                            mint: mint.clone(),
+                                            dex: manual_sell_dex_label(&mint).to_string(),
+                                            price_sol: 0.0,
+                                            amount_sol: 0.0,
+                                            amount_token: 0.0,
+                                            tx_signature: None,
+                                            reason: Some("closed_empty".into()),
+                                            at: now_iso(),
+                                        },
+                                    )
+                                    .await;
                                     publish_event(
                                         &mut event_conn,
                                         &BotEvent::Error {
                                             user_id: user_id.clone(),
                                             message: format!(
-                                                "Aucune position à clôturer pour {mint} (solde nul)"
+                                                "Aucune position à clôturer pour {mint} (solde nul) — position marquée comme clôturée"
                                             ),
                                             at: now_iso(),
                                         },

@@ -2007,8 +2007,21 @@ impl SellingEngine {
                                 Ok(signature.to_string())
                             },
                             Err(e) => {
-                                self.logger.log(format!("Emergency sell transaction failed: {}", e).red().to_string());
-                                Err(anyhow!("Failed to send emergency sell transaction: {}", e))
+                                // format_error_chain (already used for buy
+                                // errors — see sniper_bot.rs) walks the full
+                                // .source() cascade, including a Solana RPC
+                                // preflight failure's structured simulation
+                                // logs/error code, which a bare `{}` only
+                                // shows as a single collapsed summary line
+                                // ("Failed to send normal transaction", with
+                                // nothing else) — new_signed_and_send_normal
+                                // (what new_signed_and_send_zeroslot falls
+                                // back to when ZERO_SLOT_URL is unset)
+                                // preserves that detail precisely so it can
+                                // be walked here.
+                                let detail = crate::block_engine::tx::format_error_chain(&e);
+                                self.logger.log(format!("Emergency sell transaction failed:\n{}", detail).red().to_string());
+                                Err(anyhow!("Failed to send emergency sell transaction:\n{}", detail))
                             }
                         }
                     },
@@ -2057,8 +2070,21 @@ impl SellingEngine {
                                 Ok(signature.to_string())
                             },
                             Err(e) => {
-                                self.logger.log(format!("Emergency sell transaction failed: {}", e).red().to_string());
-                                Err(anyhow!("Failed to send emergency sell transaction: {}", e))
+                                // format_error_chain (already used for buy
+                                // errors — see sniper_bot.rs) walks the full
+                                // .source() cascade, including a Solana RPC
+                                // preflight failure's structured simulation
+                                // logs/error code, which a bare `{}` only
+                                // shows as a single collapsed summary line
+                                // ("Failed to send normal transaction", with
+                                // nothing else) — new_signed_and_send_normal
+                                // (what new_signed_and_send_zeroslot falls
+                                // back to when ZERO_SLOT_URL is unset)
+                                // preserves that detail precisely so it can
+                                // be walked here.
+                                let detail = crate::block_engine::tx::format_error_chain(&e);
+                                self.logger.log(format!("Emergency sell transaction failed:\n{}", detail).red().to_string());
+                                Err(anyhow!("Failed to send emergency sell transaction:\n{}", detail))
                             }
                         }
                     },
@@ -2107,8 +2133,21 @@ impl SellingEngine {
                                 Ok(signature.to_string())
                             },
                             Err(e) => {
-                                self.logger.log(format!("Emergency sell transaction failed: {}", e).red().to_string());
-                                Err(anyhow!("Failed to send emergency sell transaction: {}", e))
+                                // format_error_chain (already used for buy
+                                // errors — see sniper_bot.rs) walks the full
+                                // .source() cascade, including a Solana RPC
+                                // preflight failure's structured simulation
+                                // logs/error code, which a bare `{}` only
+                                // shows as a single collapsed summary line
+                                // ("Failed to send normal transaction", with
+                                // nothing else) — new_signed_and_send_normal
+                                // (what new_signed_and_send_zeroslot falls
+                                // back to when ZERO_SLOT_URL is unset)
+                                // preserves that detail precisely so it can
+                                // be walked here.
+                                let detail = crate::block_engine::tx::format_error_chain(&e);
+                                self.logger.log(format!("Emergency sell transaction failed:\n{}", detail).red().to_string());
+                                Err(anyhow!("Failed to send emergency sell transaction:\n{}", detail))
                             }
                         }
                     },
@@ -2155,8 +2194,21 @@ impl SellingEngine {
                                 Ok(signature.to_string())
                             },
                             Err(e) => {
-                                self.logger.log(format!("Emergency sell transaction failed: {}", e).red().to_string());
-                                Err(anyhow!("Failed to send emergency sell transaction: {}", e))
+                                // format_error_chain (already used for buy
+                                // errors — see sniper_bot.rs) walks the full
+                                // .source() cascade, including a Solana RPC
+                                // preflight failure's structured simulation
+                                // logs/error code, which a bare `{}` only
+                                // shows as a single collapsed summary line
+                                // ("Failed to send normal transaction", with
+                                // nothing else) — new_signed_and_send_normal
+                                // (what new_signed_and_send_zeroslot falls
+                                // back to when ZERO_SLOT_URL is unset)
+                                // preserves that detail precisely so it can
+                                // be walked here.
+                                let detail = crate::block_engine::tx::format_error_chain(&e);
+                                self.logger.log(format!("Emergency sell transaction failed:\n{}", detail).red().to_string());
+                                Err(anyhow!("Failed to send emergency sell transaction:\n{}", detail))
                             }
                         }
                     },
