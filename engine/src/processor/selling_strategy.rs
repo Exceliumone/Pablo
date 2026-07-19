@@ -10,7 +10,7 @@ use anchor_client::solana_sdk::{hash::Hash, instruction::Instruction, pubkey::Pu
 use colored::Colorize;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account::{get_associated_token_address, get_associated_token_address_with_program_id};
 use dashmap::DashMap;
 use solana_program_pack::Pack;
 
@@ -35,6 +35,28 @@ impl From<SwapProtocol> for DexType {
             SwapProtocol::Auto | SwapProtocol::Unknown => DexType::Unknown,
         }
     }
+}
+
+/// Derives the wallet's associated token account for `mint` using
+/// whichever SPL Token program actually owns it — legacy `spl_token` or
+/// `spl_token_2022` — instead of assuming legacy unconditionally.
+/// `get_associated_token_address` alone always derives the legacy-program
+/// address; for a Token-2022 mint (increasingly common — some newer
+/// pump.fun-family tokens use it) that's simply the wrong pubkey, and RPC
+/// calls against it come back either "No token account found" (nothing
+/// was ever created at that wrong address) or "Account could not be
+/// parsed as token account" (a coincidental account exists there but
+/// isn't a token account at all). This is the same fix already applied
+/// on the buy side for PumpSwap (see `block_engine::token::
+/// get_mint_token_program`'s doc comment) — this is that same helper,
+/// applied to the balance-check/emergency-sell call sites in this file.
+async fn resolve_wallet_ata(
+    client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
+    wallet: &Pubkey,
+    mint: &Pubkey,
+) -> Result<Pubkey> {
+    let token_program = crate::block_engine::token::get_mint_token_program(client, mint).await?;
+    Ok(get_associated_token_address_with_program_id(wallet, mint, &token_program))
 }
 
 // Global state for token metrics
@@ -575,12 +597,19 @@ impl TokenManager {
     ) -> Result<bool> {
         use solana_sdk::pubkey::Pubkey;
         use std::str::FromStr;
-        use spl_associated_token_account::get_associated_token_address;
-        
+
         if let Ok(wallet_pubkey) = app_state.wallet.try_pubkey() {
             if let Ok(token_pubkey) = Pubkey::from_str(token_mint) {
-                let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
-                
+                let Ok(ata) = resolve_wallet_ata(
+                    app_state.rpc_nonblocking_client.clone(),
+                    &wallet_pubkey,
+                    &token_pubkey,
+                )
+                .await
+                else {
+                    return Err(anyhow::anyhow!("Failed to resolve token account for mint: {}", token_mint));
+                };
+
                 match app_state.rpc_nonblocking_client.get_token_account(&ata).await {
                     Ok(account_result) => {
                         match account_result {
@@ -930,7 +959,13 @@ impl SellingEngine {
         // Get token account to determine actual balance
         let token_pubkey = Pubkey::from_str(token_mint)
             .map_err(|e| anyhow!("Invalid token mint address: {}", e))?;
-        let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
+        let ata = resolve_wallet_ata(
+            self.app_state.rpc_nonblocking_client.clone(),
+            &wallet_pubkey,
+            &token_pubkey,
+        )
+        .await
+        .unwrap_or_else(|_| get_associated_token_address(&wallet_pubkey, &token_pubkey));
 
         // Get current token balance
         let actual_token_balance = match self.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
@@ -1795,7 +1830,13 @@ impl SellingEngine {
         // Get token account to determine how much we own
         let token_pubkey = Pubkey::from_str(token_mint)
             .map_err(|e| anyhow!("Invalid token mint address: {}", e))?;
-        let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
+        let ata = resolve_wallet_ata(
+            self.app_state.rpc_nonblocking_client.clone(),
+            &wallet_pubkey,
+            &token_pubkey,
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to resolve token account for mint {}: {}", token_mint, e))?;
 
         // Get current token balance
         let token_amount = match self.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
@@ -2143,7 +2184,13 @@ impl SellingEngine {
             .map_err(|e| anyhow!("Failed to get wallet pubkey: {}", e))?;
         let token_pubkey = Pubkey::from_str(token_mint)
             .map_err(|e| anyhow!("Invalid token mint address: {}", e))?;
-        let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
+        let ata = resolve_wallet_ata(
+            self.app_state.rpc_nonblocking_client.clone(),
+            &wallet_pubkey,
+            &token_pubkey,
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to resolve token account for mint {}: {}", token_mint, e))?;
 
         // Get current token balance in raw units for Jupiter
         let raw_token_amount = match self.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
