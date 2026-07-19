@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
+    "build": "pnpm --filter @pablo/shared-types build && tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "lint": "eslint . --config ../../eslint.config.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
