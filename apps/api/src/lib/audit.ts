@@ -6,9 +6,14 @@ import { prisma } from "./prisma.js";
  * grants/revokes, PlatformConfig edits) lands here — this is what backs
  * GET /admin/logs. Best-effort: a logging failure must never block the
  * action it's describing, so this only ever warns to stderr, never throws.
+ *
+ * `actorType: "USER"` covers a sensitive action a user takes on their own
+ * account outside the admin console (e.g. exporting their custodial
+ * trading wallet's private key) — same durable trail, not shown in
+ * GET /admin/logs' own filters yet but queryable the same way.
  */
 export async function logAudit(entry: {
-  actorType: "ADMIN" | "SYSTEM";
+  actorType: "USER" | "ADMIN" | "SYSTEM";
   actorUserId?: string | null;
   action: string;
   meta?: Record<string, unknown>;

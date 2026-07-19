@@ -4,12 +4,22 @@ import { Loader2, RefreshCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { DepositPanel } from "@/components/wallet/deposit-panel";
 import { WithdrawForm } from "@/components/wallet/withdraw-form";
+import { ExportKeyPanel } from "@/components/wallet/export-key-panel";
 import { useAuth } from "@/components/providers/auth-provider";
 import { useWallet } from "@/lib/use-wallet";
 
 export default function WalletPage() {
   const { accessToken } = useAuth();
-  const { wallet, withdrawalQuote, loading, error, withdraw, withdrawing } = useWallet(accessToken);
+  const {
+    wallet,
+    withdrawalQuote,
+    loading,
+    error,
+    withdraw,
+    withdrawing,
+    exportPrivateKey,
+    exportingKey,
+  } = useWallet(accessToken);
 
   return (
     <div className="mx-auto max-w-4xl space-y-6">
@@ -69,6 +79,8 @@ export default function WalletPage() {
             <DepositPanel wallet={wallet} />
             <WithdrawForm quote={withdrawalQuote} withdrawing={withdrawing} onWithdraw={withdraw} />
           </div>
+
+          <ExportKeyPanel onExport={exportPrivateKey} exporting={exportingKey} />
         </>
       )}
     </div>

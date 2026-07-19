@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import type { WalletDto, WithdrawalQuoteDto } from "@pablo/shared-types";
+import type { WalletDto, WalletExportDto, WithdrawalQuoteDto } from "@pablo/shared-types";
 import { apiFetch, ApiError } from "./api";
 
 interface UseWalletResult {
@@ -13,6 +13,8 @@ interface UseWalletResult {
   withdraw: (toAddress: string, amountSol: number) => Promise<string>;
   withdrawing: boolean;
   withdrawError: string | null;
+  exportPrivateKey: () => Promise<WalletExportDto>;
+  exportingKey: boolean;
 }
 
 export function useWallet(accessToken: string | null): UseWalletResult {
@@ -22,6 +24,7 @@ export function useWallet(accessToken: string | null): UseWalletResult {
   const [error, setError] = useState<string | null>(null);
   const [withdrawing, setWithdrawing] = useState(false);
   const [withdrawError, setWithdrawError] = useState<string | null>(null);
+  const [exportingKey, setExportingKey] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!accessToken) return;
@@ -69,6 +72,23 @@ export function useWallet(accessToken: string | null): UseWalletResult {
     [accessToken, refresh],
   );
 
+  // No `refresh()` afterward and no local state caches the result — the
+  // decrypted secret only ever lives in the caller's own (short-lived,
+  // explicitly-cleared) state, never here, so it can't leak into a
+  // re-render triggered by something unrelated.
+  const exportPrivateKey = useCallback(async () => {
+    if (!accessToken) throw new Error("Not authenticated.");
+    setExportingKey(true);
+    try {
+      return await apiFetch<WalletExportDto>("/wallet/export-key", {
+        method: "POST",
+        accessToken,
+      });
+    } finally {
+      setExportingKey(false);
+    }
+  }, [accessToken]);
+
   return {
     wallet,
     withdrawalQuote,
@@ -78,5 +98,7 @@ export function useWallet(accessToken: string | null): UseWalletResult {
     withdraw,
     withdrawing,
     withdrawError,
+    exportPrivateKey,
+    exportingKey,
   };
 }

@@ -308,6 +308,16 @@ export const withdrawalQuoteDto = z.object({
 });
 export type WithdrawalQuoteDto = z.infer<typeof withdrawalQuoteDto>;
 
+// Base58 secret key of the custodial trading wallet, decrypted on demand —
+// see apps/api's wallet.service.ts exportTradingWalletPrivateKey. Never
+// cached or logged; the frontend must clear this from state once the user
+// navigates away or hides it.
+export const walletExportDto = z.object({
+  publicKey: z.string(),
+  secretKeyB58: z.string(),
+});
+export type WalletExportDto = z.infer<typeof walletExportDto>;
+
 // ── Admin console (Phase 6) ────────────────────────────────────────────
 
 export const adminSubscriptionSummaryDto = z.object({

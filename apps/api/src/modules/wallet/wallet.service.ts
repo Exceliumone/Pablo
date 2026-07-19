@@ -5,6 +5,7 @@ import { prisma } from "../../lib/prisma.js";
 import { encryptSecret, decryptSecret } from "../../lib/wallet-crypto.js";
 import { connection, getTokenBalanceRaw, rawToHumanString } from "../../lib/solana.js";
 import { getPlatformConfig } from "../admin/platform-config.service.js";
+import { logAudit } from "../../lib/audit.js";
 
 export class WalletError extends Error {
   constructor(
@@ -54,6 +55,36 @@ export async function decryptTradingWalletSecret(userId: string): Promise<string
     throw new Error("No trading wallet provisioned for this user yet.");
   }
   return decryptSecret(wallet.encryptedPrivateKey);
+}
+
+/**
+ * Lets a user recover their own custodial trading wallet's private key —
+ * e.g. to move funds out independently if the bot or this platform is
+ * ever unavailable. Returns the same base58 secret `decryptTradingWalletSecret`
+ * already decrypts for internal use (building the executor's config); this
+ * is simply the first caller that returns it in an HTTP response instead
+ * of consuming it server-side only, so every export is logged via
+ * `logAudit` for a durable, queryable trail of when this ever happened —
+ * this can't be undone or revoked (the wallet would need to be rotated,
+ * not built here yet), so the record matters even though the export
+ * itself can't be blocked after the fact.
+ */
+export async function exportTradingWalletPrivateKey(
+  userId: string,
+): Promise<{ publicKey: string; secretKeyB58: string }> {
+  const wallet = await prisma.tradingWallet.findUnique({ where: { userId } });
+  if (!wallet) {
+    throw new WalletError("No trading wallet provisioned for this user yet.", 404);
+  }
+  const secretKeyB58 = await decryptTradingWalletSecret(userId);
+
+  await logAudit({
+    actorType: "USER",
+    actorUserId: userId,
+    action: "wallet.export_private_key",
+  });
+
+  return { publicKey: wallet.publicKey, secretKeyB58 };
 }
 
 /**

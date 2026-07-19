@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { withdrawRequestDto } from "@pablo/shared-types";
 import {
   WalletError,
+  exportTradingWalletPrivateKey,
   getWalletView,
   getWithdrawalQuote,
   withdrawFromTradingWallet,
@@ -37,5 +38,15 @@ export default async function walletRoutes(fastify: FastifyInstance) {
       );
       return { txSignature };
     },
+  );
+
+  // Tighter than /withdraw's 5/min — a withdrawal is a bounded, one-time,
+  // auditable on-chain transfer; exporting the raw key hands over
+  // permanent, unbounded control of the wallet with no way to revoke it
+  // after the fact.
+  fastify.post(
+    "/export-key",
+    { config: { rateLimit: { max: 3, timeWindow: "1 minute" } } },
+    async (request) => exportTradingWalletPrivateKey(request.user.sub),
   );
 }
