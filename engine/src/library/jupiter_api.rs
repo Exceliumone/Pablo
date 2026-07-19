@@ -14,8 +14,8 @@ use tokio::time::Duration;
 
 use crate::common::logger::Logger;
 
-const JUPITER_API_URL: &str = "https://lite-api.jup.ag/swap/v1";
-const JUPITER_SWAP_API_URL: &str = "https://lite-api.jup.ag/swap/v1";
+const JUPITER_FREE_API_URL: &str = "https://lite-api.jup.ag/swap/v1";
+const JUPITER_PAID_API_URL: &str = "https://api.jup.ag/swap/v1";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(Debug, Serialize)]
@@ -127,6 +127,12 @@ pub struct JupiterClient {
     client: Client,
     rpc_client: Arc<RpcClient>,
     logger: Logger,
+    // Optional paid-tier API key, read once at construction from the
+    // JUPITER_API_KEY env var (same env-var-injection pattern the executor
+    // already uses for RPC_HTTP/ZERO_SLOT_URL — see executor.rs's doc
+    // comment). None (the var unset/empty) keeps every existing call site
+    // unchanged: still the free lite-api.jup.ag tier, no header sent.
+    api_key: Option<String>,
 }
 
 impl JupiterClient {
@@ -135,11 +141,24 @@ impl JupiterClient {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
-            
+
+        let api_key = std::env::var("JUPITER_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
+
         Self {
             client,
             rpc_client,
             logger: Logger::new("[JUPITER] => ".magenta().to_string()),
+            api_key,
+        }
+    }
+
+    fn base_url(&self) -> &'static str {
+        if self.api_key.is_some() {
+            JUPITER_PAID_API_URL
+        } else {
+            JUPITER_FREE_API_URL
         }
     }
 
@@ -161,17 +180,19 @@ impl JupiterClient {
             slippage_bps,
         };
 
-        let url = format!("{}/quote", JUPITER_API_URL);
-        let response = self.client
+        let url = format!("{}/quote", self.base_url());
+        let mut request = self.client
             .get(&url)
             .query(&[
                 ("inputMint", &quote_request.input_mint),
                 ("outputMint", &quote_request.output_mint),
                 ("amount", &quote_request.amount),
                 ("slippageBps", &quote_request.slippage_bps.to_string()),
-            ])
-            .send()
-            .await?;
+            ]);
+        if let Some(api_key) = &self.api_key {
+            request = request.header("x-api-key", api_key);
+        }
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
@@ -212,17 +233,19 @@ impl JupiterClient {
             },
         };
 
-        let url = format!("{}/swap", JUPITER_SWAP_API_URL);
-        
+        let url = format!("{}/swap", self.base_url());
+
         // Log the request for debugging
         self.logger.log(format!("Sending swap request to: {}", url));
         self.logger.log(format!("Request payload: {}", serde_json::to_string_pretty(&swap_request).unwrap_or_else(|_| "Failed to serialize".to_string())));
-        
-        let response = self.client
+
+        let mut request = self.client
             .post(&url)
-            .json(&swap_request)
-            .send()
-            .await?;
+            .json(&swap_request);
+        if let Some(api_key) = &self.api_key {
+            request = request.header("x-api-key", api_key);
+        }
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -292,6 +315,58 @@ impl JupiterClient {
         let signature = self.rpc_client.send_transaction(&transaction).await?;
 
         self.logger.log(format!("Jupiter sell transaction sent: {}", signature).green().to_string());
+
+        Ok(signature.to_string())
+    }
+
+    /// Execute a token buy using Jupiter (complete flow) — the buy-side
+    /// mirror of `sell_token_with_jupiter` above (SOL -> mint instead of
+    /// mint -> SOL). Routes through whatever DEX/pool Jupiter's own
+    /// aggregation finds the best price on, so unlike the engine's
+    /// PumpFun/PumpSwap/Raydium-Launchpad-specific instruction builders in
+    /// `sniper_bot.rs`, this works for a mint on ANY DEX Jupiter indexes
+    /// (Meteora, Orca, Raydium AMM, PumpFun, ...) — it never needs to know
+    /// which one a copy-trading target actually used.
+    pub async fn buy_token_with_jupiter(
+        &self,
+        output_mint: &str,
+        sol_amount_lamports: u64,
+        slippage_bps: u64,
+        keypair: &Keypair,
+    ) -> Result<String> {
+        self.logger.log(format!(
+            "Starting Jupiter buy for token {} (sol_amount_lamports: {}, slippage: {}bps)",
+            output_mint, sol_amount_lamports, slippage_bps
+        ));
+
+        let quote = self
+            .get_quote(SOL_MINT, output_mint, sol_amount_lamports, slippage_bps)
+            .await?;
+
+        self.logger.log("Quote received, getting swap transaction...".to_string());
+
+        let mut transaction = self.get_swap_transaction(quote, &keypair.pubkey()).await?;
+
+        let recent_blockhash = self.rpc_client.get_latest_blockhash().await?;
+        transaction.message.set_recent_blockhash(recent_blockhash);
+
+        use anchor_client::solana_sdk::signer::Signer;
+        let message_data = transaction.message.serialize();
+        let signature = keypair.sign_message(&message_data);
+
+        let account_keys = transaction.message.static_account_keys();
+        if let Some(signer_index) = account_keys.iter().position(|key| *key == keypair.pubkey()) {
+            if transaction.signatures.len() <= signer_index {
+                transaction.signatures.resize(signer_index + 1, anchor_client::solana_sdk::signature::Signature::default());
+            }
+            transaction.signatures[signer_index] = signature;
+        } else {
+            return Err(anyhow!("Keypair not found in transaction account keys"));
+        }
+
+        let signature = self.rpc_client.send_transaction(&transaction).await?;
+
+        self.logger.log(format!("Jupiter buy transaction sent: {}", signature).green().to_string());
 
         Ok(signature.to_string())
     }

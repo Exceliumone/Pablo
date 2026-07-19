@@ -4,14 +4,30 @@
 //! subscription — it tails the shared scanner's Redis stream and makes its
 //! own buy/sell decisions using that one user's wallet and settings.
 //!
-//! Every trading call here (`execute_buy`, `SellingEngine::new`,
-//! `update_metrics`, `evaluate_sell_conditions`, `unified_emergency_sell`)
-//! is an unmodified public function/method from the engine crate, used
-//! exactly as the engine's own top-level monitoring loop uses them. This
-//! process being its own OS process is what makes that safe: the engine's
-//! position-tracking globals (TOKEN_METRICS, BOUGHT_TOKEN_LIST, ...) are
-//! keyed by mint only, with no user dimension, so they'd corrupt across
-//! users inside a shared process — see docs/ARCHITECTURE.md.
+//! Every trading call here (`JupiterClient::buy_token_with_jupiter`,
+//! `SellingEngine::new`, `update_metrics`, `evaluate_sell_conditions`,
+//! `unified_emergency_sell`) is an unmodified (or, for the Jupiter buy
+//! client, narrowly and additively extended) public function/method from
+//! the engine crate, used exactly as the engine's own top-level monitoring
+//! loop uses them. This process being its own OS process is what makes
+//! that safe: the engine's position-tracking globals (TOKEN_METRICS, ...)
+//! are keyed by mint only, with no user dimension, so they'd corrupt
+//! across users inside a shared process — see docs/ARCHITECTURE.md.
+//!
+//! Buys go through Jupiter's aggregator (quote + swap, see
+//! `engine::library::jupiter_api::JupiterClient::buy_token_with_jupiter`)
+//! rather than the engine's own PumpFun/PumpSwap/Raydium-Launchpad-specific
+//! instruction builders (`sniper_bot::execute_buy`) — by explicit product
+//! decision, so that a copy-trading target's buy is always copyable no
+//! matter which DEX/router/aggregator they actually used (Jupiter routes
+//! to whichever pool it finds, on any DEX it indexes), not just the three
+//! this codebase has hand-written instruction builders for. This trades
+//! away `execute_buy`'s direct-instruction speed advantage on the DEXs it
+//! *does* support, in exchange for universal coverage. Selling is
+//! unaffected by this — `unified_emergency_sell` already has its own
+//! Jupiter fallback for when a direct DEX-specific sell fails (see
+//! `selling_strategy.rs`'s `try_jupiter_fallback_sell`), and which pool a
+//! position was originally bought through doesn't change how it's sold.
 //!
 //! **Copy-trading only** — by explicit product decision, there is no
 //! "generic sniper" fallback (buy any new token from any trader) anymore.
@@ -54,6 +70,7 @@ use solana_vntr_sniper::common::config::{
     SwapConfig,
 };
 use solana_vntr_sniper::library::blockhash_processor::BlockhashProcessor;
+use solana_vntr_sniper::library::jupiter_api::JupiterClient;
 use solana_vntr_sniper::processor::selling_strategy::{SellingConfig, SellingEngine};
 use solana_vntr_sniper::processor::swap::{SwapDirection, SwapInType, SwapProtocol};
 use solana_vntr_sniper::processor::transaction_parser::{DexType, TradeInfoFromToken};
@@ -172,7 +189,8 @@ async fn main() -> anyhow::Result<()> {
         let wallet = Arc::new(Keypair::from_base58_string(&payload.wallet_secret_key_b58));
         let rpc_client = create_rpc_client()?;
         let rpc_nonblocking_client = create_nonblocking_rpc_client().await?;
-        let zeroslot_rpc_client = create_zeroslot_rpc_client(rpc_nonblocking_client.clone()).await?;
+        let zeroslot_rpc_client =
+            create_zeroslot_rpc_client(rpc_nonblocking_client.clone()).await?;
 
         let protocol_preference = match payload.settings.protocol_preference.as_str() {
             "pumpfun" => SwapProtocol::PumpFun,
@@ -506,56 +524,31 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await;
 
-                // The scanner's generic balance-diff fallback (see
-                // scanner.rs's detect_trade_by_balance_diff) can detect a
-                // buy on literally any DEX/router/aggregator — including
-                // ones (Meteora DLMM, whatever a Bitget/Photon/BullX-style
-                // wallet's own aggregator routes through next, ...) this
-                // codebase has no swap-instruction builder for at all. It
-                // tags these DexType::Unknown. Before this check, an
-                // Unknown dex_type fell through to SwapProtocol::Auto,
-                // which execute_buy's Auto/Unknown branch silently
-                // defaults to PumpFun — attempting a PumpFun-specific buy
-                // (bonding-curve PDA derived from the mint) against a
-                // token that most likely has no PumpFun bonding curve at
-                // all. The Opportunity event above already gives the user
-                // visibility that this trade was detected; there's just
-                // nothing this executor can do to copy it yet.
-                if tick.dex_type == "Unknown" {
-                    tracing::info!(
-                        %user_id,
-                        mint = %tick.mint,
-                        source_signature = %tick.signature,
-                        trader = ?tick.trader,
-                        "executor: detected a buy via the generic balance-diff fallback, but \
-                         its DEX/router couldn't be identified — no swap-instruction builder \
-                         exists for it, so this trade is visible but not copyable; skipping"
-                    );
-                    continue;
-                }
-
-                let protocol = protocol_from_dex(&trade_info.dex_type);
                 tracing::info!(
                     %user_id,
                     mint = %tick.mint,
                     dex = %tick.dex_type,
-                    protocol = ?protocol,
                     price_sol = tick.price as f64 / 1_000_000_000.0,
                     source_signature = %tick.signature,
                     trader = ?tick.trader,
                     amount_sol = swap_config.amount_in,
                     slippage_bps = swap_config.slippage,
-                    "executor: STEP 1: Event received — dispatching buy attempt to engine::execute_buy"
+                    "executor: STEP 1: Event received — dispatching buy attempt via Jupiter"
                 );
-                match solana_vntr_sniper::processor::sniper_bot::execute_buy(
-                    trade_info.clone(),
-                    app_state.clone(),
-                    swap_config.clone(),
-                    protocol.clone(),
-                )
-                .await
+
+                let jupiter_client = JupiterClient::new(app_state.rpc_nonblocking_client.clone());
+                let sol_amount_lamports = (swap_config.amount_in * 1_000_000_000.0).round() as u64;
+
+                match jupiter_client
+                    .buy_token_with_jupiter(
+                        &tick.mint,
+                        sol_amount_lamports,
+                        swap_config.slippage,
+                        &app_state.wallet,
+                    )
+                    .await
                 {
-                    Ok(()) => {
+                    Ok(signature) => {
                         let price_sol = tick.price as f64 / 1_000_000_000.0;
                         let amount_token = if price_sol > 0.0 {
                             swap_config.amount_in / price_sol
@@ -574,7 +567,7 @@ async fn main() -> anyhow::Result<()> {
                                 price_sol,
                                 amount_sol: swap_config.amount_in,
                                 amount_token,
-                                tx_signature: None,
+                                tx_signature: Some(signature),
                                 reason: Some("auto_snipe".into()),
                                 at: now_iso(),
                             },
@@ -589,60 +582,33 @@ async fn main() -> anyhow::Result<()> {
                         // is invisible under the `RUST_LOG=info` this binary
                         // is always spawned with (see engine-bridge's
                         // main.rs `spawn_executor`). That made a persistent
-                        // buy failure (e.g. the blockhash cache never being
-                        // populated — since fixed) indistinguishable from
-                        // "nothing to buy": the Sniper page kept showing
-                        // "Nouveau token détecté" (BotEvent::Opportunity,
-                        // published unconditionally just above, before this
-                        // attempt) with no trade and no explanation ever
-                        // following it.
-                        // engine::execute_buy's own STEP 2-9 logs (relayed
-                        // via this process's stdout, see main.rs's
-                        // spawn_executor) carry the step-by-step detail;
-                        // this is the final outcome plus the context needed
-                        // to reproduce it (wallet, RPC, amount) without
-                        // having to go dig those logs up.
+                        // buy failure indistinguishable from "nothing to
+                        // buy": the Sniper page kept showing "Nouveau token
+                        // détecté" (BotEvent::Opportunity, published
+                        // unconditionally just above, before this attempt)
+                        // with no trade and no explanation ever following
+                        // it.
                         let wallet_pubkey = app_state
                             .wallet
                             .try_pubkey()
                             .map(|pk| pk.to_string())
                             .unwrap_or_else(|_| "<unavailable>".to_string());
-                        // `e` is engine::execute_buy's flattened Result<(),
-                        // String> error — since sniper_bot.rs now builds it
-                        // via block_engine::tx::format_error_chain, it's no
-                        // longer a single generic line ("Transaction
-                        // simulation failed") but the full Error::source()
-                        // cascade, plus — for a Solana RPC preflight
-                        // rejection — the on-chain program logs and
-                        // structured simulation error one level below the
-                        // client's own summary (e.g. the exact "Program
-                        // log: Error: IncorrectProgramId" line). Logging it
-                        // in full (not truncated) is what actually makes
-                        // this diagnosable from PM2 output alone.
                         tracing::warn!(
                             error = %e,
-                            error_line_count = e.lines().count(),
                             mint = %tick.mint,
-                            protocol = ?protocol,
                             wallet = %wallet_pubkey,
                             rpc_http = %payload.rpc_http,
                             amount_sol = swap_config.amount_in,
                             slippage_bps = swap_config.slippage,
-                            "executor: buy failed"
+                            "executor: Jupiter buy failed"
                         );
                         publish_event(
                             &mut event_conn,
                             &BotEvent::Error {
                                 user_id: user_id.clone(),
-                                // First line is a human-readable summary;
-                                // everything from the second line on is
-                                // `e`'s full detail — apps/web renders line
-                                // one always, with the rest behind a
-                                // click-to-expand toggle (see
-                                // components/bot/bot-event-feed.tsx).
                                 message: format!(
-                                    "Buy failed for {} (protocol={:?}, wallet={}, amount_sol={})\n{}",
-                                    tick.mint, protocol, wallet_pubkey, swap_config.amount_in, e
+                                    "Buy failed for {} via Jupiter (wallet={}, amount_sol={})\n{}",
+                                    tick.mint, wallet_pubkey, swap_config.amount_in, e
                                 ),
                                 at: now_iso(),
                             },
