@@ -82,10 +82,19 @@ pub struct SwapInfo {
     pub in_amount: String,
     #[serde(rename = "outAmount")]
     pub out_amount: String,
-    #[serde(rename = "feeAmount")]
-    pub fee_amount: String,
-    #[serde(rename = "feeMint")]
-    pub fee_mint: String,
+    // Jupiter omits feeAmount/feeMint on some route legs (observed live:
+    // a PumpSwap leg in a multi-hop route with no fee) — Option (rather
+    // than String) is what makes serde treat a missing key as None
+    // instead of a hard deserialization error ("missing field
+    // `feeAmount`"), which previously made get_quote fail outright on
+    // any route containing such a leg, i.e. most real quotes. skip_
+    // serializing_if keeps the swap request we send back to Jupiter a
+    // faithful round-trip of what we received, rather than injecting a
+    // `null` Jupiter's swap endpoint never asked for.
+    #[serde(rename = "feeAmount", default, skip_serializing_if = "Option::is_none")]
+    pub fee_amount: Option<String>,
+    #[serde(rename = "feeMint", default, skip_serializing_if = "Option::is_none")]
+    pub fee_mint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
