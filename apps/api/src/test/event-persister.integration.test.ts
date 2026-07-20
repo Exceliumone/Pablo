@@ -4,20 +4,23 @@ import type { FastifyInstance } from "fastify";
 import type { BotEventDto } from "@pablo/shared-types";
 import { prisma } from "../lib/prisma.js";
 import { env } from "../config/env.js";
-import { startEventPersister } from "../jobs/event-persister.js";
+import { startEventPersister, DURABLE_STREAM } from "../jobs/event-persister.js";
 import { buildTestApp, seedUser, createIdentity } from "./helpers.js";
 
 /**
- * Regression test for the Phase 4 race: ioredis's "pmessage" handler
- * doesn't wait for a prior handler's promise before firing the next one,
- * so a BUY immediately followed by a SELL on the same mint could have the
- * SELL's "find the open position" query race the BUY's still-in-flight
- * insert and find nothing to close — event-persister.ts now serializes
- * processing by chaining onto one promise (see the `queue` comment there).
- * This test publishes BUY then SELL back-to-back over real Redis pub/sub
- * against the real persister and asserts the position actually closes —
- * before the fix this was flaky-to-reliably-failing under exactly this
- * sequence.
+ * Regression test for the Phase 4 race: back when this consumed a plain
+ * Redis pub/sub channel, ioredis's "pmessage" handler didn't wait for a
+ * prior handler's promise before firing the next one, so a BUY immediately
+ * followed by a SELL on the same mint could have the SELL's "find the open
+ * position" query race the BUY's still-in-flight insert and find nothing to
+ * close. event-persister.ts now reads a durable Redis Stream via a
+ * consumer group instead (see that file's module doc comment for why:
+ * pub/sub silently drops events with no subscriber connected, which turned
+ * out to be a much bigger problem than this race) and processes one
+ * XREADGROUP batch's entries fully in order before fetching the next,
+ * which serializes this the same way the old `queue` promise-chain did.
+ * This test XADDs BUY then SELL back-to-back onto the real durable stream
+ * against the real persister and asserts the position actually closes.
  */
 describe("event-persister: BUY immediately followed by SELL never races", () => {
   let app: FastifyInstance;
@@ -34,9 +37,10 @@ describe("event-persister: BUY immediately followed by SELL never races", () => 
     // logger — event-persister.ts only needs the FastifyBaseLogger shape.
     app = await buildTestApp();
     stopPersister = startEventPersister(app.log);
-    // Give the persister's psubscribe a moment to actually attach before
-    // we publish — pub/sub delivery only reaches subscribers connected at
-    // publish time.
+    // Give the persister's consumer group a moment to be created before we
+    // XADD — not strictly required for a stream (unlike pub/sub, nothing
+    // published before a consumer exists is lost), but avoids the very
+    // first XADD racing the XGROUP CREATE call in tests.
     await new Promise((resolve) => setTimeout(resolve, 150));
   });
 
@@ -48,7 +52,6 @@ describe("event-persister: BUY immediately followed by SELL never races", () => 
 
   it("closes the position instead of silently no-op'ing on a not-yet-committed BUY", async () => {
     const mint = "raceMint111111111111111111111111111111";
-    const channel = `executor:events:${userId}`;
 
     const buy: Extract<BotEventDto, { type: "trade" }> = {
       type: "trade",
@@ -74,8 +77,8 @@ describe("event-persister: BUY immediately followed by SELL never races", () => 
 
     // Back-to-back, no await between them — exactly the sequence that
     // exposed the race (a fast v1 heuristic can react within milliseconds).
-    await publisher.publish(channel, JSON.stringify(buy));
-    await publisher.publish(channel, JSON.stringify(sell));
+    await publisher.xadd(DURABLE_STREAM, "*", "data", JSON.stringify(buy));
+    await publisher.xadd(DURABLE_STREAM, "*", "data", JSON.stringify(sell));
 
     // Processing is async on the persister side — poll briefly instead of
     // a single fixed sleep, since exact timing isn't guaranteed.

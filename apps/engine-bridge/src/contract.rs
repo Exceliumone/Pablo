@@ -16,6 +16,18 @@ pub fn executor_events_channel(user_id: &str) -> String {
     format!("executor:events:{user_id}")
 }
 
+/// Durable counterpart to `executor_events_channel`. Every executor XADDs
+/// the same event here in addition to PUBLISHing it on the pub/sub channel
+/// above — pub/sub has no history and silently drops a message when no
+/// subscriber is connected at the moment it's published (e.g. apps/api
+/// mid-restart/mid-deploy). apps/api's event-persister reads this stream
+/// with a consumer group instead of psubscribe specifically so a trade/PnL
+/// record can never be silently lost that way; ws/gateway.ts keeps using
+/// the pub/sub channel unchanged since a dropped *live* UI update is
+/// harmless (the next refresh/poll catches up) where a dropped financial
+/// record is not.
+pub const EXECUTOR_EVENTS_STREAM: &str = "executor:events:durable";
+
 /// Per-user command stream, orchestrator -> a specific running executor
 /// (the reverse direction of everything else here — every other
 /// stream/channel in this file is executor -> orchestrator/apps/api). Used
@@ -103,6 +115,25 @@ pub struct ExecutorStartPayload {
     pub redis_url: String,
 
     pub settings: BotSettingsPayload,
+
+    /// Positions already OPEN in the DB for this user at spawn time (apps/api
+    /// fills this from `Position` rows). Without it, a freshly (re)started
+    /// executor's `held_positions`/engine `TOKEN_METRICS` start empty, so a
+    /// position bought by a *previous* process instance (e.g. before a
+    /// crash+auto-restart) is never picked back up for take-profit/
+    /// stop-loss/trailing monitoring again — it just sits there silently
+    /// until someone manually closes it. Seeding these back in on startup
+    /// is what lets automatic selling resume for them.
+    #[serde(default)]
+    pub open_positions: Vec<OpenPositionSeed>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenPositionSeed {
+    pub mint: String,
+    pub amount_token: f64,
+    pub entry_price_sol: f64,
+    pub cost_basis_sol: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

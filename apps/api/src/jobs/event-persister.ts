@@ -19,36 +19,125 @@ function dexToProtocol(dex: string): string {
   }
 }
 
+// Exported so tests can XADD onto the same stream the real engine-bridge
+// process writes to (see engine-bridge's events.rs/contract.rs
+// EXECUTOR_EVENTS_STREAM — kept in sync by hand, same as the rest of the
+// cross-language contract).
+export const DURABLE_STREAM = "executor:events:durable";
+const CONSUMER_GROUP = "event-persister";
+// One process runs this loop (started once at boot in index.ts, no
+// multi-instance deployment in this repo's infra — see
+// infra/docker-compose.yml), so a fixed consumer name is fine; ioredis'
+// XREADGROUP would need a distinct name per consumer if that ever changed.
+const CONSUMER_NAME = "event-persister-1";
+
 /**
- * The one process-wide Redis subscriber (unlike ws/gateway.ts, which opens
- * one per browser connection) that turns `trade`/`error` executor events
- * into durable rows — Trade + Position for trades, Notification for both.
- * `opportunity`/`status` events are relayed live over the WebSocket but
- * intentionally not persisted here: they're high-frequency and disposable,
- * not history. Started once at boot in index.ts.
+ * Turns `trade`/`error` executor events into durable rows — Trade +
+ * Position for trades, Notification for both. `opportunity`/`status`
+ * events are relayed live over the WebSocket (ws/gateway.ts, still plain
+ * pub/sub — a dropped *live* UI update is harmless) but intentionally not
+ * persisted here: they're high-frequency and disposable, not history.
+ *
+ * Reads `EXECUTOR_EVENTS_STREAM`/`executor:events:durable` (a Redis Stream
+ * every executor XADDs onto in addition to publishing on the per-user
+ * pub/sub channel — see engine-bridge's events.rs) via a consumer group,
+ * NOT the old `executor:events:*` pub/sub pattern. Pub/sub has no history:
+ * a message published while this process is restarting/deploying (no
+ * subscriber connected at that exact moment) was silently dropped forever
+ * — for a `trade` event that meant a position either never got its closing
+ * PnL recorded (stuck OPEN despite being sold) or, worse, a later
+ * "closed_empty" cleanup would force-book a full loss on a position that
+ * had actually already sold at a profit, since nothing remembered the
+ * real sale ever happened. A Stream + consumer group means every event is
+ * durably stored until this process explicitly XACKs it, and pending
+ * (received-but-never-acked) entries from a crash are reclaimed on the
+ * next startup instead of lost. Started once at boot in index.ts.
  */
 export function startEventPersister(logger: FastifyBaseLogger) {
-  const subscriber = new Redis(env.REDIS_URL);
+  const redis = new Redis(env.REDIS_URL);
+  let stopped = false;
 
-  subscriber.psubscribe("executor:events:*").catch((err: unknown) => {
-    logger.error({ err }, "event-persister: failed to psubscribe");
-  });
+  // Redis preserves stream order, and this loop processes one XREADGROUP
+  // batch fully (await-ing each entry in sequence, see below) before
+  // fetching the next — unlike the old pmessage handler, there's no
+  // separate queue needed to keep a BUY-then-SELL on the same mint from
+  // racing each other.
+  async function run() {
+    try {
+      await redis.xgroup("CREATE", DURABLE_STREAM, CONSUMER_GROUP, "0", "MKSTREAM");
+    } catch (err) {
+      // BUSYGROUP = group already exists from a previous boot — expected
+      // on every restart, not an error.
+      if (!(err instanceof Error) || !err.message.includes("BUSYGROUP")) {
+        logger.error({ err }, "event-persister: failed to create consumer group");
+      }
+    }
 
-  // Redis preserves publish order within a single subscriber connection,
-  // but the ioredis "pmessage" handler doesn't wait for a prior handler's
-  // promise before firing the next one — a BUY immediately followed by a
-  // SELL on the same mint (the common case: the v1 heuristic can react
-  // within milliseconds) could otherwise have the SELL's "find the open
-  // position" query race the BUY's still-in-flight insert and find
-  // nothing to close. Chaining onto one promise serializes processing
-  // back to the order Redis delivered it in.
-  let queue: Promise<void> = Promise.resolve();
-  subscriber.on("pmessage", (_pattern: string, _channel: string, message: string) => {
-    queue = queue.then(() => handleMessage(message, logger));
+    // Reclaim this consumer's own pending (delivered-but-never-acked)
+    // entries from a previous crashed run before joining the live tail —
+    // '0' means "from the start of my pending list", not "from the start
+    // of the stream".
+    await drainBacklog("0", logger);
+
+    while (!stopped) {
+      await drainBacklog(">", logger);
+    }
+  }
+
+  async function drainBacklog(cursor: "0" | ">", logger: FastifyBaseLogger) {
+    let reply;
+    try {
+      // ioredis' xreadgroup overloads don't include a COUNT variant — fine
+      // here, this stream is low-volume (trade/error events only) so an
+      // unbounded read per call is not a concern. Only the live-tail read
+      // (cursor ">") blocks; a pending-backlog read (cursor "0") should
+      // return immediately with whatever's already there.
+      reply =
+        cursor === ">"
+          ? await redis.xreadgroup(
+              "GROUP",
+              CONSUMER_GROUP,
+              CONSUMER_NAME,
+              "BLOCK",
+              5000,
+              "STREAMS",
+              DURABLE_STREAM,
+              cursor,
+            )
+          : await redis.xreadgroup(
+              "GROUP",
+              CONSUMER_GROUP,
+              CONSUMER_NAME,
+              "STREAMS",
+              DURABLE_STREAM,
+              cursor,
+            );
+    } catch (err) {
+      logger.error({ err }, "event-persister: xreadgroup failed, retrying");
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      return;
+    }
+    if (!reply) return;
+
+    for (const [, entries] of reply as [string, [string, string[]][]][]) {
+      for (const [entryId, fields] of entries) {
+        const dataIndex = fields.indexOf("data");
+        const message = dataIndex >= 0 ? fields[dataIndex + 1] : undefined;
+        if (message !== undefined) {
+          await handleMessage(message, logger);
+        }
+        await redis.xack(DURABLE_STREAM, CONSUMER_GROUP, entryId);
+      }
+    }
+  }
+
+  run().catch((err: unknown) => {
+    logger.error({ err }, "event-persister: consumer loop crashed");
   });
 
   return () => {
-    subscriber.disconnect();
+    stopped = true;
+    redis.disconnect();
   };
 }
 

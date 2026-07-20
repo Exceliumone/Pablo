@@ -9,6 +9,13 @@ import { env } from "../config/env.js";
  * "engine as an interchangeable plugin" boundary from docs/ARCHITECTURE.md.
  */
 
+export interface OpenPositionSeed {
+  mint: string;
+  amount_token: number;
+  entry_price_sol: number;
+  cost_basis_sol: number;
+}
+
 export interface ExecutorStartPayload {
   user_id: string;
   wallet_secret_key_b58: string;
@@ -31,6 +38,11 @@ export interface ExecutorStartPayload {
     copy_trading_targets: string[];
     protocol_preference: string;
   };
+  // Positions already OPEN in the DB for this user — without this, a freshly
+  // (re)started executor has no idea these exist and never resumes take-
+  // profit/stop-loss/trailing monitoring for them (see bot.service.ts's
+  // buildExecutorPayload and contract.rs's OpenPositionSeed doc comment).
+  open_positions: OpenPositionSeed[];
 }
 
 class EngineBridgeError extends Error {

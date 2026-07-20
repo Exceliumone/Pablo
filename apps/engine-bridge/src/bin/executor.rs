@@ -81,7 +81,7 @@ use solana_vntr_sniper::common::config::{
 use solana_vntr_sniper::library::blockhash_processor::BlockhashProcessor;
 use solana_vntr_sniper::library::jupiter_api::JupiterClient;
 use solana_vntr_sniper::processor::selling_strategy::{
-    SellingConfig, SellingEngine, TOKEN_METRICS,
+    SellingConfig, SellingEngine, TokenMetrics, TOKEN_METRICS,
 };
 use solana_vntr_sniper::processor::swap::{SwapDirection, SwapInType, SwapProtocol};
 use solana_vntr_sniper::processor::transaction_parser::{DexType, TradeInfoFromToken};
@@ -157,6 +157,317 @@ fn tick_to_trade_info(tick: &ScannerTick) -> TradeInfoFromToken {
         liquidity: tick.liquidity,
         virtual_sol_reserves: tick.virtual_sol_reserves,
         virtual_token_reserves: tick.virtual_token_reserves,
+    }
+}
+
+/// True when a `unified_emergency_sell`/`execute_emergency_sell_internal`
+/// failure means "there is genuinely nothing left to sell" (the token
+/// account is fully closed — see `selling_strategy.rs`'s
+/// `execute_emergency_sell_internal`, `get_wallet_token_balance` returning
+/// `Ok(None)`) rather than a transient failure (RPC hiccup, stale
+/// blockhash, slippage exceeded, simulation failure, ...) worth retrying on
+/// the next tick. Matched by substring since the engine returns this as a
+/// plain `anyhow!` string, not a typed error variant.
+fn is_empty_balance_error(e: &anyhow::Error) -> bool {
+    e.to_string().contains("No token account found for mint")
+}
+
+/// Diffs the wallet's native SOL balance against `sol_before` (captured
+/// just before an automatic sell attempt) to report the amount ACTUALLY
+/// received — fees, priority fee, and real slippage all included — instead
+/// of the `amount_token * price_sol` estimate at the triggering tick's
+/// price (which reflects none of that). Mirrors `execute_manual_sell`'s
+/// balance-diff approach, applied here to the two automatic sell paths
+/// (copy-trade mirror, take-profit/stop-loss/trailing) so their reported
+/// PnL — and hence the fees an operator is implicitly paying, since it's
+/// the gap between this and the pre-fee estimate — stops being fictional.
+/// Returns `None` (caller falls back to the old estimate) if either
+/// balance read failed, since a missing real number beats a wrong one but
+/// is still better handled than crashing the sell over a stray RPC error.
+async fn real_sol_received(
+    app_state: &Arc<AppState>,
+    wallet_pubkey: Option<solana_sdk::pubkey::Pubkey>,
+    sol_before: Option<u64>,
+) -> Option<f64> {
+    let pk = wallet_pubkey?;
+    let before = sol_before?;
+    let after = app_state
+        .rpc_nonblocking_client
+        .get_balance(&pk)
+        .await
+        .ok()?;
+    Some(after.saturating_sub(before) as f64 / 1_000_000_000.0)
+}
+
+/// Shared `Err` handling for the two automatic sell paths below
+/// (copy-trade mirror, take-profit/stop-loss/trailing). A confirmed-empty
+/// balance (`is_empty_balance_error`) means there is genuinely nothing left
+/// to sell — clean up exactly like a manual close finding a zero balance
+/// (same `closed_empty` mechanism, see `execute_manual_sell`'s doc comment)
+/// so the position doesn't sit `OPEN` forever. Anything else is treated as
+/// transient and rate-limited via `sell_retry_cooldown` instead of retried
+/// on every subsequent tick — see that map's doc comment for why an
+/// unconditional retry loop was a real, observed bug (repeated "sell
+/// failed" spam every ~5-6s for the same already-gone position).
+#[allow(clippy::too_many_arguments)]
+async fn handle_auto_sell_failure(
+    event_conn: &mut redis::aio::MultiplexedConnection,
+    held_positions: &mut std::collections::HashMap<String, f64>,
+    sell_retry_cooldown: &mut std::collections::HashMap<String, Instant>,
+    user_id: &str,
+    mint: &str,
+    dex: &str,
+    context: &str,
+    e: anyhow::Error,
+) {
+    if is_empty_balance_error(&e) {
+        held_positions.remove(mint);
+        TOKEN_METRICS.remove(mint);
+        sell_retry_cooldown.remove(mint);
+        publish_event(
+            event_conn,
+            &BotEvent::Trade {
+                user_id: user_id.to_string(),
+                side: TradeSide::Sell,
+                mint: mint.to_string(),
+                dex: dex.to_string(),
+                price_sol: 0.0,
+                amount_sol: 0.0,
+                amount_token: 0.0,
+                tx_signature: None,
+                reason: Some("closed_empty".into()),
+                at: now_iso(),
+            },
+        )
+        .await;
+        publish_event(
+            event_conn,
+            &BotEvent::Error {
+                user_id: user_id.to_string(),
+                message: format!(
+                    "Aucune position à clôturer pour {mint} (solde nul) — position marquée comme clôturée"
+                ),
+                at: now_iso(),
+            },
+        )
+        .await;
+    } else {
+        sell_retry_cooldown.insert(mint.to_string(), Instant::now());
+        publish_event(
+            event_conn,
+            &BotEvent::Error {
+                user_id: user_id.to_string(),
+                message: format!("{context} failed for {mint}: {e}"),
+                at: now_iso(),
+            },
+        )
+        .await;
+    }
+}
+
+/// Well-known wrapped-SOL mint address (Jupiter's `SOL_MINT` in
+/// jupiter_api.rs is a private module constant with the same value —
+/// duplicated here rather than exposed, since it's a public, unchanging
+/// Solana constant, not something that benefits from a shared source of
+/// truth).
+const WRAPPED_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Shared by both the tick-driven automatic sell branches and
+/// `poll_held_positions` — see `sell_retry_cooldown`'s doc comment at its
+/// declaration in `main()` for why an unconditional per-tick retry is a
+/// real, observed bug.
+const SELL_RETRY_COOLDOWN: Duration = Duration::from_secs(20);
+
+/// Independent price/sell-condition refresh for currently held positions,
+/// run periodically from the main loop (see `POSITION_POLL_INTERVAL` at its
+/// call site) rather than only ever reacting to `scanner:ticks`.
+///
+/// Without this, take-profit/stop-loss/trailing-stop were checked *only*
+/// when a fresh tick for that exact mint arrived — and `scanner:ticks` only
+/// ever carries a *copied wallet's own* trades (see this file's module doc
+/// comment: no generic-sniper/program-wide subscription). So a position
+/// whose target wallet simply didn't retrade it never got a fresh price at
+/// all, no matter how far the token's real market price moved — TP/SL/
+/// trailing could never fire for it. This polls each held mint's real
+/// on-chain balance plus a live Jupiter sell quote directly, independent of
+/// anyone else's activity, and reuses the exact same
+/// evaluate_sell_conditions -> unified_emergency_sell path the tick-driven
+/// branches use.
+#[allow(clippy::too_many_arguments)]
+async fn poll_held_positions(
+    app_state: &Arc<AppState>,
+    selling_engine: &SellingEngine,
+    jupiter_client: &JupiterClient,
+    event_conn: &mut redis::aio::MultiplexedConnection,
+    held_positions: &mut std::collections::HashMap<String, f64>,
+    sell_retry_cooldown: &mut std::collections::HashMap<String, Instant>,
+    user_id: &str,
+) {
+    let Ok(wallet_pubkey) = app_state.wallet.try_pubkey() else {
+        return;
+    };
+    let mints: Vec<String> = held_positions.keys().cloned().collect();
+
+    for mint in mints {
+        if sell_retry_cooldown
+            .get(&mint)
+            .is_some_and(|last| last.elapsed() < SELL_RETRY_COOLDOWN)
+        {
+            continue;
+        }
+        let Ok(mint_pubkey) = mint.parse() else {
+            continue;
+        };
+
+        let ata = match solana_vntr_sniper::processor::selling_strategy::resolve_wallet_ata(
+            app_state.rpc_nonblocking_client.clone(),
+            &wallet_pubkey,
+            &mint_pubkey,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(_) => continue, // transient RPC error — try again next poll
+        };
+
+        let (raw_amount, decimals) =
+            match solana_vntr_sniper::processor::selling_strategy::get_wallet_token_balance(
+                app_state.rpc_nonblocking_client.clone(),
+                app_state.wallet.clone(),
+                &ata,
+                &mint_pubkey,
+            )
+            .await
+            {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    handle_auto_sell_failure(
+                        event_conn,
+                        held_positions,
+                        sell_retry_cooldown,
+                        user_id,
+                        &mint,
+                        "Unknown",
+                        "position poll",
+                        anyhow::anyhow!("No token account found for mint: {mint}"),
+                    )
+                    .await;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+        if raw_amount == 0 {
+            handle_auto_sell_failure(
+                event_conn,
+                held_positions,
+                sell_retry_cooldown,
+                user_id,
+                &mint,
+                "Unknown",
+                "position poll",
+                anyhow::anyhow!("No token account found for mint: {mint}"),
+            )
+            .await;
+            continue;
+        }
+
+        // A brand-new bonding-curve token can still be untradable on
+        // Jupiter (same TOKEN_NOT_TRADABLE indexing lag as the buy side,
+        // see this file's module doc comment) — that's not an error worth
+        // surfacing here, just "no fresher price available this cycle",
+        // same as a quiet tick-less window already was.
+        let Ok(quote) = jupiter_client
+            .get_quote(&mint, WRAPPED_SOL_MINT, raw_amount, 500)
+            .await
+        else {
+            continue;
+        };
+        let Ok(out_lamports) = quote.out_amount.parse::<u64>() else {
+            continue;
+        };
+        if out_lamports == 0 {
+            continue;
+        }
+        let token_amount = raw_amount as f64 / 10f64.powi(decimals as i32);
+        let price_sol = (out_lamports as f64 / 1_000_000_000.0) / token_amount;
+
+        let protocol = {
+            let Some(mut entry) = TOKEN_METRICS.get_mut(&mint) else {
+                continue; // shouldn't happen for a held position, but be safe
+            };
+            entry.current_price = price_sol;
+            entry.amount_held = token_amount;
+            if price_sol > entry.highest_price {
+                entry.highest_price = price_sol;
+            }
+            if entry.lowest_price == 0.0 || price_sol < entry.lowest_price {
+                entry.lowest_price = price_sol;
+            }
+            entry.last_update = Instant::now();
+            entry.protocol.clone()
+        };
+
+        let should_sell = match selling_engine.evaluate_sell_conditions(&mint).await {
+            Ok((should_sell, is_emergency)) => Some((should_sell, is_emergency)),
+            Err(e) => {
+                tracing::warn!(error = %e, %mint, "executor: poll evaluate_sell_conditions failed");
+                None
+            }
+        };
+        let Some((true, is_emergency)) = should_sell else {
+            continue;
+        };
+
+        let sol_before = app_state
+            .rpc_nonblocking_client
+            .get_balance(&wallet_pubkey)
+            .await
+            .ok();
+        match selling_engine
+            .unified_emergency_sell(&mint, is_emergency, None, Some(protocol.clone()))
+            .await
+        {
+            Ok(signature) => {
+                let amount_token = held_positions.remove(&mint).unwrap_or(token_amount);
+                sell_retry_cooldown.remove(&mint);
+                let amount_sol = real_sol_received(app_state, Some(wallet_pubkey), sol_before)
+                    .await
+                    .unwrap_or(amount_token * price_sol);
+                publish_event(
+                    event_conn,
+                    &BotEvent::Trade {
+                        user_id: user_id.to_string(),
+                        side: TradeSide::Sell,
+                        mint: mint.clone(),
+                        dex: dex_str_from_protocol(&protocol).to_string(),
+                        price_sol,
+                        amount_sol,
+                        amount_token,
+                        tx_signature: Some(signature),
+                        reason: Some(if is_emergency {
+                            "emergency".into()
+                        } else {
+                            "sell_condition".into()
+                        }),
+                        at: now_iso(),
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                handle_auto_sell_failure(
+                    event_conn,
+                    held_positions,
+                    sell_retry_cooldown,
+                    user_id,
+                    &mint,
+                    dex_str_from_protocol(&protocol),
+                    "position poll sell",
+                    e,
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -545,6 +856,67 @@ async fn main() -> anyhow::Result<()> {
     // best available approximation of position size without engine changes.
     let mut held_positions: std::collections::HashMap<String, f64> =
         std::collections::HashMap::new();
+
+    // Re-adopt positions this user already had OPEN in the DB before this
+    // process started (a previous executor instance's crash+auto-restart,
+    // or apps/api restarting the bot after a settings change) — without
+    // this, `held_positions`/`TOKEN_METRICS` start completely empty and a
+    // position bought by the previous instance is never evaluated for
+    // take-profit/stop-loss/trailing again: no error, just silent
+    // abandonment until someone notices and closes it manually. Seeding
+    // `current_price = entry_price` (rather than guessing) means PnL reads
+    // as exactly 0% until a real tick refreshes it — safe (never triggers a
+    // false immediate sell) rather than accurate from the first instant.
+    for seed in &payload.open_positions {
+        held_positions.insert(seed.mint.clone(), seed.amount_token);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        TOKEN_METRICS.insert(
+            seed.mint.clone(),
+            TokenMetrics {
+                entry_price: seed.entry_price_sol,
+                highest_price: seed.entry_price_sol,
+                lowest_price: seed.entry_price_sol,
+                current_price: seed.entry_price_sol,
+                volume_24h: 0.0,
+                market_cap: 0.0,
+                time_held: 0,
+                last_update: Instant::now(),
+                buy_timestamp: now_unix,
+                amount_held: seed.amount_token,
+                cost_basis: seed.cost_basis_sol,
+                price_history: std::collections::VecDeque::from([seed.entry_price_sol]),
+                volume_history: std::collections::VecDeque::new(),
+                liquidity_at_entry: 0.0,
+                liquidity_at_current: 0.0,
+                protocol: SwapProtocol::Auto,
+            },
+        );
+    }
+    if !payload.open_positions.is_empty() {
+        tracing::info!(
+            %user_id,
+            count = payload.open_positions.len(),
+            mints = ?payload.open_positions.iter().map(|s| &s.mint).collect::<Vec<_>>(),
+            "executor: re-adopted open positions from DB for monitoring"
+        );
+    }
+
+    // Per-mint cooldown for automatic sell attempts that failed for a
+    // reason OTHER than "genuinely nothing left to sell" (RPC hiccup, stale
+    // blockhash, slippage exceeded, ...) — without this, a copied wallet
+    // that keeps trading the same mint (or this position's own TP/SL
+    // condition staying true) re-triggers `unified_emergency_sell` on
+    // *every* tick, which for a persistently-failing mint arrived roughly
+    // every 5-6s in practice (one XREAD block cycle), spamming both RPC
+    // calls and the user's activity feed with the same failure forever. A
+    // confirmed-empty balance is NOT rate-limited by this — see
+    // `is_empty_balance_error` below — it's cleaned up immediately instead.
+    let mut sell_retry_cooldown: std::collections::HashMap<String, Instant> =
+        std::collections::HashMap::new();
+
     let mut last_id = "$".to_string();
     // Manual "Close Position" commands from the web dashboard (relayed via
     // apps/api -> engine-bridge's orchestrator -> XADD onto this stream —
@@ -569,7 +941,29 @@ async fn main() -> anyhow::Result<()> {
     let mut idle_warning_logged = false;
     const IDLE_WARNING_THRESHOLD: Duration = Duration::from_secs(120);
 
+    // See `poll_held_positions`'s doc comment: this is what makes
+    // take-profit/stop-loss/trailing actually independent of whether a
+    // copied wallet happens to retrade a held mint, instead of only ever
+    // reacting to `scanner:ticks`.
+    let position_poll_jupiter_client = JupiterClient::new(app_state.rpc_nonblocking_client.clone());
+    let mut last_position_poll = Instant::now();
+    const POSITION_POLL_INTERVAL: Duration = Duration::from_secs(20);
+
     loop {
+        if !held_positions.is_empty() && last_position_poll.elapsed() >= POSITION_POLL_INTERVAL {
+            poll_held_positions(
+                &app_state,
+                &selling_engine,
+                &position_poll_jupiter_client,
+                &mut event_conn,
+                &mut held_positions,
+                &mut sell_retry_cooldown,
+                &user_id,
+            )
+            .await;
+            last_position_poll = Instant::now();
+        }
+
         let reply: redis::RedisResult<StreamReadReply> = stream_conn
             .xread_options(
                 &[SCANNER_TICKS_STREAM, commands_stream.as_str()],
@@ -732,7 +1126,18 @@ async fn main() -> anyhow::Result<()> {
                 // take-profit/stop-loss — we're following their exit, not
                 // making an independent one.
                 if is_held && is_from_target_wallet && !tick.is_buy {
+                    let on_cooldown = sell_retry_cooldown
+                        .get(&tick.mint)
+                        .is_some_and(|last| last.elapsed() < SELL_RETRY_COOLDOWN);
+                    if on_cooldown {
+                        continue;
+                    }
                     let protocol = protocol_from_dex(&trade_info.dex_type);
+                    let wallet_pubkey = app_state.wallet.try_pubkey().ok();
+                    let sol_before = match wallet_pubkey {
+                        Some(pk) => app_state.rpc_nonblocking_client.get_balance(&pk).await.ok(),
+                        None => None,
+                    };
                     match selling_engine
                         .unified_emergency_sell(
                             &tick.mint,
@@ -745,7 +1150,11 @@ async fn main() -> anyhow::Result<()> {
                         Ok(signature) => {
                             let price_sol = tick.price as f64 / 1_000_000_000.0;
                             let amount_token = held_positions.remove(&tick.mint).unwrap_or(0.0);
-                            let amount_sol = amount_token * price_sol;
+                            sell_retry_cooldown.remove(&tick.mint);
+                            let amount_sol =
+                                real_sol_received(&app_state, wallet_pubkey, sol_before)
+                                    .await
+                                    .unwrap_or(amount_token * price_sol);
                             publish_event(
                                 &mut event_conn,
                                 &BotEvent::Trade {
@@ -764,16 +1173,15 @@ async fn main() -> anyhow::Result<()> {
                             .await;
                         }
                         Err(e) => {
-                            publish_event(
+                            handle_auto_sell_failure(
                                 &mut event_conn,
-                                &BotEvent::Error {
-                                    user_id: user_id.clone(),
-                                    message: format!(
-                                        "copy-trade sell failed for {}: {e}",
-                                        tick.mint
-                                    ),
-                                    at: now_iso(),
-                                },
+                                &mut held_positions,
+                                &mut sell_retry_cooldown,
+                                &user_id,
+                                &tick.mint,
+                                &tick.dex_type,
+                                "copy-trade sell",
+                                e,
                             )
                             .await;
                         }
@@ -788,7 +1196,20 @@ async fn main() -> anyhow::Result<()> {
                     }
                     match selling_engine.evaluate_sell_conditions(&tick.mint).await {
                         Ok((should_sell, is_emergency)) if should_sell => {
+                            let on_cooldown = sell_retry_cooldown
+                                .get(&tick.mint)
+                                .is_some_and(|last| last.elapsed() < SELL_RETRY_COOLDOWN);
+                            if on_cooldown {
+                                continue;
+                            }
                             let protocol = protocol_from_dex(&trade_info.dex_type);
+                            let wallet_pubkey = app_state.wallet.try_pubkey().ok();
+                            let sol_before = match wallet_pubkey {
+                                Some(pk) => {
+                                    app_state.rpc_nonblocking_client.get_balance(&pk).await.ok()
+                                }
+                                None => None,
+                            };
                             match selling_engine
                                 .unified_emergency_sell(
                                     &tick.mint,
@@ -802,7 +1223,11 @@ async fn main() -> anyhow::Result<()> {
                                     let price_sol = tick.price as f64 / 1_000_000_000.0;
                                     let amount_token =
                                         held_positions.remove(&tick.mint).unwrap_or(0.0);
-                                    let amount_sol = amount_token * price_sol;
+                                    sell_retry_cooldown.remove(&tick.mint);
+                                    let amount_sol =
+                                        real_sol_received(&app_state, wallet_pubkey, sol_before)
+                                            .await
+                                            .unwrap_or(amount_token * price_sol);
                                     publish_event(
                                         &mut event_conn,
                                         &BotEvent::Trade {
@@ -825,13 +1250,15 @@ async fn main() -> anyhow::Result<()> {
                                     .await;
                                 }
                                 Err(e) => {
-                                    publish_event(
+                                    handle_auto_sell_failure(
                                         &mut event_conn,
-                                        &BotEvent::Error {
-                                            user_id: user_id.clone(),
-                                            message: format!("sell failed for {}: {e}", tick.mint),
-                                            at: now_iso(),
-                                        },
+                                        &mut held_positions,
+                                        &mut sell_retry_cooldown,
+                                        &user_id,
+                                        &tick.mint,
+                                        &tick.dex_type,
+                                        "sell",
+                                        e,
                                     )
                                     .await;
                                 }

@@ -72,8 +72,39 @@ export async function getBotSettings(userId: string) {
   return toBotSettingsDto(settings);
 }
 
+// A priority fee bigger than this fraction of the buy amount itself is
+// never a deliberate choice — it means the position is guaranteed to
+// lose money to fees alone before the token even has a chance to move
+// (observed live: a user lowered amountPerBuySol to 0.001 SOL for small
+// tests but left priorityFeeLamports at 3_000_000 (0.003 SOL) — a fee 3x
+// bigger than the entire trade, on every single buy). Neither field is
+// validated against the other by botSettingsSchema alone since a PATCH
+// can touch just one of them, so this checks the fully-merged resolved
+// row instead, right before it's persisted.
+const MAX_PRIORITY_FEE_FRACTION_OF_BUY = 0.5;
+
+async function assertSanePriorityFee(amountPerBuySol: number, priorityFeeLamports: bigint) {
+  const buyLamports = BigInt(Math.round(amountPerBuySol * 1_000_000_000));
+  if (buyLamports <= 0n) return;
+  // fee > MAX_PRIORITY_FEE_FRACTION_OF_BUY * buyLamports, done as an
+  // integer comparison (fee * 2 > buyLamports, since the fraction is 1/2)
+  // to avoid float precision issues on the bigint side.
+  if (priorityFeeLamports * 2n > buyLamports) {
+    const priorityFeeSol = Number(priorityFeeLamports) / 1_000_000_000;
+    throw new BotError(
+      `Le priority fee (${priorityFeeSol.toFixed(4)} SOL) dépasse ${Math.round(MAX_PRIORITY_FEE_FRACTION_OF_BUY * 100)}% du montant par achat (${amountPerBuySol.toFixed(4)} SOL) — cette combinaison garantit de perdre de l'argent en frais sur chaque trade. Augmentez le montant par achat ou réduisez le priority fee.`,
+      422,
+    );
+  }
+}
+
 export async function updateBotSettings(userId: string, patch: Partial<BotSettingsDto>) {
   const data = toPrismaPatch(patch);
+  const existing = await prisma.botSettings.findUnique({ where: { userId } });
+  const resolvedAmountPerBuySol = patch.amountPerBuySol ?? existing?.amountPerBuySol ?? 0.05;
+  const resolvedPriorityFeeLamports = data.priorityFeeLamports ?? existing?.priorityFeeLamports ?? 2_000_000n;
+  await assertSanePriorityFee(resolvedAmountPerBuySol, resolvedPriorityFeeLamports);
+
   const settings = await prisma.botSettings.upsert({
     where: { userId },
     create: { userId, ...data },
@@ -105,6 +136,17 @@ async function requireActiveSubscription(userId: string) {
  * secret. */
 async function buildExecutorPayload(userId: string, settings: BotSettingsRow) {
   const secretKeyB58 = await decryptTradingWalletSecret(userId);
+
+  // Without this, a freshly (re)started executor's in-memory position
+  // tracking starts completely empty and a position bought by a previous
+  // process instance (e.g. before a crash+auto-restart) never gets
+  // take-profit/stop-loss/trailing monitoring again — see
+  // engine-bridge-client.ts's OpenPositionSeed doc comment.
+  const openPositions = await prisma.position.findMany({
+    where: { userId, status: "OPEN" },
+    select: { tokenMint: true, currentAmount: true, entryPriceSol: true, costBasisSol: true },
+  });
+
   return {
     user_id: userId,
     wallet_secret_key_b58: secretKeyB58,
@@ -123,6 +165,12 @@ async function buildExecutorPayload(userId: string, settings: BotSettingsRow) {
       copy_trading_targets: settings.copyTradingTargets,
       protocol_preference: settings.protocolPreference,
     },
+    open_positions: openPositions.map((p) => ({
+      mint: p.tokenMint,
+      amount_token: p.currentAmount,
+      entry_price_sol: p.entryPriceSol,
+      cost_basis_sol: p.costBasisSol,
+    })),
   };
 }
 
